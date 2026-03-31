@@ -289,14 +289,20 @@ func tryProportionalDrain(source, currentOld, currentNew RoleReplicaState, minOl
 	return &UpdateStep{Past: nextOld, New: currentNew}
 }
 
-// tryForceDrain drains exactly enough old replicas to unblock the next scale-up.
-func tryForceDrain(currentOld, currentNew, nextNew RoleReplicaState, source, targetNew RoleReplicaState, config []RollingUpdateConfig, minOld []int) *UpdateStep {
+// tryForceDrain drains exactly enough old replicas to unblock the next scale-up,
+// and performs the scale-up in the same step to avoid capacity dips.
+func tryForceDrain(currentOld, currentNew, nextNew RoleReplicaState, source, targetNew RoleReplicaState, config []RollingUpdateConfig) *UpdateStep {
 	drainedOld := make([]int, len(currentOld))
 	needsDrain := false
 	for i := range currentOld {
 		maxOld := targetNew[i] + config[i].MaxSurge - nextNew[i]
 		drainedOld[i] = max(0, min(currentOld[i], maxOld))
-		drainedOld[i] = max(drainedOld[i], minOld[i]) // Enforce maxUnavailable
+		// Compute minOld using nextNew (the new replica count after this step)
+		// to ensure maxUnavailable is respected with the scaled-up capacity
+		if source[i] >= targetNew[i] {
+			minOldForRole := max(0, targetNew[i]-config[i].MaxUnavailable-nextNew[i])
+			drainedOld[i] = max(drainedOld[i], minOldForRole)
+		}
 		if drainedOld[i] < currentOld[i] {
 			needsDrain = true
 		}
@@ -304,12 +310,15 @@ func tryForceDrain(currentOld, currentNew, nextNew RoleReplicaState, source, tar
 	if !needsDrain {
 		return nil
 	}
-	return &UpdateStep{Past: drainedOld, New: currentNew}
+	// Return nextNew to scale up in the same step as draining,
+	// avoiding capacity dips when maxSurge=0
+	return &UpdateStep{Past: drainedOld, New: nextNew}
 }
 
 // ComputeNextStep computes the next step in the rolling update.
 // Returns nil when no more steps are needed (current state equals target).
-// Each step changes EITHER old OR new replicas, not both (decoupled steps).
+// Steps are generally decoupled (change old OR new), but when maxSurge=0 forces
+// a drain before scale-up, both are combined to avoid capacity dips.
 func ComputeNextStep(source, currentOld, currentNew, targetNew RoleReplicaState, config []RollingUpdateConfig) *UpdateStep {
 	if isComplete(currentOld, currentNew, targetNew) {
 		return nil
@@ -338,7 +347,7 @@ func ComputeNextStep(source, currentOld, currentNew, targetNew RoleReplicaState,
 	if step := tryProportionalDrain(source, currentOld, currentNew, minOld, totalSteps); step != nil {
 		return step
 	}
-	if step := tryForceDrain(currentOld, currentNew, nextNew, source, targetNew, config, minOld); step != nil {
+	if step := tryForceDrain(currentOld, currentNew, nextNew, source, targetNew, config); step != nil {
 		return step
 	}
 

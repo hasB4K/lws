@@ -459,6 +459,8 @@ func TestGenerateServiceName(t *testing.T) {
 }
 
 // createTestDeployment creates a test deployment without ServiceTemplate
+//
+//nolint:unparam // namespace is always "default" in tests but kept for clarity
 func createTestDeployment(name, namespace string) *disaggregatedsetv1.DisaggregatedSet {
 	return &disaggregatedsetv1.DisaggregatedSet{
 		ObjectMeta: metav1.ObjectMeta{

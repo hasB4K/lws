@@ -32,6 +32,8 @@ import (
 )
 
 // createTestLWSWithAnnotation creates a LeaderWorkerSet for testing with optional annotations.
+//
+//nolint:unparam // namespace is always "default" in tests but kept for clarity
 func createTestLWSWithAnnotation(
 	name, namespace string,
 	replicas int32,

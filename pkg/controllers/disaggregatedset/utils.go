@@ -100,7 +100,7 @@ type WorkloadInfo struct {
 	ReadyReplicas                int
 	InitialReplicas              int
 	HasInitialReplicasAnnotation bool
-	CreationTimestamp             time.Time
+	CreationTimestamp            time.Time
 }
 
 type CreateParams struct {

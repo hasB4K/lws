@@ -26,7 +26,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/lws/test/testutils/disaggregatedset"
+	utils "sigs.k8s.io/lws/test/testutils/disaggregatedset"
 	"sigs.k8s.io/lws/test/testutils/disaggregatedset/fixtures"
 	"sigs.k8s.io/lws/test/testutils/disaggregatedset/kubectl"
 )

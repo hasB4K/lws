@@ -68,7 +68,7 @@ func newTestReconciler(fakeClient client.Client) *DisaggregatedSetReconciler {
 		Scheme:          scheme,
 		WorkloadManager: NewLeaderWorkerSetManager(fakeClient),
 		ServiceManager:  NewServiceManager(fakeClient, scheme),
-		Record:        events.NewFakeRecorder(100),
+		Record:          events.NewFakeRecorder(100),
 	}
 }
 
@@ -77,7 +77,7 @@ func newTestExecutor(fakeClient client.Client) *RollingUpdateExecutor {
 	return &RollingUpdateExecutor{
 		Client:          fakeClient,
 		WorkloadManager: NewLeaderWorkerSetManager(fakeClient),
-		Record:        events.NewFakeRecorder(100),
+		Record:          events.NewFakeRecorder(100),
 	}
 }
 
@@ -109,6 +109,8 @@ func createTestLWS(
 }
 
 // createTestLWSWithAnnotations creates a LeaderWorkerSet with custom annotations.
+//
+//nolint:unparam // namespace is always "default" in tests but kept for clarity
 func createTestLWSWithAnnotations(
 	name, namespace, role, revision string,
 	replicas, readyReplicas int32,

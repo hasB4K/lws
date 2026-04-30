@@ -188,7 +188,7 @@ func isNewAtTarget(currentNew, targetNew RoleReplicaState) bool {
 	return true
 }
 
-func canScaleUp(currentOld, nextNew, source, targetNew RoleReplicaState, config []RollingUpdateConfig) bool {
+func canScaleUp(currentOld, nextNew, targetNew RoleReplicaState, config []RollingUpdateConfig) bool {
 	for i := range currentOld {
 		if targetNew[i] == 0 {
 			continue
@@ -210,7 +210,7 @@ func computeMinOld(source, currentNew, targetNew RoleReplicaState, config []Roll
 	return minOld
 }
 
-func tryScaleUp(currentOld, currentNew, nextNew RoleReplicaState, source, targetNew RoleReplicaState, config []RollingUpdateConfig) *UpdateStep {
+func tryScaleUp(currentOld, currentNew, nextNew, targetNew RoleReplicaState, config []RollingUpdateConfig) *UpdateStep {
 	needsScaleUp := false
 	for i := range currentNew {
 		if nextNew[i] > currentNew[i] {
@@ -221,7 +221,7 @@ func tryScaleUp(currentOld, currentNew, nextNew RoleReplicaState, source, target
 	if !needsScaleUp {
 		return nil
 	}
-	if !canScaleUp(currentOld, nextNew, source, targetNew, config) {
+	if !canScaleUp(currentOld, nextNew, targetNew, config) {
 		return nil
 	}
 	return &UpdateStep{Past: currentOld, New: nextNew}
@@ -293,7 +293,7 @@ func applyOrphanPrevention(nextOld, currentNew, source, target RoleReplicaState,
 	}
 }
 
-func tryForceDrain(currentOld, currentNew, nextNew RoleReplicaState, source, targetNew RoleReplicaState, config []RollingUpdateConfig) *UpdateStep {
+func tryForceDrain(currentOld, nextNew RoleReplicaState, source, targetNew RoleReplicaState, config []RollingUpdateConfig) *UpdateStep {
 	drainedOld := make([]int, len(currentOld))
 	needsDrain := false
 
@@ -338,13 +338,13 @@ func ComputeNextStep(source, currentOld, currentNew, targetNew RoleReplicaState,
 	nextNew := computeNextNewReplicas(targetNew, currentNew, totalSteps)
 	minOld := computeMinOld(source, currentNew, targetNew, config)
 
-	if step := tryScaleUp(currentOld, currentNew, nextNew, source, targetNew, config); step != nil {
+	if step := tryScaleUp(currentOld, currentNew, nextNew, targetNew, config); step != nil {
 		return step
 	}
 	if step := tryProportionalDrain(source, currentOld, currentNew, targetNew, minOld, totalSteps, config); step != nil {
 		return step
 	}
-	if step := tryForceDrain(currentOld, currentNew, nextNew, source, targetNew, config); step != nil {
+	if step := tryForceDrain(currentOld, nextNew, source, targetNew, config); step != nil {
 		return step
 	}
 

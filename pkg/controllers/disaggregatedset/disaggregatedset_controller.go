@@ -116,6 +116,7 @@ func (reconciler *DisaggregatedSetReconciler) createRollingUpdateExecutor() *Rol
 	}
 }
 
+//nolint:unparam // Result is always empty but signature matches controller-runtime pattern
 func (reconciler *DisaggregatedSetReconciler) reconcileSimple(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, revision string) (ctrl.Result, error) {
 	roleConfigs := GetRoleConfigs(disaggregatedSet)
 

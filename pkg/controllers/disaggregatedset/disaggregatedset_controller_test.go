@@ -136,7 +136,7 @@ func TestFreshDeploymentNoRollingUpdate(t *testing.T) {
 		Scheme:          scheme,
 		WorkloadManager: controller.NewLeaderWorkerSetManager(fakeClient),
 		ServiceManager:  controller.NewServiceManager(fakeClient, scheme),
-		Record:        events.NewFakeRecorder(100),
+		Record:          events.NewFakeRecorder(100),
 	}
 
 	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: disaggregatedSet.Name, Namespace: disaggregatedSet.Namespace}})
@@ -171,7 +171,7 @@ func TestScalingWithoutRollingUpdate(t *testing.T) {
 		Scheme:          scheme,
 		WorkloadManager: controller.NewLeaderWorkerSetManager(fakeClient),
 		ServiceManager:  controller.NewServiceManager(fakeClient, scheme),
-		Record:        events.NewFakeRecorder(100),
+		Record:          events.NewFakeRecorder(100),
 	}
 
 	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: disaggregatedSet.Name, Namespace: disaggregatedSet.Namespace}})

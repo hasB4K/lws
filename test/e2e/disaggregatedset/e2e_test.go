@@ -43,35 +43,6 @@ func applyYAML(yaml string) error {
 }
 
 var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
-	// Deploy the operator before all tests (if not already deployed by hack/e2e-test.sh)
-	BeforeAll(func() {
-		By("checking if controller-manager is already deployed")
-		cmd := exec.Command("kubectl", "get", "deployment", "lws-controller-manager",
-			"-n", namespace, "-o", "name")
-		output, err := utils.Run(cmd)
-		if err == nil && strings.Contains(output, "deployment") {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Controller-manager already deployed, skipping deployment\n")
-			return
-		}
-
-		By("creating operator namespace")
-		cmd = exec.Command("kubectl", "create", "ns", namespace, "--dry-run=client", "-o", "yaml")
-		output, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-		cmd = exec.Command("kubectl", "apply", "-f", "-")
-		cmd.Stdin = strings.NewReader(output)
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
-	})
-
-	// Note: We don't undeploy in AfterAll because hack/e2e-test.sh handles cleanup
-	// This allows tests to be run both standalone and via the hack script
-
 	// Collect debug info on test failure
 	AfterEach(func() {
 		specReport := CurrentSpecReport()
@@ -602,10 +573,11 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 		}
 
 		AfterEach(func() {
-			// Use longer timeout for larger deployments
 			_, _ = kubectl.Delete("disaggregatedset", deploymentName).Namespace("default").IgnoreNotFound().Timeout("60s").RunQuiet()
 			_, _ = kubectl.Delete("lws").Label("disaggregatedset.x-k8s.io/name", deploymentName).Namespace("default").IgnoreNotFound().Timeout("60s").RunQuiet()
 			_, _ = kubectl.Delete("pods").Label("disaggregatedset.x-k8s.io/name", deploymentName).Namespace("default").IgnoreNotFound().GracePeriod(0).Force().RunQuiet()
+			kubectl.ForLWSCount(deploymentName, 0)
+			kubectl.ForPodCount(deploymentName, 0)
 		})
 
 		for _, tc := range testCases {
@@ -1149,16 +1121,16 @@ func (s rolloutState) Equals(other rolloutState) bool {
 
 // rolloutTestCase defines a rolling update scenario to test
 type rolloutTestCase struct {
-	Name            string
-	SourcePrefill   int
-	SourceDecode    int
-	TargetPrefill   int
-	TargetDecode    int
-	PrefillSurge    int
-	DecodeSurge     int
-	PrefillUnavail  int
-	DecodeUnavail   int
-	ExpectedSteps   []rolloutState
+	Name           string
+	SourcePrefill  int
+	SourceDecode   int
+	TargetPrefill  int
+	TargetDecode   int
+	PrefillSurge   int
+	DecodeSurge    int
+	PrefillUnavail int
+	DecodeUnavail  int
+	ExpectedSteps  []rolloutState
 }
 
 // getCurrentRolloutState queries the cluster for current LWS replica counts

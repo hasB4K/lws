@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -224,8 +225,11 @@ func extractRollingUpdateConfig(ds *disaggregatedsetv1.DisaggregatedSet, allRole
 	for _, role := range ds.Spec.Roles {
 		if rc := role.Spec.RolloutStrategy.RollingUpdateConfiguration; rc != nil {
 			i := roleIndex[role.Name]
-			surge := rc.MaxSurge.IntValue()
-			unavail := rc.MaxUnavailable.IntValue()
+			replicas := getTargetReplicas(ds, role.Name)
+			// Use GetScaledValueFromIntOrPercent to handle both integers and percentages.
+			// For maxSurge, round up (true); for maxUnavailable, round down (false).
+			surge, _ := intstr.GetScaledValueFromIntOrPercent(&rc.MaxSurge, replicas, true)
+			unavail, _ := intstr.GetScaledValueFromIntOrPercent(&rc.MaxUnavailable, replicas, false)
 			if unavail > 0 {
 				config[i].MaxUnavailable = unavail
 				config[i].MaxSurge = surge

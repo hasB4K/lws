@@ -705,6 +705,115 @@ func TestExtractRollingUpdateConfig(t *testing.T) {
 	}
 }
 
+func TestExtractRollingUpdateConfigWithPercentages(t *testing.T) {
+	strVal := func(v string) intstr.IntOrString { return intstr.FromString(v) }
+
+	testCases := []struct {
+		name                                         string
+		prefillReplicas, decodeReplicas              int32
+		prefillSurge, prefillUnavail                 string
+		decodeSurge, decodeUnavail                   string
+		expectedPrefillSurge, expectedPrefillUnavail int
+		expectedDecodeSurge, expectedDecodeUnavail   int
+	}{
+		{
+			name:                   "50% surge on 4 replicas = 2",
+			prefillReplicas:        4,
+			decodeReplicas:         4,
+			prefillSurge:           "50%",
+			prefillUnavail:         "0",
+			decodeSurge:            "50%",
+			decodeUnavail:          "0",
+			expectedPrefillSurge:   2,
+			expectedPrefillUnavail: 0,
+			expectedDecodeSurge:    2,
+			expectedDecodeUnavail:  0,
+		},
+		{
+			name:                   "25% unavailable on 4 replicas = 1",
+			prefillReplicas:        4,
+			decodeReplicas:         4,
+			prefillSurge:           "0",
+			prefillUnavail:         "25%",
+			decodeSurge:            "0",
+			decodeUnavail:          "25%",
+			expectedPrefillSurge:   0,
+			expectedPrefillUnavail: 1,
+			expectedDecodeSurge:    0,
+			expectedDecodeUnavail:  1,
+		},
+		{
+			name:                   "surge rounds up, unavail rounds down",
+			prefillReplicas:        10,
+			decodeReplicas:         10,
+			prefillSurge:           "25%", // 2.5 -> 3 (round up)
+			prefillUnavail:         "25%", // 2.5 -> 2 (round down)
+			decodeSurge:            "25%",
+			decodeUnavail:          "25%",
+			expectedPrefillSurge:   3,
+			expectedPrefillUnavail: 2,
+			expectedDecodeSurge:    3,
+			expectedDecodeUnavail:  2,
+		},
+		{
+			name:                   "100% surge",
+			prefillReplicas:        5,
+			decodeReplicas:         5,
+			prefillSurge:           "100%",
+			prefillUnavail:         "0",
+			decodeSurge:            "100%",
+			decodeUnavail:          "0",
+			expectedPrefillSurge:   5,
+			expectedPrefillUnavail: 0,
+			expectedDecodeSurge:    5,
+			expectedDecodeUnavail:  0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			roles := []disaggregatedsetv1.DisaggregatedRoleSpec{
+				{
+					Name: testRolePrefill,
+					LeaderWorkerSetTemplateSpec: leaderworkerset.LeaderWorkerSetTemplateSpec{Spec: leaderworkerset.LeaderWorkerSetSpec{
+						Replicas: ptr.To(tc.prefillReplicas),
+						RolloutStrategy: leaderworkerset.RolloutStrategy{
+							RollingUpdateConfiguration: &leaderworkerset.RollingUpdateConfiguration{
+								MaxSurge:       strVal(tc.prefillSurge),
+								MaxUnavailable: strVal(tc.prefillUnavail),
+							},
+						},
+					}},
+				},
+				{
+					Name: testRoleDecode,
+					LeaderWorkerSetTemplateSpec: leaderworkerset.LeaderWorkerSetTemplateSpec{Spec: leaderworkerset.LeaderWorkerSetSpec{
+						Replicas: ptr.To(tc.decodeReplicas),
+						RolloutStrategy: leaderworkerset.RolloutStrategy{
+							RollingUpdateConfiguration: &leaderworkerset.RollingUpdateConfiguration{
+								MaxSurge:       strVal(tc.decodeSurge),
+								MaxUnavailable: strVal(tc.decodeUnavail),
+							},
+						},
+					}},
+				},
+			}
+
+			ds := &disaggregatedsetv1.DisaggregatedSet{
+				Spec: disaggregatedsetv1.DisaggregatedSetSpec{Roles: roles},
+			}
+
+			roleNames := []string{testRolePrefill, testRoleDecode}
+			config := extractRollingUpdateConfig(ds, roleNames)
+
+			assert.Equal(t, tc.expectedPrefillSurge, config[0].MaxSurge)
+			assert.Equal(t, tc.expectedPrefillUnavail, config[0].MaxUnavailable)
+			assert.Equal(t, tc.expectedDecodeSurge, config[1].MaxSurge)
+			assert.Equal(t, tc.expectedDecodeUnavail, config[1].MaxUnavailable)
+		})
+	}
+}
+
 // =============================================================================
 // Unit Tests for scaleDownOld
 // =============================================================================

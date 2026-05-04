@@ -20,6 +20,8 @@ package fixtures
 import (
 	"fmt"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // Role holds configuration for a single role.
@@ -27,8 +29,8 @@ type Role struct {
 	Name           string
 	Replicas       int
 	Image          string
-	MaxSurge       int
-	MaxUnavailable int
+	MaxSurge       intstr.IntOrString
+	MaxUnavailable intstr.IntOrString
 	Partition      *int // nil = not set, 0 = valid, >0 = invalid (rejected by webhook)
 	HasRollout     bool
 	Labels         map[string]string // workerTemplate labels (propagate to pods)
@@ -89,8 +91,8 @@ spec:
 			sb.WriteString("      rolloutStrategy:\n")
 			sb.WriteString("        rollingUpdateConfiguration:\n")
 			if p.HasRollout {
-				sb.WriteString(fmt.Sprintf("          maxSurge: %d\n", p.MaxSurge))
-				sb.WriteString(fmt.Sprintf("          maxUnavailable: %d\n", p.MaxUnavailable))
+				sb.WriteString(fmt.Sprintf("          maxSurge: %s\n", p.MaxSurge.String()))
+				sb.WriteString(fmt.Sprintf("          maxUnavailable: %s\n", p.MaxUnavailable.String()))
 			}
 			if p.Partition != nil {
 				sb.WriteString(fmt.Sprintf("          partition: %d\n", *p.Partition))

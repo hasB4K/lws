@@ -25,6 +25,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	utils "sigs.k8s.io/lws/test/testutils/disaggregatedset"
 	"sigs.k8s.io/lws/test/testutils/disaggregatedset/fixtures"
@@ -232,6 +233,32 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 						fmt.Sprintf("Revision %s has prefill replicas but no decode (orphaned)", revision))
 				}
 			}
+		})
+
+		It("should handle percentage-based maxSurge and maxUnavailable", func() {
+			By("creating DisaggregatedSet with percentage rollout config")
+			// 4 replicas with 50% surge = 2 surge, 25% unavailable = 1 unavailable
+			yaml := fixtures.PrefillDecode(deploymentName,
+				fixtures.Role{Replicas: 4, HasRollout: true, MaxSurge: intstr.FromString("50%"), MaxUnavailable: intstr.FromString("25%")},
+				fixtures.Role{Replicas: 4, HasRollout: true, MaxSurge: intstr.FromString("50%"), MaxUnavailable: intstr.FromString("25%")},
+			).YAML()
+			Expect(applyYAML(yaml)).To(Succeed())
+
+			By("waiting for initial deployment to stabilize")
+			kubectl.ForRunningPodCount(deploymentName, 8)
+
+			By("triggering rolling update by changing image")
+			yamlV2 := fixtures.PrefillDecode(deploymentName,
+				fixtures.Role{Replicas: 4, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromString("50%"), MaxUnavailable: intstr.FromString("25%")},
+				fixtures.Role{Replicas: 4, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromString("50%"), MaxUnavailable: intstr.FromString("25%")},
+			).YAML()
+			Expect(applyYAML(yamlV2)).To(Succeed())
+
+			By("waiting for rolling update to complete")
+			kubectl.ForSingleActiveRevision(deploymentName)
+
+			By("verifying final state has correct replicas")
+			kubectl.ForRunningPodCount(deploymentName, 8)
 		})
 	})
 
@@ -534,8 +561,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 				SourceDecode:  2,
 				TargetPrefill: 6,
 				TargetDecode:  8,
-				PrefillSurge:  2,
-				DecodeSurge:   2,
+				PrefillSurge:  intstr.FromInt(2),
+				DecodeSurge:   intstr.FromInt(2),
 				// Expected steps from: go run ./hack/plan-steps --source '{"prefill":10,"decode":2}' --target '{"prefill":6,"decode":8}' --surge '{"prefill":2,"decode":2}'
 				ExpectedSteps: []rolloutState{
 					{OldPrefill: 10, OldDecode: 2, NewPrefill: 0, NewDecode: 0}, // step 0: initial
@@ -557,10 +584,10 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 				SourceDecode:   4,
 				TargetPrefill:  4,
 				TargetDecode:   4,
-				PrefillSurge:   0,
-				DecodeSurge:    0,
-				PrefillUnavail: 2,
-				DecodeUnavail:  2,
+				PrefillSurge:   intstr.FromInt(0),
+				DecodeSurge:    intstr.FromInt(0),
+				PrefillUnavail: intstr.FromInt(2),
+				DecodeUnavail:  intstr.FromInt(2),
 				// Expected steps from: go run ./hack/plan-steps --source '{"prefill":4,"decode":4}' --target '{"prefill":4,"decode":4}' --surge '{"prefill":0,"decode":0}' --unavailable '{"prefill":2,"decode":2}'
 				ExpectedSteps: []rolloutState{
 					{OldPrefill: 4, OldDecode: 4, NewPrefill: 0, NewDecode: 0}, // step 0: initial
@@ -658,8 +685,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 				// Verify invariants throughout rollout
 				By("verifying surge limits were respected")
-				maxPrefillSurge := tc.PrefillSurge
-				maxDecodeSurge := tc.DecodeSurge
+				maxPrefillSurge := tc.PrefillSurge.IntValue()
+				maxDecodeSurge := tc.DecodeSurge.IntValue()
 				for _, state := range observedStates {
 					totalPrefill := state.OldPrefill + state.NewPrefill
 					totalDecode := state.OldDecode + state.NewDecode
@@ -688,9 +715,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			initialYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(initialYaml)).To(Succeed())
@@ -705,9 +732,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			updatedYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
-					{Name: "encode", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "encode", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(updatedYaml)).To(Succeed())
@@ -732,9 +759,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			initialYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(initialYaml)).To(Succeed())
@@ -751,9 +778,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			updatedYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
-					{Name: "decode-long-context", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode-long-context", Replicas: 2, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(updatedYaml)).To(Succeed())
@@ -786,8 +813,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			initialYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: 1},
+					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(initialYaml)).To(Succeed())
@@ -803,9 +830,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			updatedYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: 1},
-					{Name: "gamma", Replicas: 5, HasRollout: true, MaxSurge: 1},
+					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "gamma", Replicas: 5, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(updatedYaml)).To(Succeed())
@@ -834,8 +861,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			initialYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(initialYaml)).To(Succeed())
@@ -851,9 +878,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			updatedYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: 1},
-					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(updatedYaml)).To(Succeed())
@@ -888,9 +915,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			initialYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: 1},
-					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "encode", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(initialYaml)).To(Succeed())
@@ -906,8 +933,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			updatedYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: 1},
-					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: 1},
+					{Name: "prefill", Replicas: 4, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "decode", Replicas: 6, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(updatedYaml)).To(Succeed())
@@ -942,8 +969,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 		It("should drain B (broken intermediate) before A (stable original)", func() {
 			By("creating initial deployment A (6 replicas per role)")
 			yamlA := fixtures.PrefillDecode(deploymentName,
-				fixtures.Role{Replicas: 6, HasRollout: true, MaxSurge: 1},
-				fixtures.Role{Replicas: 6, HasRollout: true, MaxSurge: 1},
+				fixtures.Role{Replicas: 6, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+				fixtures.Role{Replicas: 6, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 			).YAML()
 			Expect(applyYAML(yamlA)).To(Succeed())
 			kubectl.ForRunningPodCountWithTimeout(deploymentName, 12, 3*time.Minute)
@@ -953,8 +980,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 			By("triggering update B (simulates bad deploy)")
 			yamlB := fixtures.PrefillDecode(deploymentName,
-				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
-				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: 1},
+				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
+				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: intstr.FromInt(1)},
 			).YAML()
 			Expect(applyYAML(yamlB)).To(Succeed())
 
@@ -996,8 +1023,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 			By("triggering update C (the fix) mid-rollout")
 			yamlC := fixtures.PrefillDecode(deploymentName,
-				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.8", HasRollout: true, MaxSurge: 1},
-				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.8", HasRollout: true, MaxSurge: 1},
+				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.8", HasRollout: true, MaxSurge: intstr.FromInt(1)},
+				fixtures.Role{Replicas: 6, Image: "registry.k8s.io/pause:3.8", HasRollout: true, MaxSurge: intstr.FromInt(1)},
 			).YAML()
 			Expect(applyYAML(yamlC)).To(Succeed())
 
@@ -1060,9 +1087,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			initialYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: 1},
-					{Name: "zeta", Replicas: 5, HasRollout: true, MaxSurge: 1},
+					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "zeta", Replicas: 5, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(initialYaml)).To(Succeed())
@@ -1078,9 +1105,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			updatedYaml := fixtures.Config{
 				Name: deploymentName,
 				Roles: []fixtures.Role{
-					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: 1},
-					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: 1},
-					{Name: "gamma", Replicas: 5, HasRollout: true, MaxSurge: 1},
+					{Name: "alpha", Replicas: 2, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "beta", Replicas: 3, HasRollout: true, MaxSurge: intstr.FromInt(1)},
+					{Name: "gamma", Replicas: 5, HasRollout: true, MaxSurge: intstr.FromInt(1)},
 				},
 			}.YAML()
 			Expect(applyYAML(updatedYaml)).To(Succeed())
@@ -1126,10 +1153,10 @@ type rolloutTestCase struct {
 	SourceDecode   int
 	TargetPrefill  int
 	TargetDecode   int
-	PrefillSurge   int
-	DecodeSurge    int
-	PrefillUnavail int
-	DecodeUnavail  int
+	PrefillSurge   intstr.IntOrString
+	DecodeSurge    intstr.IntOrString
+	PrefillUnavail intstr.IntOrString
+	DecodeUnavail  intstr.IntOrString
 	ExpectedSteps  []rolloutState
 }
 

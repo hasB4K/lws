@@ -60,6 +60,8 @@ type DisaggregatedSetSpec struct {
 	// Each role has a unique name and its own configuration.
 	// +kubebuilder:validation:MinItems=2
 	// +kubebuilder:validation:MaxItems=10
+	// +listType=map
+	// +listMapKey=name
 	// +required
 	Roles []DisaggregatedRoleSpec `json:"roles"`
 }

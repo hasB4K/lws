@@ -16,23 +16,80 @@ limitations under the License.
 
 // Package disaggregatedset provides rolling update planning and execution for DisaggregatedSet.
 //
-// # Rolling Update Algorithm — Percentage-Block Model
+// # Rolling update algorithm
 //
-// Each revision is treated as a "block" with a progress percentage (0% → 100%).
-// Each revision has its own minimalUnit (max(1/N_i) across its roles), and the
-// global sync point interval is max(minimalUnit_old, minimalUnit_new).
+// A DisaggregatedSet rollout has several roles (e.g. prefill, decode) running
+// at two revisions: the OLD one (being drained) and the NEW one (being scaled
+// up). The planner decides, on every reconcile, how many replicas to add to
+// the new revision and how many to drain from the old one for each role.
 //
-// The planner uses a two-level step structure:
+// ## The two sides
 //
-//   - Cross-role sync points (big steps): all roles must reach a sync point
-//     before any can cross it.
-//   - Per-role sub-steps (small steps): each role advances 1 replica at a time
-//     between sync points, at its own granularity.
+// We treat the rollout as two independent "sides":
+//   - NEW: scales from 0 up to its target replica count.
+//   - OLD: drains from its initial replica count down to 0.
 //
-// Capacity constraints (per role):
+// Each side runs its own progression. They are only coupled through the
+// capacity envelope below (surge ceiling and unavailable floor); there is no
+// forced lockstep between "old has drained 50%" and "new has scaled to 50%".
 //
-//	ceiling: old + new <= max(initialOld, target) + maxSurge
-//	floor:   old + new >= min(initialOld, target) - maxUnavailable
+// ## minimalUnit and sync windows (within a side)
+//
+// Inside a single side, roles must stay roughly in proportion so that prefill
+// and decode keep their intended ratio at every step. The smallest possible
+// progress increment a side can express is bounded by its smallest role:
+// a role with N replicas can only represent multiples of 1/N of itself.
+// So a side's "step granularity" is:
+//
+//	minimalUnit = 1 / min(replicas of all roles in that side)
+//
+// minimalUnit divides the side's progress (0 → 100%) into "sync windows".
+// Within a window, each role advances toward the next sync barrier at its own
+// pace; once every role has reached the barrier, the window closes and the
+// next one opens. This is what keeps roles in lockstep within a side.
+//
+// Example: NEW side with prefill=8, decode=4 → minimalUnit = max(1/8, 1/4)
+// = 1/4 → 4 sync windows at 25%, 50%, 75%, 100%. At sync 1 (25%), prefill
+// should have added 2 replicas (= 8 × 25%) and decode should have added 1.
+//
+// ## Capacity envelope (surge + unavailable)
+//
+// `maxSurge` and `maxUnavailable` are the operator's safety budgets. They set
+// two bounds on the TOTAL replicas (old + new) per role at any moment:
+//
+//	ceiling = max(initialOld, target) + maxSurge      // max replicas allowed
+//	floor   = max(0, min(initialOld, target) - maxUnavailable)  // min ready replicas
+//
+// These bounds are enforced per-step:
+//   - addBudget   = ceiling - currentTotal     (how much new we can add)
+//   - drainBudget = currentTotal - floor       (how much old we can drain)
+//
+// Larger surge/unavailable budgets mean more replicas can move per step —
+// this is the primary "speed knob" for the rollout.
+//
+// ## What ComputeNextStep does, in four phases
+//
+//  1. derivePerSideProgress — for each side, work out where every role
+//     currently sits (which sync window, how far into it). Produces a
+//     `sidesProgress` value carrying both sides' state.
+//
+//  2. pickNextSyncTargets — for each side, find the lowest sync window any
+//     role has reached (= the floor of progress on that side) and aim for the
+//     barrier just above it. Roles ahead of the floor are "parked" — they
+//     wait until everyone else catches up before crossing the next barrier.
+//
+//  3. computeRoleDeltas — for each role, decide how many replicas to add to
+//     new and drain from old this step. The numbers are capped by both the
+//     sync targets (don't overshoot the next barrier) AND the capacity
+//     budgets (don't break the surge ceiling or unavailable floor). If both
+//     budgets are zero but progress is still possible, a +1 fallback ensures
+//     the rollout doesn't deadlock.
+//
+//  4. applyRoleDeltas — turn the per-role deltas into an `UpdateStep` (new
+//     replica counts + updated sync positions for both sides).
+//
+// If no role's count would actually change, ComputeNextStep returns nil —
+// signalling that the rollout has nothing to do this reconcile.
 package disaggregatedset
 
 // RoleStepState tracks a single role's position in the two-level step structure.

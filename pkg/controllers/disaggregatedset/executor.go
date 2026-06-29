@@ -277,7 +277,7 @@ func buildStepLogArgs(roleNames []string, step *UpdateStep) []interface{} {
 		args = append(args,
 			"past_"+name, past.Replicas,
 			"new_"+name, new.Replicas,
-			"sync_"+name, fmt.Sprintf("%d.%d", new.CrossRoleStep, new.RoleStep),
+			"sync_"+name, fmt.Sprintf("%d.%d", new.SyncWindowIndex, new.RoleStep),
 		)
 	}
 	return args
@@ -378,7 +378,7 @@ func (executor *RollingUpdateExecutor) scaleUpNew(
 		}
 		lwsName := disaggregatedsetutils.GenerateName(ds.Name, name, newRevision.Revision)
 		log.Info("Scaling up", "lws", lwsName, "from_spec", currentSpec, "from_ready", currentNew[name], "to", desiredSpec,
-			"syncPoint", fmt.Sprintf("%d.%d", targetNew[name].CrossRoleStep, targetNew[name].RoleStep))
+			"syncPoint", fmt.Sprintf("%d.%d", targetNew[name].SyncWindowIndex, targetNew[name].RoleStep))
 		if err := executor.LWSManager.Scale(ctx, ds.Namespace, lwsName, desiredSpec); err != nil {
 			return fmt.Errorf("failed to scale %s: %w", lwsName, err)
 		}

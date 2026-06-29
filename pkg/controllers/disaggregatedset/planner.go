@@ -36,10 +36,19 @@ limitations under the License.
 package disaggregatedset
 
 // RoleStepState tracks a single role's position in the two-level step structure.
+//
+// The same struct is reused on both sides of an UpdateStep:
+//   - In step.New[role], SyncWindowIndex/RoleStep refer to the NEW revision's
+//     sync sequence (position scaling up toward target).
+//   - In step.Past[role], SyncWindowIndex/RoleStep refer to the OLD revision's
+//     sync sequence (position draining toward 0).
+//
+// The two sides have independent sync sequences (two-minU model), so the
+// indices in step.New and step.Past are not directly comparable.
 type RoleStepState struct {
-	CrossRoleStep int // sync point index this role has reached
-	RoleStep      int // sub-step index within the current sync point
-	Replicas      int // target replica count for this role at this step
+	SyncWindowIndex int // sync point index this role has reached (side-specific)
+	RoleStep        int // sub-step index within the current sync window
+	Replicas        int // target replica count for this role at this step
 }
 
 // UpdateStep is the planner output: the target replica counts per role for
@@ -100,14 +109,14 @@ func numSyncPoints(unit frac) int {
 
 // newSyncTarget returns the target new-replica count for a role at a given
 // new-side sync point.
-func newSyncTarget(target int, syncPct frac) int {
-	return floorFrac(frac{target * syncPct.num, syncPct.den})
+func newSyncTarget(target int, syncPercent frac) int {
+	return floorFrac(frac{target * syncPercent.num, syncPercent.den})
 }
 
 // oldSyncTarget returns the target old-replica count for a role at a given
 // old-side sync point. Old drains down, so this returns the REMAINING old count.
-func oldSyncTarget(initialOld int, syncPct frac) int {
-	remaining := frac{initialOld * (syncPct.den - syncPct.num), syncPct.den}
+func oldSyncTarget(initialOld int, syncPercent frac) int {
+	remaining := frac{initialOld * (syncPercent.den - syncPercent.num), syncPercent.den}
 	return ceilFrac(remaining)
 }
 
@@ -121,7 +130,7 @@ func deriveNewProgress(roleNames []string, targets, currentNew map[string]int, u
 		target := targets[role]
 		cur := currentNew[role]
 		if target == 0 {
-			states[role] = RoleStepState{CrossRoleStep: nSync, RoleStep: 0, Replicas: cur}
+			states[role] = RoleStepState{SyncWindowIndex: nSync, RoleStep: 0, Replicas: cur}
 			continue
 		}
 		crossStep := 0
@@ -139,7 +148,7 @@ func deriveNewProgress(roleNames []string, targets, currentNew map[string]int, u
 				break
 			}
 		}
-		states[role] = RoleStepState{CrossRoleStep: crossStep, RoleStep: roleStep, Replicas: cur}
+		states[role] = RoleStepState{SyncWindowIndex: crossStep, RoleStep: roleStep, Replicas: cur}
 	}
 	return states
 }
@@ -154,7 +163,7 @@ func deriveOldProgress(roleNames []string, initial, currentOld map[string]int, u
 		init := initial[role]
 		cur := currentOld[role]
 		if init == 0 {
-			states[role] = RoleStepState{CrossRoleStep: nSync, RoleStep: 0, Replicas: cur}
+			states[role] = RoleStepState{SyncWindowIndex: nSync, RoleStep: 0, Replicas: cur}
 			continue
 		}
 		crossStep := 0
@@ -172,7 +181,7 @@ func deriveOldProgress(roleNames []string, initial, currentOld map[string]int, u
 				break
 			}
 		}
-		states[role] = RoleStepState{CrossRoleStep: crossStep, RoleStep: roleStep, Replicas: cur}
+		states[role] = RoleStepState{SyncWindowIndex: crossStep, RoleStep: roleStep, Replicas: cur}
 	}
 	return states
 }
@@ -205,18 +214,18 @@ func ComputeNextStep(
 	minNewCross := nNewSync
 	minOldCross := nOldSync
 	for _, role := range roleNames {
-		if newProgress[role].CrossRoleStep < minNewCross {
-			minNewCross = newProgress[role].CrossRoleStep
+		if newProgress[role].SyncWindowIndex < minNewCross {
+			minNewCross = newProgress[role].SyncWindowIndex
 		}
-		if oldProgress[role].CrossRoleStep < minOldCross {
-			minOldCross = oldProgress[role].CrossRoleStep
+		if oldProgress[role].SyncWindowIndex < minOldCross {
+			minOldCross = oldProgress[role].SyncWindowIndex
 		}
 	}
 
 	nextNewSync := min(minNewCross+1, nNewSync)
 	nextOldSync := min(minOldCross+1, nOldSync)
-	newSyncPct := newUnit.mul(nextNewSync)
-	oldSyncPct := oldUnit.mul(nextOldSync)
+	newSyncPercent := newUnit.mul(nextNewSync)
+	oldSyncPercent := oldUnit.mul(nextOldSync)
 
 	pastStep := make(map[string]RoleStepState, len(roleNames))
 	newStep := make(map[string]RoleStepState, len(roleNames))
@@ -228,16 +237,16 @@ func ComputeNextStep(
 		curOld := currentOld[role]
 		cfg := config[role]
 
-		newTarget := newSyncTarget(target, newSyncPct)
-		oldTarget := oldSyncTarget(initial, oldSyncPct)
+		newTarget := newSyncTarget(target, newSyncPercent)
+		oldTarget := oldSyncTarget(initial, oldSyncPercent)
 
 		// Decide each side independently. A role parked at a higher
 		// new-side sync barrier doesn't advance new (preserve within-new
 		// role ratio). Same for old. The two parking decisions are
 		// independent — a role can advance new but be parked on old, or
 		// vice versa.
-		newParked := newProgress[role].CrossRoleStep > minNewCross
-		oldParked := oldProgress[role].CrossRoleStep > minOldCross
+		newParked := newProgress[role].SyncWindowIndex > minNewCross
+		oldParked := oldProgress[role].SyncWindowIndex > minOldCross
 
 		// Capacity envelope for this role.
 		ceiling := max(initial, target) + cfg.MaxSurge
@@ -274,7 +283,7 @@ func ComputeNextStep(
 		nextOld := curOld - drainOld
 
 		// Update each side's sync position separately.
-		nextNewCross := newProgress[role].CrossRoleStep
+		nextNewCross := newProgress[role].SyncWindowIndex
 		nextNewRoleStep := newProgress[role].RoleStep
 		if !newParked {
 			nextNewRoleStep++
@@ -283,7 +292,7 @@ func ComputeNextStep(
 				nextNewRoleStep = 0
 			}
 		}
-		nextOldCross := oldProgress[role].CrossRoleStep
+		nextOldCross := oldProgress[role].SyncWindowIndex
 		nextOldRoleStep := oldProgress[role].RoleStep
 		if !oldParked {
 			nextOldRoleStep++
@@ -294,14 +303,14 @@ func ComputeNextStep(
 		}
 
 		pastStep[role] = RoleStepState{
-			CrossRoleStep: nextOldCross,
-			RoleStep:      nextOldRoleStep,
-			Replicas:      nextOld,
+			SyncWindowIndex: nextOldCross,
+			RoleStep:        nextOldRoleStep,
+			Replicas:        nextOld,
 		}
 		newStep[role] = RoleStepState{
-			CrossRoleStep: nextNewCross,
-			RoleStep:      nextNewRoleStep,
-			Replicas:      nextNew,
+			SyncWindowIndex: nextNewCross,
+			RoleStep:        nextNewRoleStep,
+			Replicas:        nextNew,
 		}
 	}
 

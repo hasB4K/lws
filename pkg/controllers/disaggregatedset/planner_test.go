@@ -217,8 +217,8 @@ func TestSyncPointEnforcement(t *testing.T) {
 		pState := s.New["P"]
 		dlState := s.New["DL"]
 		// P should never be more than 1 sync point ahead of DL.
-		assert.LessOrEqual(t, pState.CrossRoleStep, dlState.CrossRoleStep+1,
-			"step %d: P at sync %d but DL at sync %d", i, pState.CrossRoleStep, dlState.CrossRoleStep)
+		assert.LessOrEqual(t, pState.SyncWindowIndex, dlState.SyncWindowIndex+1,
+			"step %d: P at sync %d but DL at sync %d", i, pState.SyncWindowIndex, dlState.SyncWindowIndex)
 	}
 }
 
@@ -235,7 +235,7 @@ func TestSyncPointStructure_3Roles(t *testing.T) {
 	// Verify that the last step has all roles at sync point 3 (= 1/minimalUnit).
 	last := steps[len(steps)-1]
 	for _, role := range roles {
-		assert.Equal(t, 3, last.New[role].CrossRoleStep,
+		assert.Equal(t, 3, last.New[role].SyncWindowIndex,
 			"role %s should end at sync point 3", role)
 	}
 }
@@ -469,7 +469,7 @@ func formatSteps(steps []UpdateStep) string {
 		os := s.Past["prefill"]
 		out += fmt.Sprintf("%d: oldP=%d oldD=%d newP=%d newD=%d (sync new=%d.%d old=%d.%d)\n",
 			i, op, od, np, nd,
-			ns.CrossRoleStep, ns.RoleStep, os.CrossRoleStep, os.RoleStep)
+			ns.SyncWindowIndex, ns.RoleStep, os.SyncWindowIndex, os.RoleStep)
 	}
 	return out
 }

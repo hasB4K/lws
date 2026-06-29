@@ -270,14 +270,17 @@ func extractRollingUpdateConfigMap(ds *disaggregatedsetv1.DisaggregatedSet, allR
 }
 
 func buildStepLogArgs(roleNames []string, step *UpdateStep) []interface{} {
-	args := make([]interface{}, 0, len(roleNames)*6)
+	args := make([]interface{}, 0, len(roleNames)*8)
 	for _, name := range roleNames {
 		past := step.Past[name]
-		new := step.New[name]
+		newSide := step.New[name]
+		// Log both sides' sync positions — in the two-minU model each side has
+		// its own sync sequence and the indices are not directly comparable.
 		args = append(args,
 			"past_"+name, past.Replicas,
-			"new_"+name, new.Replicas,
-			"sync_"+name, fmt.Sprintf("%d.%d", new.SyncWindowIndex, new.RoleStep),
+			"new_"+name, newSide.Replicas,
+			"sync_new_"+name, fmt.Sprintf("%d.%d", newSide.SyncWindowIndex, newSide.RoleStep),
+			"sync_old_"+name, fmt.Sprintf("%d.%d", past.SyncWindowIndex, past.RoleStep),
 		)
 	}
 	return args

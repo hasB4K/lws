@@ -120,70 +120,78 @@ func oldSyncTarget(initialOld int, syncPercent frac) int {
 	return ceilFrac(remaining)
 }
 
-// deriveNewProgress computes each role's new-side sync position from the
-// current new-replica count relative to the new revision's sync points.
-// A role with target=0 (e.g. a removed role) is reported as fully done.
-func deriveNewProgress(roleNames []string, targets, currentNew map[string]int, unit frac) map[string]RoleStepState {
+// sideDirection selects which "side" of a rolling update deriveSideProgress
+// reports on. The two sides are mirror images of each other: NEW ramps up
+// from 0 to target; OLD drains from initial down to 0.
+type sideDirection int
+
+const (
+	sideUp   sideDirection = iota // NEW side: 0 → target
+	sideDown                      // OLD side: initial → 0
+)
+
+// deriveSideProgress reports each role's position in its side's sync sequence.
+// "N" is the role's far-end count (target for sideUp, initialOld for sideDown);
+// "cur" is its current replica count. A role with N=0 is reported as fully done.
+//
+// SyncWindowIndex is the highest sync barrier the role has reached/crossed.
+// RoleStep counts sub-step replicas advanced beyond that barrier toward the next.
+func deriveSideProgress(roleNames []string, N, cur map[string]int, unit frac, dir sideDirection) map[string]RoleStepState {
 	nSync := numSyncPoints(unit)
 	states := make(map[string]RoleStepState, len(roleNames))
+
 	for _, role := range roleNames {
-		target := targets[role]
-		cur := currentNew[role]
-		if target == 0 {
-			states[role] = RoleStepState{SyncWindowIndex: nSync, RoleStep: 0, Replicas: cur}
+		n := N[role]
+		c := cur[role]
+		if n == 0 {
+			states[role] = RoleStepState{SyncWindowIndex: nSync, Replicas: c}
 			continue
 		}
-		crossStep := 0
-		roleStep := 0
+
+		crossStep, roleStep := 0, 0
 		for s := 1; s <= nSync; s++ {
-			if cur >= newSyncTarget(target, unit.mul(s)) {
+			target := sideTargetAt(n, unit.mul(s), dir)
+			if sideReached(c, target, dir) {
 				crossStep = s
 				roleStep = 0
-			} else {
-				prev := 0
-				if s > 1 {
-					prev = newSyncTarget(target, unit.mul(s-1))
-				}
-				roleStep = cur - prev
-				break
+				continue
 			}
+			// Not yet at sync s; compute distance from the previous sync barrier.
+			prev := sideBaseline(n, dir)
+			if s > 1 {
+				prev = sideTargetAt(n, unit.mul(s-1), dir)
+			}
+			if c >= prev {
+				roleStep = c - prev
+			} else {
+				roleStep = prev - c
+			}
+			break
 		}
-		states[role] = RoleStepState{SyncWindowIndex: crossStep, RoleStep: roleStep, Replicas: cur}
+		states[role] = RoleStepState{SyncWindowIndex: crossStep, RoleStep: roleStep, Replicas: c}
 	}
 	return states
 }
 
-// deriveOldProgress computes each role's old-side sync position. Old drains, so
-// "progress" means "how much has been drained" — we measure curOld against
-// per-sync oldTarget (remaining count). A role with initialOld=0 is fully done.
-func deriveOldProgress(roleNames []string, initial, currentOld map[string]int, unit frac) map[string]RoleStepState {
-	nSync := numSyncPoints(unit)
-	states := make(map[string]RoleStepState, len(roleNames))
-	for _, role := range roleNames {
-		init := initial[role]
-		cur := currentOld[role]
-		if init == 0 {
-			states[role] = RoleStepState{SyncWindowIndex: nSync, RoleStep: 0, Replicas: cur}
-			continue
-		}
-		crossStep := 0
-		roleStep := 0
-		for s := 1; s <= nSync; s++ {
-			if cur <= oldSyncTarget(init, unit.mul(s)) {
-				crossStep = s
-				roleStep = 0
-			} else {
-				prev := init
-				if s > 1 {
-					prev = oldSyncTarget(init, unit.mul(s-1))
-				}
-				roleStep = prev - cur
-				break
-			}
-		}
-		states[role] = RoleStepState{SyncWindowIndex: crossStep, RoleStep: roleStep, Replicas: cur}
+func sideTargetAt(n int, p frac, dir sideDirection) int {
+	if dir == sideUp {
+		return newSyncTarget(n, p)
 	}
-	return states
+	return oldSyncTarget(n, p)
+}
+
+func sideReached(cur, target int, dir sideDirection) bool {
+	if dir == sideUp {
+		return cur >= target
+	}
+	return cur <= target
+}
+
+func sideBaseline(n int, dir sideDirection) int {
+	if dir == sideUp {
+		return 0
+	}
+	return n
 }
 
 // ComputeNextStep computes the next scaling step for a rolling update.
@@ -206,8 +214,8 @@ func ComputeNextStep(
 	nNewSync := numSyncPoints(newUnit)
 	nOldSync := numSyncPoints(oldUnit)
 
-	newProgress := deriveNewProgress(roleNames, targetNew, currentNew, newUnit)
-	oldProgress := deriveOldProgress(roleNames, initialOld, currentOld, oldUnit)
+	newProgress := deriveSideProgress(roleNames, targetNew, currentNew, newUnit, sideUp)
+	oldProgress := deriveSideProgress(roleNames, initialOld, currentOld, oldUnit, sideDown)
 
 	// Per-side floor of progress: only roles AT this level can advance to the
 	// next sync barrier on that side. Coordinates roles within a revision.

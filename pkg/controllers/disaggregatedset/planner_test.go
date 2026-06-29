@@ -565,6 +565,104 @@ func TestComputeAllSteps_Golden(t *testing.T) {
 }
 
 // =============================================================================
+// deriveSideProgress Tests (unified new/old)
+// =============================================================================
+
+// TestDeriveSideProgress_Up exercises the NEW side (ramping up from 0).
+func TestDeriveSideProgress_Up(t *testing.T) {
+	roles := []string{"prefill", "decode"}
+	unit := frac{1, 4}
+	target := map[string]int{"prefill": 8, "decode": 4}
+
+	cases := []struct {
+		name        string
+		current     map[string]int
+		wantPrefill RoleStepState
+		wantDecode  RoleStepState
+	}{
+		{
+			name:        "at start (sync 0)",
+			current:     map[string]int{"prefill": 0, "decode": 0},
+			wantPrefill: RoleStepState{SyncWindowIndex: 0, RoleStep: 0, Replicas: 0},
+			wantDecode:  RoleStepState{SyncWindowIndex: 0, RoleStep: 0, Replicas: 0},
+		},
+		{
+			name:        "at sync 1 for both",
+			current:     map[string]int{"prefill": 2, "decode": 1},
+			wantPrefill: RoleStepState{SyncWindowIndex: 1, RoleStep: 0, Replicas: 2},
+			wantDecode:  RoleStepState{SyncWindowIndex: 1, RoleStep: 0, Replicas: 1},
+		},
+		{
+			name:        "mid-window for prefill, parked decode",
+			current:     map[string]int{"prefill": 3, "decode": 1},
+			wantPrefill: RoleStepState{SyncWindowIndex: 1, RoleStep: 1, Replicas: 3},
+			wantDecode:  RoleStepState{SyncWindowIndex: 1, RoleStep: 0, Replicas: 1},
+		},
+		{
+			name:        "complete",
+			current:     map[string]int{"prefill": 8, "decode": 4},
+			wantPrefill: RoleStepState{SyncWindowIndex: 4, RoleStep: 0, Replicas: 8},
+			wantDecode:  RoleStepState{SyncWindowIndex: 4, RoleStep: 0, Replicas: 4},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveSideProgress(roles, target, tc.current, unit, sideUp)
+			assert.Equal(t, tc.wantPrefill, got["prefill"])
+			assert.Equal(t, tc.wantDecode, got["decode"])
+		})
+	}
+}
+
+// TestDeriveSideProgress_Down exercises the OLD side (draining from initial to 0).
+func TestDeriveSideProgress_Down(t *testing.T) {
+	roles := []string{"prefill", "decode"}
+	unit := frac{1, 4}
+	initial := map[string]int{"prefill": 8, "decode": 4}
+
+	cases := []struct {
+		name        string
+		current     map[string]int
+		wantPrefill RoleStepState
+		wantDecode  RoleStepState
+	}{
+		{
+			name:        "at start (no drain yet)",
+			current:     map[string]int{"prefill": 8, "decode": 4},
+			wantPrefill: RoleStepState{SyncWindowIndex: 0, RoleStep: 0, Replicas: 8},
+			wantDecode:  RoleStepState{SyncWindowIndex: 0, RoleStep: 0, Replicas: 4},
+		},
+		{
+			name:        "at sync 1 (25% drained)",
+			current:     map[string]int{"prefill": 6, "decode": 3},
+			wantPrefill: RoleStepState{SyncWindowIndex: 1, RoleStep: 0, Replicas: 6},
+			wantDecode:  RoleStepState{SyncWindowIndex: 1, RoleStep: 0, Replicas: 3},
+		},
+		{
+			name:        "mid-window for prefill, parked decode",
+			current:     map[string]int{"prefill": 5, "decode": 3},
+			wantPrefill: RoleStepState{SyncWindowIndex: 1, RoleStep: 1, Replicas: 5},
+			wantDecode:  RoleStepState{SyncWindowIndex: 1, RoleStep: 0, Replicas: 3},
+		},
+		{
+			name:        "fully drained",
+			current:     map[string]int{"prefill": 0, "decode": 0},
+			wantPrefill: RoleStepState{SyncWindowIndex: 4, RoleStep: 0, Replicas: 0},
+			wantDecode:  RoleStepState{SyncWindowIndex: 4, RoleStep: 0, Replicas: 0},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveSideProgress(roles, initial, tc.current, unit, sideDown)
+			assert.Equal(t, tc.wantPrefill, got["prefill"])
+			assert.Equal(t, tc.wantDecode, got["decode"])
+		})
+	}
+}
+
+// =============================================================================
 // Default Config Tests
 // =============================================================================
 

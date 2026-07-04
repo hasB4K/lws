@@ -238,6 +238,16 @@ func buildPlannerState(
 				targetNew[i] = currentNew[i]
 				continue
 			}
+			// Monotonicity guard for External roles: an HPA scale-down
+			// arriving mid-rollout must not force the planner into a
+			// scale-down direction on a fleet that has not finished
+			// growing. Clamp the new-revision target to at least the
+			// current new-revision replica count; the guard releases
+			// naturally once the new revision reaches its previous target
+			// and stabilizes.
+			if roleIsExternal(ds, roleName) && target < currentNew[i] {
+				target = currentNew[i]
+			}
 			targetNew[i] = target
 		}
 	}

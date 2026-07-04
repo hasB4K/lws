@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
+	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	disaggregatedsetutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 	"sigs.k8s.io/lws/test/wrappers"
 )
@@ -281,6 +282,70 @@ func TestReconcile_ScalerStatusWriteback(t *testing.T) {
 	ready := findCondition(currentScaler.Status.Conditions, disaggregatedsetv1.ScalerReady)
 	require.NotNil(t, ready)
 	assert.Equal(t, metav1.ConditionTrue, ready.Status)
+}
+
+func TestBuildPlannerState_MonotonicityGuard(t *testing.T) {
+	// External role with a mid-rollout state:
+	//   - old revision is on its drain trajectory (5 replicas)
+	//   - new revision has grown to 3 replicas
+	//   - HPA has just written scaler.spec.replicas = 2 (shrink)
+	// The guard should clamp targetNew to currentNew (=3), preventing a
+	// mid-rollout scale-down flip.
+	ds := wrappers.BuildDisaggregatedSet("myds", "default").
+		WithRoleExternal("prefill", "img").
+		Obj()
+	scalers := map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler{
+		"prefill": wrappers.BuildDisaggregatedSetRoleScaler("s", "default").
+			WithTargetRef("myds", "prefill").WithReplicas(2).Obj(),
+	}
+
+	allRoles := []string{"prefill"}
+	specRoleSet := map[string]bool{"prefill": true}
+
+	oldRevisions := disaggregatedsetutils.RevisionRolesList{{
+		Revision: "old",
+		Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+			"prefill": makeLWS(withReplicas(5), withReadyReplicas(5), withInitialReplicasAnnotation(5)),
+		},
+	}}
+	newRevision := disaggregatedsetutils.RevisionRoles{
+		Revision: "new",
+		Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+			"prefill": makeLWS(withReplicas(3), withReadyReplicas(3)),
+		},
+	}
+
+	_, _, currentNew, targetNew := buildPlannerState(ds, allRoles, specRoleSet, oldRevisions, newRevision, scalers)
+	assert.Equal(t, 3, currentNew[0])
+	assert.Equal(t, 3, targetNew[0],
+		"monotonicity guard: targetNew must not fall below currentNew for External roles")
+}
+
+func TestBuildPlannerState_GuardReleasesOnceStable(t *testing.T) {
+	// Once the new revision reaches the HPA's target and stabilizes, the
+	// guard has no effect: targetNew tracks the scaler value exactly.
+	ds := wrappers.BuildDisaggregatedSet("myds", "default").
+		WithRoleExternal("prefill", "img").
+		Obj()
+	scalers := map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler{
+		"prefill": wrappers.BuildDisaggregatedSetRoleScaler("s", "default").
+			WithTargetRef("myds", "prefill").WithReplicas(7).Obj(),
+	}
+
+	allRoles := []string{"prefill"}
+	specRoleSet := map[string]bool{"prefill": true}
+
+	oldRevisions := disaggregatedsetutils.RevisionRolesList{}
+	newRevision := disaggregatedsetutils.RevisionRoles{
+		Revision: "new",
+		Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+			"prefill": makeLWS(withReplicas(5), withReadyReplicas(5)),
+		},
+	}
+
+	_, _, currentNew, targetNew := buildPlannerState(ds, allRoles, specRoleSet, oldRevisions, newRevision, scalers)
+	assert.Equal(t, 5, currentNew[0])
+	assert.Equal(t, 7, targetNew[0], "guard must not clamp when scaler target > currentNew")
 }
 
 func TestErrScalerNotReadyIsSentinel(t *testing.T) {

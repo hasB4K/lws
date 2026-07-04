@@ -245,6 +245,10 @@ func setupControllers(mgr ctrl.Manager, certsReady chan struct{}, cfg configapi.
 			setupLog.Error(err, "unable to create disaggregatedset webhook", "webhook", "DisaggregatedSet")
 			os.Exit(1)
 		}
+		if err := disaggregatedsetwebhook.SetupDisaggregatedSetRoleScalerWebhook(mgr); err != nil {
+			setupLog.Error(err, "unable to create disaggregatedsetrolescaler webhook", "webhook", "DisaggregatedSetRoleScaler")
+			os.Exit(1)
+		}
 	}
 	//+kubebuilder:scaffold:builder
 }

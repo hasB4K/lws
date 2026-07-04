@@ -18,6 +18,7 @@ package disaggregatedset
 
 import (
 	"context"
+	"fmt"
 
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,18 +45,41 @@ var _ admission.Validator[*disaggv1.DisaggregatedSet] = &DisaggregatedSetWebhook
 // ValidateCreate implements admission.Validator for create operations.
 func (w *DisaggregatedSetWebhook) ValidateCreate(ctx context.Context, disagg *disaggv1.DisaggregatedSet) (admission.Warnings, error) {
 	allErrs := w.validateRoles(disagg)
-	return nil, allErrs.ToAggregate()
+	warns := w.scalingWarnings(disagg)
+	return warns, allErrs.ToAggregate()
 }
 
 // ValidateUpdate implements admission.Validator for update operations.
 func (w *DisaggregatedSetWebhook) ValidateUpdate(ctx context.Context, oldDisagg, newDisagg *disaggv1.DisaggregatedSet) (admission.Warnings, error) {
 	allErrs := w.validateRoles(newDisagg)
-	return nil, allErrs.ToAggregate()
+	warns := w.scalingWarnings(newDisagg)
+	return warns, allErrs.ToAggregate()
 }
 
 // ValidateDelete implements admission.Validator for delete operations.
 func (w *DisaggregatedSetWebhook) ValidateDelete(ctx context.Context, disagg *disaggv1.DisaggregatedSet) (admission.Warnings, error) {
 	return nil, nil
+}
+
+// scalingWarnings emits (non-blocking) warnings when a role's Scaling
+// configuration is inconsistent with its inline spec.replicas. The
+// per-role CEL rule on DisaggregatedRoleSpec already rejects
+// spec.replicas > 0 on External roles, so this only fires as a friendlier
+// message on the way to that rejection.
+func (w *DisaggregatedSetWebhook) scalingWarnings(obj *disaggv1.DisaggregatedSet) admission.Warnings {
+	var warns admission.Warnings
+	for _, role := range obj.Spec.Roles {
+		if role.Scaling == nil || role.Scaling.Mode != disaggv1.RoleScalingExternal {
+			continue
+		}
+		if role.Spec.Replicas != nil && *role.Spec.Replicas > 0 {
+			warns = append(warns, fmt.Sprintf(
+				"role %q uses scaling.mode: External; the inline spec.replicas value (%d) is ignored and must be unset or zero",
+				role.Name, *role.Spec.Replicas,
+			))
+		}
+	}
+	return warns
 }
 
 // validateRoles validates all roles in the DisaggregatedSet spec.

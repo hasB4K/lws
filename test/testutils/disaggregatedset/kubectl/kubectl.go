@@ -39,9 +39,14 @@ type Builder struct {
 	quiet         bool
 }
 
-// Get starts a kubectl get command.
-func Get(resource string) *Builder {
-	return &Builder{cmd: "get", resource: resource}
+// Get starts a kubectl get command. If a name is provided, it targets a
+// specific resource; otherwise the command operates on the collection.
+func Get(resource string, name ...string) *Builder {
+	b := &Builder{cmd: "get", resource: resource}
+	if len(name) > 0 {
+		b.name = name[0]
+	}
+	return b
 }
 
 // Delete starts a kubectl delete command.

@@ -33,6 +33,7 @@ type Role struct {
 	MaxUnavailable intstr.IntOrString
 	Partition      *int // nil = not set, 0 = valid, >0 = invalid (rejected by webhook)
 	HasRollout     bool
+	External       bool              // true => emit scaling.mode: External (and skip inline replicas)
 	Labels         map[string]string // workerTemplate labels (propagate to pods)
 	Annotations    map[string]string // workerTemplate annotations (propagate to pods)
 	LWSLabels      map[string]string // LWS CR metadata labels (for Kueue, exclusive-topology)
@@ -83,9 +84,19 @@ spec:
 			}
 		}
 
+		// Optional external scaling opt-in. Emitted BEFORE spec: so the
+		// per-role CEL rule that forbids spec.replicas>0 on External roles
+		// is satisfied by omitting inline replicas below.
+		if p.External {
+			sb.WriteString("    scaling:\n")
+			sb.WriteString("      mode: External\n")
+		}
+
 		// spec: wraps LeaderWorkerSetSpec fields
 		sb.WriteString("    spec:\n")
-		sb.WriteString(fmt.Sprintf("      replicas: %d\n", p.Replicas))
+		if !p.External {
+			sb.WriteString(fmt.Sprintf("      replicas: %d\n", p.Replicas))
+		}
 
 		if p.HasRollout || p.Partition != nil {
 			sb.WriteString("      rolloutStrategy:\n")
@@ -146,4 +157,42 @@ func PrefillDecode(name string, prefill, decode Role) Config {
 // Ptr returns a pointer to v.
 func Ptr[T any](v T) *T {
 	return &v
+}
+
+// ScalerConfig holds configuration for generating a DisaggregatedSetRoleScaler YAML.
+type ScalerConfig struct {
+	Name          string
+	Namespace     string
+	TargetName    string // DisaggregatedSet name
+	TargetRole    string // role within the DisaggregatedSet
+	Replicas      *int   // omitted when nil (simulates HPA not having written yet)
+	OmitTargetRef bool   // for negative testing: emit an empty targetRef block
+}
+
+// YAML generates a DisaggregatedSetRoleScaler YAML from config.
+func (s ScalerConfig) YAML() string {
+	ns := s.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSetRoleScaler
+metadata:
+  name: %s
+  namespace: %s
+spec:
+`, s.Name, ns))
+
+	if !s.OmitTargetRef {
+		sb.WriteString("  targetRef:\n")
+		sb.WriteString(fmt.Sprintf("    name: %s\n", s.TargetName))
+		sb.WriteString(fmt.Sprintf("    role: %s\n", s.TargetRole))
+	}
+
+	if s.Replicas != nil {
+		sb.WriteString(fmt.Sprintf("  replicas: %d\n", *s.Replicas))
+	}
+
+	return sb.String()
 }

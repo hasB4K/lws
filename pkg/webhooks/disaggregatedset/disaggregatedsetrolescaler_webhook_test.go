@@ -160,8 +160,8 @@ func TestDisaggregatedSetWebhook_ScalingWarning(t *testing.T) {
 					// intentionally leave replicas unset -> no warning
 				},
 				{
-					Name:    "decode",
-					Scaling: &disaggv1.RoleScaling{Mode: disaggv1.RoleScalingExternal},
+					Name:                        "decode",
+					Scaling:                     &disaggv1.RoleScaling{Mode: disaggv1.RoleScalingExternal},
 					LeaderWorkerSetTemplateSpec: leaderworkersetTemplateWithReplicas(4),
 				},
 			},

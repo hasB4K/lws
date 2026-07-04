@@ -96,6 +96,25 @@ rules:
 - apiGroups:
   - disaggregatedset.x-k8s.io
   resources:
+  - disaggregatedsetrolescalers
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - disaggregatedset.x-k8s.io
+  resources:
+  - disaggregatedsetrolescalers/status
+  - disaggregatedsets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - disaggregatedset.x-k8s.io
+  resources:
   - disaggregatedsets
   verbs:
   - create
@@ -110,14 +129,6 @@ rules:
   resources:
   - disaggregatedsets/finalizers
   verbs:
-  - update
-- apiGroups:
-  - disaggregatedset.x-k8s.io
-  resources:
-  - disaggregatedsets/status
-  verbs:
-  - get
-  - patch
   - update
 - apiGroups:
   - leaderworkerset.x-k8s.io

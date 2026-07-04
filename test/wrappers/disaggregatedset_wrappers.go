@@ -79,6 +79,23 @@ func (w *DisaggregatedSetWrapper) WithRoleNoReplicas(name string, image string) 
 	return w
 }
 
+// WithRoleExternal appends a role that opts into external scaling
+// (scaling.mode: External). No inline spec.replicas is set — the scaler
+// resource is the source of truth for the desired count.
+func (w *DisaggregatedSetWrapper) WithRoleExternal(name, image string) *DisaggregatedSetWrapper {
+	w.Spec.Roles = append(w.Spec.Roles, disaggregatedsetv1.DisaggregatedRoleSpec{
+		Name:    name,
+		Scaling: &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal},
+		LeaderWorkerSetTemplateSpec: leaderworkersetv1.LeaderWorkerSetTemplateSpec{Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+			LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+				Size:           ptr.To(int32(1)),
+				WorkerTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: image}}}},
+			},
+		}},
+	})
+	return w
+}
+
 func (w *DisaggregatedSetWrapper) WithRollout(role string, surge, unavail intstr.IntOrString) *DisaggregatedSetWrapper {
 	for i := range w.Spec.Roles {
 		if w.Spec.Roles[i].Name == role {

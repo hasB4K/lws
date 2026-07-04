@@ -53,10 +53,14 @@ type RollingUpdateExecutor struct {
 //     revision exist yet, or
 //  2. Continues an in-progress rolling update (ReconcileRollingUpdate) by
 //     computing and executing the next scale step.
+//
+// scalers holds the DisaggregatedSetRoleScaler for each External-mode role;
+// see ReconcileRollingUpdate for how it is consumed.
 func (executor *RollingUpdateExecutor) ReconcileRollingUpdateNew(
 	ctx context.Context,
 	disaggregatedSet *disaggregatedsetv1.DisaggregatedSet,
 	revision string,
+	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	roleNames := disaggregatedsetutils.GetRoleNames(disaggregatedSet)
@@ -79,7 +83,7 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdateNew(
 		return executor.initRollingUpdate(ctx, disaggregatedSet, revision, roleNames, roleConfigs, oldRevisions)
 	}
 
-	return executor.ReconcileRollingUpdate(ctx, disaggregatedSet, oldRevisions, *newRevision)
+	return executor.ReconcileRollingUpdate(ctx, disaggregatedSet, oldRevisions, *newRevision, scalers)
 }
 
 func (executor *RollingUpdateExecutor) initRollingUpdate(
@@ -127,11 +131,16 @@ func (executor *RollingUpdateExecutor) initRollingUpdate(
 //  2. Compute the next scale step using the planner.
 //  3. Scale up new revision LWS objects.
 //  4. Scale down old revision LWS objects (newest-first, with coordinated drain).
+//
+// The scalers map holds the DisaggregatedSetRoleScaler for each External-mode
+// role; it is loaded once by the reconciler and threaded through so replica
+// targets and rollout config stay consistent within a single reconcile pass.
 func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 	ctx context.Context,
 	disaggregatedSet *disaggregatedsetv1.DisaggregatedSet,
 	oldRevisions disaggregatedsetutils.RevisionRolesList,
 	newRevision disaggregatedsetutils.RevisionRoles,
+	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	specRoleNames := disaggregatedsetutils.GetRoleNames(disaggregatedSet)
@@ -147,8 +156,8 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
-	initialOld, currentOld, currentNew, targetNew := buildPlannerState(disaggregatedSet, allRoleNames, specRoleSet, oldRevisions, newRevision)
-	config := extractRollingUpdateConfig(disaggregatedSet, allRoleNames)
+	initialOld, currentOld, currentNew, targetNew := buildPlannerState(disaggregatedSet, allRoleNames, specRoleSet, oldRevisions, newRevision, scalers)
+	config := extractRollingUpdateConfig(disaggregatedSet, allRoleNames, scalers)
 
 	nextStep := ComputeNextStep(initialOld, currentOld, currentNew, targetNew, config)
 	if nextStep == nil {
@@ -202,6 +211,7 @@ func buildPlannerState(
 	specRoleSet map[string]bool,
 	oldRevisions disaggregatedsetutils.RevisionRolesList,
 	newRevision disaggregatedsetutils.RevisionRoles,
+	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) (initialOld, currentOld, currentNew, targetNew RoleReplicaState) {
 	n := len(allRoleNames)
 	initialOld, currentOld, currentNew, targetNew = make(RoleReplicaState, n), make(RoleReplicaState, n), make(RoleReplicaState, n), make(RoleReplicaState, n)
@@ -214,25 +224,30 @@ func buildPlannerState(
 			if lws := newRevision.Roles[roleName]; lws != nil {
 				currentNew[i] = int(getLWSReplicas(lws))
 			}
-			targetNew[i] = getTargetReplicas(ds, roleName)
+			target, err := getTargetReplicas(ds, roleName, scalers)
+			if err != nil {
+				// External role with no ready scaler: hold the role at its
+				// current new-revision replica count. This produces the
+				// correct behavior in two situations:
+				//   1. Initial creation — currentNew is 0, so we create the
+				//      LWS at 0 and let it scale up once the scaler appears.
+				//   2. Scaler deleted mid-run — currentNew is the last
+				//      observed count, so the LWS holds instead of draining
+				//      until the user either recreates the scaler or flips
+				//      the role back to Static.
+				targetNew[i] = currentNew[i]
+				continue
+			}
+			targetNew[i] = target
 		}
 	}
 	return
 }
 
-func getTargetReplicas(ds *disaggregatedsetv1.DisaggregatedSet, roleName string) int {
-	for _, p := range ds.Spec.Roles {
-		if p.Name == roleName {
-			if p.Spec.Replicas == nil {
-				return 1
-			}
-			return int(*p.Spec.Replicas)
-		}
-	}
-	return 1
-}
+// extractRollingUpdateConfig now lives here; getTargetReplicas moved to scaler.go
+// so it can consult a scaler map for External-mode roles.
 
-func extractRollingUpdateConfig(ds *disaggregatedsetv1.DisaggregatedSet, allRoleNames []string) []RollingUpdateConfig {
+func extractRollingUpdateConfig(ds *disaggregatedsetv1.DisaggregatedSet, allRoleNames []string, scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler) []RollingUpdateConfig {
 	config := DefaultRollingUpdateConfig(len(allRoleNames))
 
 	roleIndex := make(map[string]int, len(allRoleNames))
@@ -243,7 +258,13 @@ func extractRollingUpdateConfig(ds *disaggregatedsetv1.DisaggregatedSet, allRole
 	for _, role := range ds.Spec.Roles {
 		if rc := role.Spec.RolloutStrategy.RollingUpdateConfiguration; rc != nil {
 			i := roleIndex[role.Name]
-			replicas := getTargetReplicas(ds, role.Name)
+			replicas, err := getTargetReplicas(ds, role.Name, scalers)
+			if err != nil {
+				// External role with no ready scaler — skip surge/unavail
+				// customization for this role; defaults are applied and the
+				// role holds in place (see buildPlannerState).
+				continue
+			}
 			// Use GetScaledValueFromIntOrPercent to handle both integers and percentages.
 			// For maxSurge, round up (true); for maxUnavailable, round down (false).
 			surge, _ := intstr.GetScaledValueFromIntOrPercent(&rc.MaxSurge, replicas, true)

@@ -1,0 +1,203 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+  labels:
+    app.kubernetes.io/instance: lws
+    app.kubernetes.io/name: lws
+  name: disaggregatedsetrolescalers.disaggregatedset.x-k8s.io
+spec:
+  group: disaggregatedset.x-k8s.io
+  names:
+    kind: DisaggregatedSetRoleScaler
+    listKind: DisaggregatedSetRoleScalerList
+    plural: disaggregatedsetrolescalers
+    shortNames:
+      - dsrs
+    singular: disaggregatedsetrolescaler
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .spec.targetRef.name
+          name: Target
+          type: string
+        - jsonPath: .spec.targetRef.role
+          name: Role
+          type: string
+        - jsonPath: .spec.replicas
+          name: Desired
+          type: integer
+        - jsonPath: .status.replicas
+          name: Current
+          type: integer
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1
+      schema:
+        openAPIV3Schema:
+          description: |-
+            DisaggregatedSetRoleScaler exposes the /scale subresource for a single
+            (DisaggregatedSet, role) pair, allowing external autoscalers (HPA, KEDA,
+            or any /scale-aware controller) to drive that role's replica count
+            independently of the rest of the DisaggregatedSet.
+
+            The scaler name is stable across rolling updates of the target
+            DisaggregatedSet, which lets an autoscaler pointed at the scaler continue
+            to work when the underlying LeaderWorkerSet's revision-hashed name
+            changes.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: spec defines the desired state of DisaggregatedSetRoleScaler
+              properties:
+                replicas:
+                  description: |-
+                    Replicas is the desired replica count for the referenced role.
+                    Set by the /scale subresource (e.g., by an HPA or KEDA ScaledObject).
+                    Read by the DisaggregatedSet controller when the referenced role is
+                    configured with scaling.mode: External.
+                  format: int32
+                  minimum: 0
+                  type: integer
+                targetRef:
+                  description: |-
+                    TargetRef selects the DisaggregatedSet and role this scaler drives.
+                    The referenced DisaggregatedSet must live in the same namespace as
+                    this scaler.
+                  properties:
+                    name:
+                      description: Name is the DisaggregatedSet name in the same namespace as the scaler.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    role:
+                      description: |-
+                        Role is the role name within the referenced DisaggregatedSet
+                        (matches spec.roles[].name).
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                    - name
+                    - role
+                  type: object
+              required:
+                - targetRef
+              type: object
+            status:
+              description: status defines the observed state of DisaggregatedSetRoleScaler
+              properties:
+                conditions:
+                  description: |-
+                    Conditions represent the current state of the scaler.
+
+                    Standard condition types include:
+                    - "Ready": the scaler has resolved its target and status is fresh
+                    - "TargetMissing": the referenced DisaggregatedSet or role is not resolvable
+                    - "Conflicting": another scaler in this namespace targets the same (set, role) pair
+                  items:
+                    description: Condition contains details for one aspect of the current state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                observedGeneration:
+                  description: ObservedGeneration is the .metadata.generation the status reflects.
+                  format: int64
+                  type: integer
+                replicas:
+                  description: |-
+                    Replicas is the observed replica count of the role's current
+                    new-revision LeaderWorkerSet. Reported to /scale readers.
+                  format: int32
+                  type: integer
+                selector:
+                  description: |-
+                    Selector is a label selector, in string form, matching pods of the
+                    role's current new-revision LeaderWorkerSet. Used by HorizontalPodAutoscaler
+                    to compute per-pod metrics against the correct pod set. The
+                    DisaggregatedSet controller rewrites this on every rolling update
+                    because the LeaderWorkerSet name changes with the revision hash.
+                  type: string
+              type: object
+          required:
+            - spec
+          type: object
+      served: true
+      storage: true
+      subresources:
+        scale:
+          labelSelectorPath: .status.selector
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.replicas
+        status: {}

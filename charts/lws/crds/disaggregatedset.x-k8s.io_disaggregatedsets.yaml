@@ -78,6 +78,23 @@ spec:
                         minLength: 1
                         pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
+                      scaling:
+                        description: |-
+                          Scaling configures how the desired replica count for this role is
+                          determined. Omit for the default Static mode (inline spec.replicas).
+                        properties:
+                          mode:
+                            default: Static
+                            description: |-
+                              Mode selects the source of the replica count:
+                                - Static (default): read from the inline spec.replicas value.
+                                - External: read from a DisaggregatedSetRoleScaler whose targetRef
+                                  points at this DisaggregatedSet and role.
+                            enum:
+                              - Static
+                              - External
+                            type: string
+                        type: object
                       spec:
                         description: spec defines the behavior of an LWS.
                         properties:
@@ -16837,6 +16854,9 @@ spec:
                     required:
                       - name
                     type: object
+                    x-kubernetes-validations:
+                      - message: spec.replicas must be unset or zero when scaling.mode is External
+                        rule: '!has(self.scaling) || self.scaling.mode != ''External'' || !has(self.spec.replicas) || self.spec.replicas == 0'
                   maxItems: 10
                   minItems: 2
                   type: array
@@ -16847,8 +16867,8 @@ spec:
                 - roles
               type: object
               x-kubernetes-validations:
-                - message: replicas must be zero for all roles or non-zero for all roles
-                  rule: self.roles.all(r, !has(r.spec.replicas) || r.spec.replicas == 0) || self.roles.all(r, has(r.spec.replicas) && r.spec.replicas > 0)
+                - message: replicas must be zero for all non-External roles or non-zero for all non-External roles
+                  rule: self.roles.filter(r, !has(r.scaling) || r.scaling.mode != 'External').all(r, !has(r.spec.replicas) || r.spec.replicas == 0) || self.roles.filter(r, !has(r.scaling) || r.scaling.mode != 'External').all(r, has(r.spec.replicas) && r.spec.replicas > 0)
             status:
               description: status defines the observed state of DisaggregatedSet
               properties:

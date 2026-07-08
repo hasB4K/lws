@@ -26,18 +26,19 @@ import (
 
 // Role holds configuration for a single role.
 type Role struct {
-	Name           string
-	Replicas       int
-	Image          string
-	MaxSurge       intstr.IntOrString
-	MaxUnavailable intstr.IntOrString
-	Partition      *int // nil = not set, 0 = valid, >0 = invalid (rejected by webhook)
-	HasRollout     bool
-	External       bool              // true => emit scaling.mode: External (and skip inline replicas)
-	Labels         map[string]string // workerTemplate labels (propagate to pods)
-	Annotations    map[string]string // workerTemplate annotations (propagate to pods)
-	LWSLabels      map[string]string // LWS CR metadata labels (for Kueue, exclusive-topology)
-	LWSAnnotations map[string]string // LWS CR metadata annotations
+	Name            string
+	Replicas        int
+	Image           string
+	MaxSurge        intstr.IntOrString
+	MaxUnavailable  intstr.IntOrString
+	Partition       *int // nil = not set, 0 = valid, >0 = invalid (rejected by webhook)
+	HasRollout      bool
+	External        bool              // true => emit scaling.mode: External (and skip inline replicas)
+	InitialReplicas *int              // when External: emitted as scaling.initialReplicas
+	Labels          map[string]string // workerTemplate labels (propagate to pods)
+	Annotations     map[string]string // workerTemplate annotations (propagate to pods)
+	LWSLabels       map[string]string // LWS CR metadata labels (for Kueue, exclusive-topology)
+	LWSAnnotations  map[string]string // LWS CR metadata annotations
 }
 
 // Config holds configuration for generating DisaggregatedSet YAML.
@@ -90,6 +91,9 @@ spec:
 		if p.External {
 			sb.WriteString("    scaling:\n")
 			sb.WriteString("      mode: External\n")
+			if p.InitialReplicas != nil {
+				sb.WriteString(fmt.Sprintf("      initialReplicas: %d\n", *p.InitialReplicas))
+			}
 		}
 
 		// spec: wraps LeaderWorkerSetSpec fields

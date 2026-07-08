@@ -18,6 +18,8 @@ package disaggregatedset
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -156,26 +158,132 @@ func roleIsExternal(ds *disaggregatedsetv1.DisaggregatedSet, roleName string) bo
 	return role != nil && role.Scaling != nil && role.Scaling.Mode == disaggregatedsetv1.RoleScalingExternal
 }
 
-// ensureScalerOwnerRef attaches a non-controller, non-blocking owner
-// reference from the DisaggregatedSet to the scaler so the scaler is
-// garbage-collected when the DisaggregatedSet is deleted, without
-// transferring ownership away from the user. It is a no-op if the ref is
-// already present.
-func (r *DisaggregatedSetReconciler) ensureScalerOwnerRef(
+// ScalerName returns the deterministic name of the auto-created scaler for
+// a given (DisaggregatedSet, role) pair: "<ds>-<role>".
+//
+// Kubernetes limits object names to 253 characters. Since roles are bounded
+// at 63 chars (validated on DisaggregatedRoleSpec.Name) and DS names are
+// bounded at 253, this can technically exceed the limit; we truncate the
+// DS-name portion and append a short hash to keep the result unique.
+func ScalerName(dsName, roleName string) string {
+	const maxLen = 253
+	full := fmt.Sprintf("%s-%s", dsName, roleName)
+	if len(full) <= maxLen {
+		return full
+	}
+	// Reserve room for the role, a separator, and an 8-char hash suffix.
+	reserved := len(roleName) + 1 + 1 + 8
+	head := dsName
+	if len(head) > maxLen-reserved {
+		head = head[:maxLen-reserved]
+	}
+	sum := sha256.Sum256([]byte(dsName))
+	return fmt.Sprintf("%s-%s-%s", head, roleName, hex.EncodeToString(sum[:4]))
+}
+
+// ensureScalerForRole creates the DisaggregatedSetRoleScaler for an
+// External-mode role if it does not already exist. The scaler carries a
+// controller owner reference back to the DisaggregatedSet so it is garbage
+// collected when the DisaggregatedSet is deleted (Deployment→ReplicaSet
+// pattern).
+//
+// If the scaler already exists (created by a previous reconcile), the
+// function is a no-op — its spec.replicas is subsequently driven by
+// external autoscalers via the /scale subresource, not by the DS controller.
+func (r *DisaggregatedSetReconciler) ensureScalerForRole(
 	ctx context.Context,
 	ds *disaggregatedsetv1.DisaggregatedSet,
-	scaler *disaggregatedsetv1.DisaggregatedSetRoleScaler,
+	role *disaggregatedsetv1.DisaggregatedRoleSpec,
+) (*disaggregatedsetv1.DisaggregatedSetRoleScaler, error) {
+	name := ScalerName(ds.Name, role.Name)
+	scaler := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: ds.Namespace, Name: name}, scaler)
+	if err == nil {
+		return scaler, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to get scaler %s: %w", name, err)
+	}
+
+	// Not found — create it.
+	desired := &disaggregatedsetv1.DisaggregatedSetRoleScaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ds.Namespace,
+			Labels: map[string]string{
+				disaggregatedsetv1.SetNameLabelKey: ds.Name,
+				disaggregatedsetv1.RoleLabelKey:    role.Name,
+			},
+		},
+		Spec: disaggregatedsetv1.DisaggregatedSetRoleScalerSpec{
+			TargetRef: disaggregatedsetv1.DisaggregatedSetRoleRef{
+				Name: ds.Name,
+				Role: role.Name,
+			},
+		},
+	}
+	if role.Scaling != nil && role.Scaling.InitialReplicas != nil {
+		v := *role.Scaling.InitialReplicas
+		desired.Spec.Replicas = &v
+	}
+	if err := controllerutil.SetControllerReference(ds, desired, r.Scheme); err != nil {
+		return nil, fmt.Errorf("failed to set controller reference on scaler %s: %w", name, err)
+	}
+	if err := r.Create(ctx, desired); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// Lost a race — refetch and return the existing object.
+			if getErr := r.Get(ctx, types.NamespacedName{Namespace: ds.Namespace, Name: name}, desired); getErr == nil {
+				return desired, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to create scaler %s: %w", name, err)
+	}
+	return desired, nil
+}
+
+// deleteObsoleteScalers removes scalers whose target role is no longer
+// External on the DisaggregatedSet (either because the role's mode flipped
+// back to Static, or because the role was removed entirely). Only scalers
+// with the deterministic auto-create name and a controller ownerRef to
+// this DS are deleted; user-created scalers (if any) are left alone.
+func (r *DisaggregatedSetReconciler) deleteObsoleteScalers(
+	ctx context.Context,
+	ds *disaggregatedsetv1.DisaggregatedSet,
+	existing []*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) error {
-	for _, ref := range scaler.OwnerReferences {
-		if ref.UID == ds.UID {
-			return nil
+	external := make(map[string]bool)
+	for _, role := range ds.Spec.Roles {
+		if role.Scaling != nil && role.Scaling.Mode == disaggregatedsetv1.RoleScalingExternal {
+			external[role.Name] = true
 		}
 	}
-	updated := scaler.DeepCopy()
-	if err := controllerutil.SetOwnerReference(ds, updated, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set owner reference on scaler %s: %w", scaler.Name, err)
+
+	for _, s := range existing {
+		role := s.Spec.TargetRef.Role
+		if external[role] {
+			continue
+		}
+		if s.Name != ScalerName(ds.Name, role) {
+			continue // not our auto-created scaler
+		}
+		if !isControlledBy(s, ds) {
+			continue // user's scaler; leave it alone
+		}
+		if err := r.Delete(ctx, s); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete obsolete scaler %s: %w", s.Name, err)
+		}
 	}
-	return r.Patch(ctx, updated, client.MergeFrom(scaler))
+	return nil
+}
+
+// isControlledBy reports whether obj has a controller owner reference to owner.
+func isControlledBy(obj metav1.Object, owner metav1.Object) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.UID == owner.GetUID() && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
 }
 
 // writeBackScalerStatus updates each scaler's status.replicas,

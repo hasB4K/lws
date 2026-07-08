@@ -359,9 +359,22 @@ determined.</p>
    <p>Mode selects the source of the replica count:</p>
 <ul>
 <li>Static (default): read from the inline spec.replicas value.</li>
-<li>External: read from a DisaggregatedSetRoleScaler whose targetRef
-points at this DisaggregatedSet and role.</li>
+<li>External: the DisaggregatedSet controller auto-creates a
+DisaggregatedSetRoleScaler named &quot;<!-- raw HTML omitted -->-<!-- raw HTML omitted -->&quot;
+whose /scale subresource an external autoscaler drives.</li>
 </ul>
+</td>
+</tr>
+<tr><td><code>initialReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>InitialReplicas seeds the auto-created DisaggregatedSetRoleScaler's
+spec.replicas so the role has a cold-start replica count before an
+external autoscaler makes its first write. Applies only when Mode
+is External. If unset, the role holds at 0 replicas until an
+autoscaler writes a value; leaving it unset only works with
+autoscalers that can scale from zero (e.g. KEDA with idleReplicaCount).</p>
 </td>
 </tr>
 </tbody>

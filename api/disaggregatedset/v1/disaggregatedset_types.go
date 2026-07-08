@@ -49,10 +49,11 @@ const (
 	// This is the default and preserves pre-scaler behavior.
 	RoleScalingStatic RoleScalingMode = "Static"
 
-	// RoleScalingExternal expects a DisaggregatedSetRoleScaler whose
-	// targetRef points at this DisaggregatedSet and role. The scaler's
-	// spec.replicas is authoritative; the inline spec.replicas on the role
-	// is ignored and must not be set to a non-zero value.
+	// RoleScalingExternal delegates the replica count to an external
+	// autoscaler (HPA, KEDA, or any /scale-aware controller) via a
+	// DisaggregatedSetRoleScaler that the DisaggregatedSet controller
+	// auto-creates for the role. The inline spec.replicas on the role is
+	// ignored and must not be set to a non-zero value.
 	RoleScalingExternal RoleScalingMode = "External"
 )
 
@@ -61,11 +62,22 @@ const (
 type RoleScaling struct {
 	// Mode selects the source of the replica count:
 	//   - Static (default): read from the inline spec.replicas value.
-	//   - External: read from a DisaggregatedSetRoleScaler whose targetRef
-	//     points at this DisaggregatedSet and role.
+	//   - External: the DisaggregatedSet controller auto-creates a
+	//     DisaggregatedSetRoleScaler named "<disaggregatedset>-<role>"
+	//     whose /scale subresource an external autoscaler drives.
 	// +kubebuilder:default=Static
 	// +optional
 	Mode RoleScalingMode `json:"mode,omitempty"`
+
+	// InitialReplicas seeds the auto-created DisaggregatedSetRoleScaler's
+	// spec.replicas so the role has a cold-start replica count before an
+	// external autoscaler makes its first write. Applies only when Mode
+	// is External. If unset, the role holds at 0 replicas until an
+	// autoscaler writes a value; leaving it unset only works with
+	// autoscalers that can scale from zero (e.g. KEDA with idleReplicaCount).
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	InitialReplicas *int32 `json:"initialReplicas,omitempty"`
 }
 
 // DisaggregatedRoleSpec defines the configuration for a disaggregated role.

@@ -182,9 +182,11 @@ func TestLoadScalersForDS_DropsConflicts(t *testing.T) {
 	assert.NotContains(t, scalers, "prefill", "conflicting scalers must be dropped from the map")
 }
 
-// --- Reconcile end-to-end with scaler ---
+// --- Reconcile end-to-end with autocreate scaler ---
 
-func TestReconcile_WaitingForScaler_HoldsAtZero(t *testing.T) {
+func TestReconcile_AutoCreatesScaler_NoInitialReplicas(t *testing.T) {
+	// Without InitialReplicas the auto-created scaler has spec.replicas=nil;
+	// the role holds at 0 with WaitingForScaler=True until an autoscaler writes.
 	ds := wrappers.BuildDisaggregatedSet("myds", "default").
 		WithRoleExternal("prefill", "img").
 		WithRole("decode", 2, "img").
@@ -200,28 +202,41 @@ func TestReconcile_WaitingForScaler_HoldsAtZero(t *testing.T) {
 	_, err := r.Reconcile(context.Background(), reqFor(ds))
 	require.NoError(t, err)
 
+	// Scaler is auto-created with deterministic name.
+	scalerName := ScalerName(ds.Name, "prefill")
+	created := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: scalerName}, created))
+	assert.Equal(t, ds.Name, created.Spec.TargetRef.Name)
+	assert.Equal(t, "prefill", created.Spec.TargetRef.Role)
+	assert.Nil(t, created.Spec.Replicas, "no InitialReplicas => nil")
+	require.Len(t, created.OwnerReferences, 1)
+	assert.True(t, created.OwnerReferences[0].Controller != nil && *created.OwnerReferences[0].Controller,
+		"scaler must be controller-owned by the DS")
+	assert.Equal(t, ds.UID, created.OwnerReferences[0].UID)
+
+	// Role holds at 0; decode unaffected.
 	assert.Equal(t, int32(2), getLWSReplicasForRole(t, fakeClient, ds, "decode"))
 	assert.Equal(t, int32(0), getLWSReplicasForRole(t, fakeClient, ds, "prefill"))
 
 	current := &disaggregatedsetv1.DisaggregatedSet{}
 	require.NoError(t, fakeClient.Get(context.Background(), reqFor(ds).NamespacedName, current))
 	waiting := findCondition(current.Status.Conditions, ConditionWaitingForScaler)
-	require.NotNil(t, waiting, "WaitingForScaler condition must be set")
+	require.NotNil(t, waiting)
 	assert.Equal(t, metav1.ConditionTrue, waiting.Status)
 }
 
-func TestReconcile_ScalerDrivesReplicas(t *testing.T) {
+func TestReconcile_AutoCreatesScaler_WithInitialReplicas(t *testing.T) {
+	// InitialReplicas=3 seeds the auto-created scaler; the role scales to 3
+	// immediately and WaitingForScaler stays False.
 	ds := wrappers.BuildDisaggregatedSet("myds", "default").
-		WithRoleExternal("prefill", "img").
+		WithRoleExternalInitial("prefill", "img", 3).
 		WithRole("decode", 2, "img").
 		Obj()
 
-	scaler := wrappers.BuildDisaggregatedSetRoleScaler("prefill-scaler", "default").
-		WithTargetRef("myds", "prefill").WithReplicas(5).Obj()
-
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(testSchemeForUnit()).
-		WithObjects(ds, scaler).
+		WithObjects(ds).
 		WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSet{}, &disaggregatedsetv1.DisaggregatedSetRoleScaler{}).
 		Build()
 	r := newTestReconciler(fakeClient)
@@ -229,37 +244,105 @@ func TestReconcile_ScalerDrivesReplicas(t *testing.T) {
 	_, err := r.Reconcile(context.Background(), reqFor(ds))
 	require.NoError(t, err)
 
-	assert.Equal(t, int32(5), getLWSReplicasForRole(t, fakeClient, ds, "prefill"))
+	scalerName := ScalerName(ds.Name, "prefill")
+	created := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: scalerName}, created))
+	require.NotNil(t, created.Spec.Replicas)
+	assert.Equal(t, int32(3), *created.Spec.Replicas)
+
+	assert.Equal(t, int32(3), getLWSReplicasForRole(t, fakeClient, ds, "prefill"))
 	assert.Equal(t, int32(2), getLWSReplicasForRole(t, fakeClient, ds, "decode"))
 
-	// DS should not be waiting.
 	current := &disaggregatedsetv1.DisaggregatedSet{}
 	require.NoError(t, fakeClient.Get(context.Background(), reqFor(ds).NamespacedName, current))
 	if waiting := findCondition(current.Status.Conditions, ConditionWaitingForScaler); waiting != nil {
 		assert.Equal(t, metav1.ConditionFalse, waiting.Status)
 	}
-
-	// Owner ref on scaler should now reference the DS.
-	currentScaler := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
-	require.NoError(t, fakeClient.Get(context.Background(),
-		types.NamespacedName{Namespace: "default", Name: "prefill-scaler"}, currentScaler))
-	require.Len(t, currentScaler.OwnerReferences, 1)
-	assert.Equal(t, "DisaggregatedSet", currentScaler.OwnerReferences[0].Kind)
-	assert.Equal(t, ds.UID, currentScaler.OwnerReferences[0].UID)
 }
 
-func TestReconcile_ScalerStatusWriteback(t *testing.T) {
+func TestReconcile_ExistingScalerReplicasDriveLWS(t *testing.T) {
+	// After the scaler is auto-created, an external autoscaler updates
+	// spec.replicas via /scale. The next reconcile drives the LWS to that value.
 	ds := wrappers.BuildDisaggregatedSet("myds", "default").
 		WithRoleExternal("prefill", "img").
 		WithRole("decode", 2, "img").
 		Obj()
 
-	scaler := wrappers.BuildDisaggregatedSetRoleScaler("prefill-scaler", "default").
-		WithTargetRef("myds", "prefill").WithReplicas(3).Obj()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(testSchemeForUnit()).
+		WithObjects(ds).
+		WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSet{}, &disaggregatedsetv1.DisaggregatedSetRoleScaler{}).
+		Build()
+	r := newTestReconciler(fakeClient)
+
+	// First reconcile creates the scaler.
+	_, err := r.Reconcile(context.Background(), reqFor(ds))
+	require.NoError(t, err)
+
+	// Simulate HPA writing to /scale.
+	scalerName := ScalerName(ds.Name, "prefill")
+	created := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: scalerName}, created))
+	created.Spec.Replicas = ptr.To[int32](5)
+	require.NoError(t, fakeClient.Update(context.Background(), created))
+
+	// Second reconcile picks up the new value and scales the LWS.
+	_, err = r.Reconcile(context.Background(), reqFor(ds))
+	require.NoError(t, err)
+	assert.Equal(t, int32(5), getLWSReplicasForRole(t, fakeClient, ds, "prefill"))
+}
+
+func TestReconcile_DeletesScalerWhenRoleFlipsToStatic(t *testing.T) {
+	// A role that starts External and then flips to Static must have its
+	// auto-created scaler garbage collected.
+	dsExt := wrappers.BuildDisaggregatedSet("myds", "default").
+		WithRoleExternalInitial("prefill", "img", 2).
+		WithRole("decode", 2, "img").
+		Obj()
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(testSchemeForUnit()).
-		WithObjects(ds, scaler).
+		WithObjects(dsExt).
+		WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSet{}, &disaggregatedsetv1.DisaggregatedSetRoleScaler{}).
+		Build()
+	r := newTestReconciler(fakeClient)
+
+	_, err := r.Reconcile(context.Background(), reqFor(dsExt))
+	require.NoError(t, err)
+
+	scalerName := ScalerName(dsExt.Name, "prefill")
+	created := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+	require.NoError(t, fakeClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: scalerName}, created),
+		"scaler must exist after the first reconcile of an External role")
+
+	// Flip the role to Static (drop the Scaling block, set inline replicas).
+	current := &disaggregatedsetv1.DisaggregatedSet{}
+	require.NoError(t, fakeClient.Get(context.Background(), reqFor(dsExt).NamespacedName, current))
+	current.Spec.Roles[0].Scaling = nil
+	current.Spec.Roles[0].Spec.Replicas = ptr.To[int32](2)
+	require.NoError(t, fakeClient.Update(context.Background(), current))
+
+	_, err = r.Reconcile(context.Background(), reqFor(dsExt))
+	require.NoError(t, err)
+
+	// Scaler should be gone.
+	err = fakeClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: scalerName}, created)
+	require.Error(t, err, "scaler must be deleted when the role is no longer External")
+}
+
+func TestReconcile_ScalerStatusWriteback(t *testing.T) {
+	ds := wrappers.BuildDisaggregatedSet("myds", "default").
+		WithRoleExternalInitial("prefill", "img", 3).
+		WithRole("decode", 2, "img").
+		Obj()
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(testSchemeForUnit()).
+		WithObjects(ds).
 		WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSet{}, &disaggregatedsetv1.DisaggregatedSetRoleScaler{}).
 		Build()
 	r := newTestReconciler(fakeClient)
@@ -269,9 +352,10 @@ func TestReconcile_ScalerStatusWriteback(t *testing.T) {
 
 	// Scaler status should reflect the new-revision LWS and carry the
 	// selector pointing at that LWS name.
+	scalerName := ScalerName(ds.Name, "prefill")
 	currentScaler := &disaggregatedsetv1.DisaggregatedSetRoleScaler{}
 	require.NoError(t, fakeClient.Get(context.Background(),
-		types.NamespacedName{Namespace: "default", Name: "prefill-scaler"}, currentScaler))
+		types.NamespacedName{Namespace: "default", Name: scalerName}, currentScaler))
 
 	revision := disaggregatedsetutils.ComputeRevision(ds.Spec.Roles)
 	expectedLWSName := disaggregatedsetutils.GenerateName(ds.Name, "prefill", revision)

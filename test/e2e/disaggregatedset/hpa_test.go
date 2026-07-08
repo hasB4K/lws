@@ -17,6 +17,7 @@ limitations under the License.
 package e2e
 
 import (
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -30,11 +31,17 @@ import (
 	"sigs.k8s.io/lws/test/testutils/disaggregatedset/kubectl"
 )
 
-// hpaDSName is the DisaggregatedSet used by the HPA e2e suite.
+// hpaDSName is the DisaggregatedSet used by the HPA e2e suite. The
+// auto-created scaler for the prefill role therefore lives at
+// "<hpaDSName>-prefill" — the DS controller uses this deterministic name.
 const hpaDSName = "hpa-e2e"
 
-// getScalerObservedReplicas returns status.replicas of the scaler as a string
-// ("" when the status field has not been written yet).
+// autoScalerName is the deterministic scaler name that the DS controller
+// creates for the prefill role.
+func autoScalerName(role string) string {
+	return fmt.Sprintf("%s-%s", hpaDSName, role)
+}
+
 func getScalerObservedReplicas(name string) string {
 	out, _ := kubectl.Get("disaggregatedsetrolescaler", name).
 		Namespace("default").
@@ -43,7 +50,6 @@ func getScalerObservedReplicas(name string) string {
 	return strings.TrimSpace(out)
 }
 
-// getScalerSelector returns status.selector of the scaler.
 func getScalerSelector(name string) string {
 	out, _ := kubectl.Get("disaggregatedsetrolescaler", name).
 		Namespace("default").
@@ -52,8 +58,14 @@ func getScalerSelector(name string) string {
 	return strings.TrimSpace(out)
 }
 
-// hpaLWSReplicas returns spec.replicas of the (single) LWS for the HPA test's
-// DisaggregatedSet + role. Fails via Gomega if no LWS is found.
+func getScalerSpecReplicas(name string) string {
+	out, _ := kubectl.Get("disaggregatedsetrolescaler", name).
+		Namespace("default").
+		JSONPath("{.spec.replicas}").
+		RunQuiet()
+	return strings.TrimSpace(out)
+}
+
 func hpaLWSReplicas(role string) int {
 	out, err := kubectl.LWSByRole(hpaDSName, role).
 		JSONPath("{.items[0].spec.replicas}").
@@ -66,8 +78,6 @@ func hpaLWSReplicas(role string) int {
 	return n
 }
 
-// getDSCondition returns "" if condition is missing, else its status
-// ("True", "False", "Unknown").
 func getDSCondition(deploymentName, condType string) string {
 	out, _ := kubectl.Get("disaggregatedset", deploymentName).
 		Namespace("default").
@@ -76,8 +86,6 @@ func getDSCondition(deploymentName, condType string) string {
 	return strings.TrimSpace(out)
 }
 
-// scaleScaler writes spec.replicas via the /scale subresource — mirrors what
-// an HPA / KEDA controller does.
 func scaleScaler(name string, replicas int) error {
 	cmd := exec.Command("kubectl", "scale", "disaggregatedsetrolescaler", name,
 		"--replicas", strconv.Itoa(replicas), "-n", "default")
@@ -85,38 +93,54 @@ func scaleScaler(name string, replicas int) error {
 	return err
 }
 
-var _ = Describe("DisaggregatedSet HPA integration (KEP-849)", Ordered, func() {
+var _ = Describe("DisaggregatedSet HPA integration — autocreate (KEP-849)", Ordered, func() {
 	SetDefaultEventuallyTimeout(2 * time.Minute)
 	SetDefaultEventuallyPollingInterval(time.Second)
 
 	const dsName = hpaDSName
-	const scalerName = "hpa-e2e-prefill-scaler"
+	scalerName := autoScalerName("prefill")
 
 	AfterAll(func() {
-		By("cleaning up any DisaggregatedSetRoleScaler left over")
+		By("cleaning up the DisaggregatedSet (cascades to the auto-created scaler)")
+		kubectl.CleanupDeployment(dsName)
 		_, _ = kubectl.Delete("disaggregatedsetrolescaler", scalerName).
 			Namespace("default").IgnoreNotFound().RunQuiet()
-
-		By("cleaning up the DisaggregatedSet")
-		kubectl.CleanupDeployment(dsName)
 	})
 
-	It("holds External role at 0 replicas and sets WaitingForScaler when no scaler exists", func() {
-		By("applying a DisaggregatedSet with an External prefill role and a Static decode role")
+	It("auto-creates a scaler for an External role and seeds it from initialReplicas", func() {
+		By("applying a DisaggregatedSet with an External prefill role (initialReplicas: 2) + Static decode role")
 		yaml := fixtures.Config{
 			Name:      dsName,
 			Namespace: "default",
 			Roles: []fixtures.Role{
-				{Name: "prefill", External: true},
+				{Name: "prefill", External: true, InitialReplicas: fixtures.Ptr(2)},
 				{Name: "decode", Replicas: 1},
 			},
 		}.YAML()
 		Expect(applyYAML(yaml)).To(Succeed())
 
-		By("verifying the prefill LWS is created at 0 replicas")
+		By("verifying the scaler was auto-created at the deterministic name")
 		Eventually(func(g Gomega) {
-			g.Expect(kubectl.CountLWSByRole(dsName, "prefill")).To(Equal(1))
-			g.Expect(hpaLWSReplicas("prefill")).To(Equal(0))
+			out, err := kubectl.Get("disaggregatedsetrolescaler", scalerName).
+				Namespace("default").
+				JSONPath("{.metadata.name}").
+				RunQuiet()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.TrimSpace(out)).To(Equal(scalerName))
+		}).Should(Succeed())
+
+		By("verifying the auto-created scaler is controller-owned by the DS")
+		out, err := kubectl.Get("disaggregatedsetrolescaler", scalerName).
+			Namespace("default").
+			JSONPath("{.metadata.ownerReferences[0].controller}").
+			RunQuiet()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(out)).To(Equal("true"))
+
+		By("verifying the scaler seed value made the prefill LWS scale to 2")
+		Eventually(func(g Gomega) {
+			g.Expect(getScalerSpecReplicas(scalerName)).To(Equal("2"))
+			g.Expect(hpaLWSReplicas("prefill")).To(Equal(2))
 		}).Should(Succeed())
 
 		By("verifying the decode LWS is created and scales to 1")
@@ -124,37 +148,9 @@ var _ = Describe("DisaggregatedSet HPA integration (KEP-849)", Ordered, func() {
 			g.Expect(hpaLWSReplicas("decode")).To(Equal(1))
 		}).Should(Succeed())
 
-		By("verifying DisaggregatedSet reports WaitingForScaler=True")
-		Eventually(func(g Gomega) {
-			g.Expect(getDSCondition(dsName, "WaitingForScaler")).To(Equal("True"))
-		}).Should(Succeed())
-	})
-
-	It("scales the prefill LWS to spec.replicas of the scaler when the scaler is created", func() {
-		By("creating a DisaggregatedSetRoleScaler with replicas: 2")
-		scalerYAML := fixtures.ScalerConfig{
-			Name:       scalerName,
-			Namespace:  "default",
-			TargetName: dsName,
-			TargetRole: "prefill",
-			Replicas:   fixtures.Ptr(2),
-		}.YAML()
-		Expect(applyYAML(scalerYAML)).To(Succeed())
-
-		By("verifying the prefill LWS scales to 2")
-		Eventually(func(g Gomega) {
-			g.Expect(hpaLWSReplicas("prefill")).To(Equal(2))
-		}).Should(Succeed())
-
-		By("verifying WaitingForScaler flips to False")
+		By("verifying WaitingForScaler is False (scaler exists and has replicas)")
 		Eventually(func(g Gomega) {
 			g.Expect(getDSCondition(dsName, "WaitingForScaler")).To(Equal("False"))
-		}).Should(Succeed())
-
-		By("verifying the scaler status.replicas mirrors the observed LWS replicas")
-		Eventually(func(g Gomega) {
-			g.Expect(getScalerObservedReplicas(scalerName)).To(Equal("2"))
-			g.Expect(getScalerSelector(scalerName)).To(ContainSubstring("leaderworkerset.sigs.k8s.io/name="))
 		}).Should(Succeed())
 	})
 
@@ -170,51 +166,41 @@ var _ = Describe("DisaggregatedSet HPA integration (KEP-849)", Ordered, func() {
 		By("verifying scaler.status.replicas reflects the new observed count")
 		Eventually(func(g Gomega) {
 			g.Expect(getScalerObservedReplicas(scalerName)).To(Equal("4"))
+			g.Expect(getScalerSelector(scalerName)).To(ContainSubstring("leaderworkerset.sigs.k8s.io/name="))
 		}).Should(Succeed())
 	})
 
-	It("holds the LWS at its last replica count when the scaler is deleted mid-run", func() {
-		By("deleting the scaler")
+	It("recreates the scaler if the user deletes it, and holds the LWS at its current count", func() {
+		By("deleting the auto-created scaler")
 		_, err := kubectl.Delete("disaggregatedsetrolescaler", scalerName).
 			Namespace("default").
 			RunQuiet()
 		Expect(err).NotTo(HaveOccurred())
 
-		By("verifying DisaggregatedSet flips to WaitingForScaler=True but LWS holds at 4")
-		Eventually(func(g Gomega) {
-			g.Expect(getDSCondition(dsName, "WaitingForScaler")).To(Equal("True"))
-			g.Expect(hpaLWSReplicas("prefill")).To(Equal(4))
-		}).Should(Succeed())
-	})
-
-	It("garbage-collects the scaler when the DisaggregatedSet is deleted", func() {
-		By("recreating the scaler so we can observe GC")
-		scalerYAML := fixtures.ScalerConfig{
-			Name:       scalerName,
-			Namespace:  "default",
-			TargetName: dsName,
-			TargetRole: "prefill",
-			Replicas:   fixtures.Ptr(1),
-		}.YAML()
-		Expect(applyYAML(scalerYAML)).To(Succeed())
-
-		By("waiting for the scaler to receive its owner reference")
+		By("verifying the controller recreates the scaler")
 		Eventually(func(g Gomega) {
 			out, err := kubectl.Get("disaggregatedsetrolescaler", scalerName).
 				Namespace("default").
-				JSONPath("{.metadata.ownerReferences[0].kind}").
+				JSONPath("{.metadata.name}").
 				RunQuiet()
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(strings.TrimSpace(out)).To(Equal("DisaggregatedSet"))
+			g.Expect(strings.TrimSpace(out)).To(Equal(scalerName))
 		}).Should(Succeed())
 
+		By("verifying the LWS holds at 4 (WaitingForScaler until HPA writes again)")
+		Consistently(func(g Gomega) {
+			g.Expect(hpaLWSReplicas("prefill")).To(Equal(4))
+		}, 15*time.Second, time.Second).Should(Succeed())
+	})
+
+	It("garbage-collects the scaler when the DisaggregatedSet is deleted", func() {
 		By("deleting the DisaggregatedSet")
 		_, err := kubectl.Delete("disaggregatedset", dsName).
 			Namespace("default").
 			RunQuiet()
 		Expect(err).NotTo(HaveOccurred())
 
-		By("verifying the scaler is garbage collected")
+		By("verifying the scaler is garbage-collected via the controller ownerRef")
 		Eventually(func(g Gomega) {
 			out, _ := kubectl.Get("disaggregatedsetrolescaler", scalerName).
 				Namespace("default").

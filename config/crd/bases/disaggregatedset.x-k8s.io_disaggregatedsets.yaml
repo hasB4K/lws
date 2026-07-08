@@ -81,13 +81,25 @@ spec:
                         Scaling configures how the desired replica count for this role is
                         determined. Omit for the default Static mode (inline spec.replicas).
                       properties:
+                        initialReplicas:
+                          description: |-
+                            InitialReplicas seeds the auto-created DisaggregatedSetRoleScaler's
+                            spec.replicas so the role has a cold-start replica count before an
+                            external autoscaler makes its first write. Applies only when Mode
+                            is External. If unset, the role holds at 0 replicas until an
+                            autoscaler writes a value; leaving it unset only works with
+                            autoscalers that can scale from zero (e.g. KEDA with idleReplicaCount).
+                          format: int32
+                          minimum: 0
+                          type: integer
                         mode:
                           default: Static
                           description: |-
                             Mode selects the source of the replica count:
                               - Static (default): read from the inline spec.replicas value.
-                              - External: read from a DisaggregatedSetRoleScaler whose targetRef
-                                points at this DisaggregatedSet and role.
+                              - External: the DisaggregatedSet controller auto-creates a
+                                DisaggregatedSetRoleScaler named "<disaggregatedset>-<role>"
+                                whose /scale subresource an external autoscaler drives.
                           enum:
                           - Static
                           - External

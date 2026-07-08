@@ -80,12 +80,28 @@ func (w *DisaggregatedSetWrapper) WithRoleNoReplicas(name string, image string) 
 }
 
 // WithRoleExternal appends a role that opts into external scaling
-// (scaling.mode: External). No inline spec.replicas is set — the scaler
-// resource is the source of truth for the desired count.
+// (scaling.mode: External) with no initialReplicas seed. The auto-created
+// scaler starts with spec.replicas=nil; the role holds at 0 until an
+// external autoscaler writes a value.
 func (w *DisaggregatedSetWrapper) WithRoleExternal(name, image string) *DisaggregatedSetWrapper {
+	return w.appendExternalRole(name, image, nil)
+}
+
+// WithRoleExternalInitial appends a role that opts into external scaling
+// with an initialReplicas seed. The auto-created scaler starts with
+// spec.replicas=initial so the role has a cold-start count before an
+// external autoscaler writes.
+func (w *DisaggregatedSetWrapper) WithRoleExternalInitial(name, image string, initial int32) *DisaggregatedSetWrapper {
+	return w.appendExternalRole(name, image, ptr.To(initial))
+}
+
+func (w *DisaggregatedSetWrapper) appendExternalRole(name, image string, initial *int32) *DisaggregatedSetWrapper {
 	w.Spec.Roles = append(w.Spec.Roles, disaggregatedsetv1.DisaggregatedRoleSpec{
-		Name:    name,
-		Scaling: &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal},
+		Name: name,
+		Scaling: &disaggregatedsetv1.RoleScaling{
+			Mode:            disaggregatedsetv1.RoleScalingExternal,
+			InitialReplicas: initial,
+		},
 		LeaderWorkerSetTemplateSpec: leaderworkersetv1.LeaderWorkerSetTemplateSpec{Spec: leaderworkersetv1.LeaderWorkerSetSpec{
 			LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
 				Size:           ptr.To(int32(1)),

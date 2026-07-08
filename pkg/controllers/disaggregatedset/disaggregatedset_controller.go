@@ -81,14 +81,18 @@ func (r *DisaggregatedSetReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Step 1: Compute the target revision hash from the spec's role templates.
 	revision := disaggregatedsetutils.ComputeRevision(disaggregatedSet.Spec.Roles)
 
-	// Step 2: Load scalers. `allScalers` is the full list (used for status
-	// writeback and owner-ref bookkeeping); `scalers` is keyed by role with
-	// conflicting entries removed (used for replica resolution).
-	scalers, allScalers, err := r.loadScalersForDS(ctx, disaggregatedSet)
-	if err != nil {
+	// Step 2: Reconcile scalers. For every role with scaling.mode: External
+	// we ensure a DisaggregatedSetRoleScaler named "<ds>-<role>" exists
+	// (created with a controller ownerRef so it is GC'd with the DS).
+	// Scalers whose target role is no longer External are deleted. Then
+	// we load the current set: `scalers` is keyed by role (used for
+	// replica resolution); `allScalers` is the full list (used for status
+	// writeback).
+	if err := r.reconcileScalers(ctx, disaggregatedSet); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileScalerOwnerRefs(ctx, disaggregatedSet, allScalers); err != nil {
+	scalers, allScalers, err := r.loadScalersForDS(ctx, disaggregatedSet)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -164,19 +168,42 @@ func findNewRevisionRoles(all disaggregatedsetutils.RevisionRolesList, revision 
 	return nil
 }
 
-// reconcileScalerOwnerRefs ensures each scaler carries a non-controller
-// owner reference to the DisaggregatedSet, so scaler CRs are GC'd on set
-// deletion without transferring ownership away from the user.
-func (r *DisaggregatedSetReconciler) reconcileScalerOwnerRefs(
+// reconcileScalers ensures every External-mode role has an auto-created
+// DisaggregatedSetRoleScaler and that no stale auto-created scalers linger
+// for roles that are no longer External (or that have been removed from
+// the spec).
+func (r *DisaggregatedSetReconciler) reconcileScalers(
 	ctx context.Context,
 	ds *disaggregatedsetv1.DisaggregatedSet,
-	scalers []*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) error {
-	for _, s := range scalers {
-		if err := r.ensureScalerOwnerRef(ctx, ds, s); err != nil {
+	// Create-if-missing for each External role.
+	for i := range ds.Spec.Roles {
+		role := &ds.Spec.Roles[i]
+		if role.Scaling == nil || role.Scaling.Mode != disaggregatedsetv1.RoleScalingExternal {
+			continue
+		}
+		if _, err := r.ensureScalerForRole(ctx, ds, role); err != nil {
 			return err
 		}
 	}
+
+	// List everything targeting this DS and prune the auto-created ones
+	// whose role is no longer External.
+	_, all, err := r.loadScalersForDS(ctx, ds)
+	if err != nil {
+		return err
+	}
+	return r.deleteObsoleteScalers(ctx, ds, all)
+}
+
+// reconcileScalerOwnerRefs is retained as a no-op stub for now — the
+// autocreate flow sets a controller owner reference at scaler creation
+// time via ensureScalerForRole, so no separate reconciliation is needed.
+func (r *DisaggregatedSetReconciler) reconcileScalerOwnerRefs(
+	_ context.Context,
+	_ *disaggregatedsetv1.DisaggregatedSet,
+	_ []*disaggregatedsetv1.DisaggregatedSetRoleScaler,
+) error {
 	return nil
 }
 

@@ -90,8 +90,7 @@ func (manager *ServiceManager) ReconcileServices(
 	// Check if target revision is ready on all roles
 	targetRevisionReady := slices.Contains(readyRevisions, targetRevision)
 
-	// Only create services for the target revision (current spec).
-	// If target revision is not ready, keep existing services unchanged to prevent flip-flop.
+	// If the target revision is not ready, keep existing services unchanged to prevent flip-flop.
 	// This ensures we only ever move forward to the new version, never backward.
 	if !targetRevisionReady {
 		log.V(1).Info("Target revision not ready on all roles, keeping existing services",
@@ -100,10 +99,18 @@ func (manager *ServiceManager) ReconcileServices(
 		return nil
 	}
 
-	// Create/ensure headless portless Services for all roles
-	for _, roleName := range roleNames {
-		if err := manager.ensureService(ctx, deployment, roleName, targetRevision); err != nil {
-			return fmt.Errorf("failed to ensure service for %s: %w", roleName, err)
+	// Create/ensure headless portless Services for every ready revision, not just the target.
+	// During a rolling update, both the previous and the update revisions can be Ready at the
+	// same time. Consumers that discover backends via the per-revision -prv Services
+	// (EndpointSlice-based discovery) need one Service per ready revision so they can keep
+	// serving traffic to the previous revision until it fully drains. If the previous
+	// revision's Service is missing, its pods become invisible to those consumers even while
+	// Ready, and all traffic collapses onto the (possibly under-scaled) update revision.
+	for _, revision := range readyRevisions {
+		for _, roleName := range roleNames {
+			if err := manager.ensureService(ctx, deployment, roleName, revision); err != nil {
+				return fmt.Errorf("failed to ensure service for %s/%s: %w", revision, roleName, err)
+			}
 		}
 	}
 

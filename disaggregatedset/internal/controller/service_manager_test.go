@@ -424,6 +424,62 @@ func TestServiceManager(t *testing.T) {
 		}, &corev1.Service{})
 		assert.Error(t, err, "old decode service should be deleted after drain")
 	})
+
+	t.Run("creates services for previous ready revision missing its -prv", func(t *testing.T) {
+		// Regression: during a rolling update, if the previous revision's -prv Services
+		// don't already exist (e.g. deleted during a transient 0-ready window, or the
+		// revision was created by an older operator version), the reconciler used to
+		// only create Services for the target revision. That left the previous revision's
+		// Ready pods invisible to EndpointSlice-based discovery clients, collapsing all
+		// traffic onto the (possibly under-scaled) update revision. The reconciler must
+		// create -prv Services for every ready revision, not just the target.
+		deployment := createTestDeployment("test-deploy", "default")
+
+		// No pre-existing services for either revision.
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(deployment).Build()
+		serviceManager := NewServiceManager(fakeClient, scheme)
+
+		// Both revisions are Ready simultaneously (rolling update in progress).
+		groupedWorkloads := GroupedWorkloads{
+			{
+				Revision: "old12345",
+				Roles: map[string]WorkloadInfo{
+					testServiceRolePrefill: {Name: "test-old12345-prefill", ReadyReplicas: 12},
+					testServiceRoleDecode:  {Name: "test-old12345-decode", ReadyReplicas: 8},
+				},
+			},
+			{
+				Revision: "new12345",
+				Roles: map[string]WorkloadInfo{
+					testServiceRolePrefill: {Name: "test-new12345-prefill", ReadyReplicas: 2},
+					testServiceRoleDecode:  {Name: "test-new12345-decode", ReadyReplicas: 1},
+				},
+			},
+		}
+
+		err := serviceManager.ReconcileServices(ctx, deployment, groupedWorkloads, "new12345")
+		require.NoError(t, err)
+
+		// -prv Services must exist for BOTH revisions and BOTH roles.
+		for _, tc := range []struct {
+			revision string
+			role     string
+		}{
+			{"old12345", testServiceRolePrefill},
+			{"old12345", testServiceRoleDecode},
+			{"new12345", testServiceRolePrefill},
+			{"new12345", testServiceRoleDecode},
+		} {
+			svc := &corev1.Service{}
+			err := fakeClient.Get(ctx, types.NamespacedName{
+				Name:      GenerateServiceName(deployment.Name, tc.role, tc.revision),
+				Namespace: deployment.Namespace,
+			}, svc)
+			require.NoError(t, err, "service for %s/%s should exist", tc.revision, tc.role)
+			assert.Equal(t, tc.revision, svc.Spec.Selector[LabelRevision])
+			assert.Equal(t, tc.role, svc.Spec.Selector[LabelDisaggRole])
+		}
+	})
 }
 
 func TestGenerateServiceName(t *testing.T) {

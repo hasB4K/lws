@@ -1,0 +1,45 @@
+# RBAC for the storage-promotion Job.
+# Needs cluster-wide list+get+update on DisaggregatedSets so it can iterate
+# every namespace and re-save each object.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: disaggregatedset-storage-promoter
+  namespace: disaggregatedset-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: disaggregatedset-storage-promoter
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+  # Re-save DisaggregatedSets to trigger storage-version upgrade.
+  - apiGroups: ["disaggregatedset.x-k8s.io"]
+    resources: ["disaggregatedsets"]
+    verbs: ["get", "list", "update"]
+  - apiGroups: ["disaggregatedset.x-k8s.io"]
+    resources: ["disaggregatedsets/status"]
+    verbs: ["get", "update"]
+  # Patch the CRD to flip storage=true from v1alpha1 to v1.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    resourceNames: ["disaggregatedsets.disaggregatedset.x-k8s.io"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: disaggregatedset-storage-promoter
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: disaggregatedset-storage-promoter
+subjects:
+  - kind: ServiceAccount
+    name: disaggregatedset-storage-promoter
+    namespace: disaggregatedset-system

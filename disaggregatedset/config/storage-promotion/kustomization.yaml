@@ -1,0 +1,22 @@
+# Storage-promotion overlay.
+#
+# Applied AFTER config/default (or config/crd-only + config/operator-only)
+# is stable and the operator is serving the v1<->v1alpha1 conversion webhook.
+#
+# The overlay consists of a single Kubernetes Job that:
+#   1. Flips the DisaggregatedSet CRD's spec.versions[] storage flag from
+#      v1alpha1 to v1 via `kubectl patch`.
+#   2. Re-saves every existing DisaggregatedSet across all namespaces via
+#      `kubectl get | kubectl replace`, forcing objects still stored as
+#      v1alpha1 bytes to be re-persisted as v1 bytes.
+#
+# Kept as an imperative Job (not a kustomize CRD patch) so this overlay does
+# NOT claim Argo ownership of the CRD — the CRD stays owned by the
+# disaggset-crd ApplicationSet, avoiding SharedResourceWarning conflicts.
+#
+# Idempotent: re-running is a no-op (storage already flipped, replace of an
+# already-v1 object produces identical bytes).
+
+resources:
+  - rbac.yaml
+  - job.yaml

@@ -1,0 +1,26 @@
+# Operator-only kustomize target.
+#
+# Renders everything the operator needs at runtime except the CRD itself:
+# Deployment, ServiceAccount, RBAC, webhook Service + ValidatingWebhookConfiguration,
+# metrics Service. The CRD is expected to already exist on the cluster
+# (installed via config/crd-only or via an upstream chart that ships it).
+#
+# Intended to be owned by an Argo ApplicationSet with resources-finalizer so
+# that removing the operator entry cascade-deletes these resources; the CRD,
+# managed elsewhere, survives.
+#
+# For local dev, prefer config/default which combines CRD + operator + webhook.
+
+namespace: disaggregatedset-system
+namePrefix: disaggregatedset-
+
+resources:
+- ../rbac
+- ../manager
+- ../webhook
+- metrics_service.yaml
+
+patches:
+- path: manager_metrics_patch.yaml
+  target:
+    kind: Deployment

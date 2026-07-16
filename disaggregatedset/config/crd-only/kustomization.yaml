@@ -1,0 +1,13 @@
+# CRD-only kustomize target.
+#
+# Renders only the DisaggregatedSet CRD (dual-version, conversion webhook
+# enabled). Intended to be owned by a dedicated Argo ApplicationSet so that
+# CRD ownership can be handed off cleanly when the operator is uninstalled:
+# removing the operator ApplicationSet does NOT drop the CRD, and removing
+# this CRD ApplicationSet leaves the CRD in place (prune=false is expected
+# on the Argo side).
+#
+# For local dev, prefer config/default which combines CRD + operator + webhook.
+
+resources:
+- ../crd

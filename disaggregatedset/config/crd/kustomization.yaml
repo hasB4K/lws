@@ -6,11 +6,11 @@ resources:
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
-# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix.
-# patches here are for enabling the conversion webhook for each CRD
+# Enables the conversion webhook on the CRD (spec.conversion.strategy=Webhook).
+# The caBundle is injected at runtime by the operator's cert-controller.
+- path: patches/webhook_in_disaggregatedsets.yaml
 # +kubebuilder:scaffold:crdkustomizewebhookpatch
 
-# [WEBHOOK] To enable webhook, uncomment the following section
 # the following config is for teaching kustomize how to do kustomization for CRDs.
 #configurations:
 #- kustomizeconfig.yaml

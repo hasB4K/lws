@@ -28,12 +28,19 @@ const (
 	validateWebhookConfName = "disaggregatedset-validating-webhook-configuration"
 	caName                  = "disaggregatedset-ca"
 	caOrg                   = "disaggregatedset"
+
+	// disaggSetCRDName is the name of the DisaggregatedSet CRD, into which
+	// this manager injects a caBundle for the conversion webhook.
+	disaggSetCRDName = "disaggregatedsets.disaggregatedset.x-k8s.io"
 )
 
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;update
 //+kubebuilder:rbac:groups="admissionregistration.k8s.io",resources=validatingwebhookconfigurations,verbs=get;list;watch;update
+//+kubebuilder:rbac:groups="apiextensions.k8s.io",resources=customresourcedefinitions,verbs=get;list;watch;update
 
-// CertsManager creates certs for webhooks.
+// CertsManager creates certs for webhooks and injects the caBundle into both
+// the ValidatingWebhookConfiguration and the DisaggregatedSet CRD's
+// spec.conversion.webhook.clientConfig.
 func CertsManager(mgr ctrl.Manager, namespace string, serviceName string, secretName string, certDir string, setupFinish chan struct{}) error {
 	// dnsName is the format of <service name>.<namespace>.svc
 	var dnsName = fmt.Sprintf("%s.%s.svc", serviceName, namespace)
@@ -52,6 +59,13 @@ func CertsManager(mgr ctrl.Manager, namespace string, serviceName string, secret
 			{
 				Type: cert.Validating,
 				Name: validateWebhookConfName,
+			},
+			{
+				// The conversion webhook config lives on the CRD itself
+				// under spec.conversion.webhook.clientConfig; cert-controller
+				// patches its caBundle field on rotation.
+				Type: cert.CRDConversion,
+				Name: disaggSetCRDName,
 			},
 		},
 		EnableReadinessCheck: true,

@@ -114,6 +114,7 @@ type DisaggregatedSetStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:storageversion
 
 // DisaggregatedSet is the Schema for the disaggregatedsets API
 type DisaggregatedSet struct {

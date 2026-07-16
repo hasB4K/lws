@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
+	disaggv1 "sigs.k8s.io/disaggregatedset/api/v1"
 	disaggv1alpha1 "sigs.k8s.io/disaggregatedset/api/v1alpha1"
 	"sigs.k8s.io/disaggregatedset/internal/controller"
 	disaggwebhook "sigs.k8s.io/disaggregatedset/internal/webhook"
@@ -56,6 +57,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(disaggv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(disaggv1.AddToScheme(scheme))
 	utilruntime.Must(leaderworkerset.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
@@ -73,6 +75,7 @@ func main() {
 	var webhookServiceName string
 	var webhookSecretName string
 	var namespace string
+	var disableReconciler bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -98,6 +101,13 @@ func main() {
 		"The name of the webhook secret.")
 	flag.StringVar(&namespace, "namespace", "disaggregatedset-system",
 		"The namespace the controller runs in.")
+	// Default disable-reconciler from the DISABLE_RECONCILER env var so it can
+	// be flipped via a Deployment env change without rewriting args.
+	flag.BoolVar(&disableReconciler, "disable-reconciler",
+		os.Getenv("DISABLE_RECONCILER") == "true",
+		"If true, skip DisaggregatedSetReconciler setup and run in webhook-only mode. "+
+			"Intended for transition windows where another controller (e.g. upstream LWS) "+
+			"is taking over reconciliation but this instance's conversion webhook is still required.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -198,7 +208,7 @@ func main() {
 	}
 
 	// Start controller and webhook setup in a goroutine that waits for certs
-	go setupControllers(mgr, certsReady)
+	go setupControllers(mgr, certsReady, disableReconciler)
 
 	// +kubebuilder:scaffold:builder
 
@@ -218,23 +228,37 @@ func main() {
 	}
 }
 
-func setupControllers(mgr ctrl.Manager, certsReady chan struct{}) {
+func setupControllers(mgr ctrl.Manager, certsReady chan struct{}, disableReconciler bool) {
 	// The controllers won't work until the webhooks are operating,
 	// and the webhook won't work until the certs are all in places.
 	setupLog.Info("waiting for the cert generation to complete")
 	<-certsReady
 	setupLog.Info("certs ready")
 
-	if err := (&controller.DisaggregatedSetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DisaggregatedSet")
-		os.Exit(1)
+	if disableReconciler {
+		setupLog.Info("reconciler disabled via --disable-reconciler; running in webhook-only mode")
+	} else {
+		if err := (&controller.DisaggregatedSetReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "DisaggregatedSet")
+			os.Exit(1)
+		}
 	}
 
 	if err := disaggwebhook.SetupDisaggregatedSetWebhook(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "DisaggregatedSet")
+		os.Exit(1)
+	}
+
+	// Register the conversion webhook for v1<->v1alpha1. controller-runtime
+	// wires the /convert route based on the Hub/Convertible interfaces
+	// implemented in api/v1alpha1 and api/v1. This must be registered even
+	// when --disable-reconciler is set, because the whole point of that mode
+	// is to keep serving the conversion webhook during operator handoff.
+	if err := ctrl.NewWebhookManagedBy(mgr, &disaggv1.DisaggregatedSet{}).Complete(); err != nil {
+		setupLog.Error(err, "unable to set up conversion webhook", "webhook", "DisaggregatedSet/v1")
 		os.Exit(1)
 	}
 }

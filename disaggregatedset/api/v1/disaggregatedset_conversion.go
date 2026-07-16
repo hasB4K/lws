@@ -34,9 +34,14 @@ var (
 )
 
 // ConvertTo converts this DisaggregatedSet (v1) to the Hub (v1alpha1) version.
+//
+// TypeMeta is intentionally NOT copied from src: each version's Convert
+// method is responsible only for populating the RECEIVER's spec/metadata,
+// and the API server enforces that the returned object's TypeMeta matches
+// the version the conversion is targeting (v1alpha1 here). Copying src's
+// TypeMeta would leave "v1" leaking into a v1alpha1 response.
 func (src *DisaggregatedSet) ConvertTo(dstRaw conversion.Hub) error {
 	dst := dstRaw.(*disaggv1alpha1.DisaggregatedSet)
-	dst.TypeMeta = src.TypeMeta
 	dst.ObjectMeta = *src.ObjectMeta.DeepCopy()
 	dst.Spec.Roles = convertRolesToV1Alpha1(src.Spec.Roles)
 	dst.Status = convertStatusToV1Alpha1(src.Status)
@@ -44,9 +49,10 @@ func (src *DisaggregatedSet) ConvertTo(dstRaw conversion.Hub) error {
 }
 
 // ConvertFrom converts the Hub (v1alpha1) version to this DisaggregatedSet (v1).
+//
+// TypeMeta is intentionally NOT copied from src (see ConvertTo).
 func (dst *DisaggregatedSet) ConvertFrom(srcRaw conversion.Hub) error {
 	src := srcRaw.(*disaggv1alpha1.DisaggregatedSet)
-	dst.TypeMeta = src.TypeMeta
 	dst.ObjectMeta = *src.ObjectMeta.DeepCopy()
 	dst.Spec.Roles = convertRolesFromV1Alpha1(src.Spec.Roles)
 	dst.Status = convertStatusFromV1Alpha1(src.Status)

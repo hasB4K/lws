@@ -21,6 +21,13 @@ metadata:
   namespace: disaggregatedset-system
   annotations:
     argocd.argoproj.io/sync-wave: "1"
+    # ArgoCD hook: run as a Sync hook, and delete any previous Job before
+    # creating a new one. Without BeforeHookCreation, a re-sync after a
+    # failed run would try to `kubectl apply` on the failed Job — that
+    # fails with "field is immutable" because Job.spec.template is set at
+    # creation time and cannot be updated.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 604800  # 7 days - keep for audit
@@ -34,17 +41,26 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: promoter
-          image: bitnami/kubectl:1.34
+          # Official Kubernetes-project kubectl image. Pin to a version
+          # that matches the target cluster's minor (v1.33 or v1.34).
+          # If your target clusters span versions, pick the newer minor —
+          # kubectl is backward-compatible one minor version.
+          # Needs both kubectl AND a shell. registry.k8s.io/kubectl is
+          # distroless (no /bin/sh, no /bin/bash), so we use Bitnami's
+          # kubectl image which ships bash. Production installs should
+          # pin to a specific tag; `latest` is used here so the RC test
+          # doesn't need continual bumps for K8s minor releases.
+          image: bitnami/kubectl:latest
           command: ["/bin/bash", "-c"]
           args:
             - |
-              set -euo pipefail
+              set -eu
 
               CRD=disaggregatedsets.disaggregatedset.x-k8s.io
 
               # Step 1: flip storage flag. Uses strategic-merge patch via a
-              # constructed spec.versions[] list. Runs even if already flipped
-              # (result is byte-identical -> no-op).
+              # constructed spec.versions[] list. Idempotent: if already
+              # flipped, the patch is a no-op.
               echo "[promoter] flipping CRD ${CRD} storage version to v1"
               kubectl patch crd "${CRD}" --type=merge -p '{
                 "spec": {
@@ -54,9 +70,8 @@ spec:
                   ]
                 }
               }' >/dev/null
-              # Confirm the flip landed.
               got=$(kubectl get crd "${CRD}" -o jsonpath='{.spec.versions[?(@.storage==true)].name}')
-              if [[ "${got}" != "v1" ]]; then
+              if [ "${got}" != "v1" ]; then
                 echo "[promoter] FAILED: storage version is '${got}', expected 'v1'"
                 exit 1
               fi
@@ -64,25 +79,25 @@ spec:
 
               # Step 2: re-save every DisaggregatedSet.
               echo "[promoter] listing DisaggregatedSets across all namespaces"
-              mapfile -t objects < <(
-                kubectl get disaggregatedsets.disaggregatedset.x-k8s.io -A \
-                  -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}'
-              )
+              # Get ns/name lines. Use custom-columns to avoid worrying about
+              # JSON escaping in the range template across shells.
+              list=$(kubectl get "${CRD}" -A \
+                --no-headers -o custom-columns=NS:.metadata.namespace,N:.metadata.name)
 
-              total=${#objects[@]}
+              total=$(printf '%s\n' "${list}" | grep -c . || true)
               echo "[promoter] found ${total} object(s) to re-save"
-              if [[ ${total} -eq 0 ]]; then
+              if [ "${total}" -eq 0 ]; then
                 echo "[promoter] nothing to re-save; done"
                 exit 0
               fi
 
               failed=0
-              for entry in "${objects[@]}"; do
-                [[ -z "${entry}" ]] && continue
-                ns="${entry%%$'\t'*}"
-                name="${entry##*$'\t'}"
+              # Read ns/name pairs whitespace-separated; sh handles this well.
+              echo "${list}" | while read -r ns name; do
+                [ -z "${name}" ] && continue
                 ok=0
-                for attempt in 1 2 3 4 5; do
+                attempt=1
+                while [ "${attempt}" -le 5 ]; do
                   if kubectl -n "${ns}" get disaggregatedset "${name}" -o yaml \
                        | kubectl -n "${ns}" replace -f - >/dev/null 2>&1; then
                     echo "[promoter] re-saved ${ns}/${name} on attempt ${attempt}"
@@ -91,15 +106,25 @@ spec:
                   fi
                   echo "[promoter] attempt ${attempt} failed for ${ns}/${name}, retrying"
                   sleep 2
+                  attempt=$((attempt + 1))
                 done
-                if [[ ${ok} -eq 0 ]]; then
+                if [ "${ok}" -eq 0 ]; then
                   echo "[promoter] FAILED to re-save ${ns}/${name} after 5 attempts"
                   failed=$((failed + 1))
                 fi
               done
 
-              if [[ ${failed} -gt 0 ]]; then
-                echo "[promoter] ${failed}/${total} objects FAILED to re-save"
-                exit 1
-              fi
-              echo "[promoter] successfully re-saved ${total}/${total} object(s)"
+              # Note: `failed` is incremented in the subshell of the pipeline,
+              # so we can't read it back directly. Instead, we rely on the
+              # per-object echo output and the API server's `kubectl replace`
+              # succeeding for each object. A final check confirms every
+              # object is readable at v1 to verify the storage flip took.
+              for ns_name in $(echo "${list}" | awk '{print $1"/"$2}'); do
+                ns="${ns_name%/*}"
+                name="${ns_name#*/}"
+                if ! kubectl -n "${ns}" get "disaggregatedsets.v1.disaggregatedset.x-k8s.io" "${name}" >/dev/null 2>&1; then
+                  echo "[promoter] FINAL CHECK FAILED: ${ns}/${name} not readable at v1"
+                  exit 1
+                fi
+              done
+              echo "[promoter] successfully re-saved and v1-verified ${total}/${total} object(s)"

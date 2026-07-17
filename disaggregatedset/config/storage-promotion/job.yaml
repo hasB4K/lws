@@ -58,18 +58,34 @@ spec:
 
               CRD=disaggregatedsets.disaggregatedset.x-k8s.io
 
-              # Step 1: flip storage flag. Uses strategic-merge patch via a
-              # constructed spec.versions[] list. Idempotent: if already
-              # flipped, the patch is a no-op.
-              echo "[promoter] flipping CRD ${CRD} storage version to v1"
-              kubectl patch crd "${CRD}" --type=merge -p '{
-                "spec": {
-                  "versions": [
-                    {"name":"v1",       "served":true, "storage":true,  "schema":{"openAPIV3Schema":{"type":"object"}}},
-                    {"name":"v1alpha1", "served":true, "storage":false, "schema":{"openAPIV3Schema":{"type":"object"}}}
-                  ]
-                }
-              }' >/dev/null
+              # Step 1: flip storage flag. CRITICAL — must use JSON Patch,
+              # not merge/strategic-merge patch. A merge patch on
+              # `spec.versions` REPLACES the entire array (JSON Merge Patch
+              # RFC 7396 doesn't do per-element merging of arrays), which
+              # would replace the real openAPIV3Schema with whatever we send
+              # here. Kubernetes' structural-schema pruning would then STRIP
+              # every field not in the new (stub) schema — nuking spec+status
+              # on every existing DisaggregatedSet.
+              #
+              # JSON Patch (RFC 6902) with test+replace on the specific
+              # index+field is surgical: only the .storage boolean is
+              # touched, schemas are preserved. `test` ops guard against
+              # the array order changing (would fail-loudly rather than
+              # corrupt data).
+              echo "[promoter] flipping CRD ${CRD} storage version to v1 (JSON Patch)"
+              # Find current index of each version so the test ops match reality.
+              v1_idx=$(kubectl get crd "${CRD}" -o jsonpath='{range .spec.versions[*]}{.name}{"\n"}{end}' | awk '/^v1$/ {print NR-1; exit}')
+              vAlpha_idx=$(kubectl get crd "${CRD}" -o jsonpath='{range .spec.versions[*]}{.name}{"\n"}{end}' | awk '/^v1alpha1$/ {print NR-1; exit}')
+              if [ -z "${v1_idx}" ] || [ -z "${vAlpha_idx}" ]; then
+                echo "[promoter] FAILED: could not locate v1 (${v1_idx}) or v1alpha1 (${vAlpha_idx}) in spec.versions"
+                exit 1
+              fi
+              kubectl patch crd "${CRD}" --type=json -p "[
+                {\"op\":\"test\",   \"path\":\"/spec/versions/${v1_idx}/name\",    \"value\":\"v1\"},
+                {\"op\":\"replace\",\"path\":\"/spec/versions/${v1_idx}/storage\", \"value\":true},
+                {\"op\":\"test\",   \"path\":\"/spec/versions/${vAlpha_idx}/name\",    \"value\":\"v1alpha1\"},
+                {\"op\":\"replace\",\"path\":\"/spec/versions/${vAlpha_idx}/storage\", \"value\":false}
+              ]" >/dev/null
               got=$(kubectl get crd "${CRD}" -o jsonpath='{.spec.versions[?(@.storage==true)].name}')
               if [ "${got}" != "v1" ]; then
                 echo "[promoter] FAILED: storage version is '${got}', expected 'v1'"

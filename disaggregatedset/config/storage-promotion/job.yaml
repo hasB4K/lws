@@ -128,3 +128,19 @@ spec:
                 fi
               done
               echo "[promoter] successfully re-saved and v1-verified ${total}/${total} object(s)"
+
+              # Step 3: shrink status.storedVersions to [v1].
+              # Once every object has been re-saved as v1 bytes, we can
+              # safely tell K8s that no data remains under v1alpha1. Without
+              # this, any later attempt to drop v1alpha1 from spec.versions
+              # (Phase 6b) fails with:
+              #   status.storedVersions[0]: Invalid value: "v1alpha1":
+              #   missing from spec.versions; ... must remain in
+              #   spec.versions until a storage migration ensures no data
+              #   remains persisted in v1alpha1 and removes v1alpha1 from
+              #   status.storedVersions
+              echo "[promoter] shrinking status.storedVersions to [v1]"
+              kubectl patch crd "${CRD}" --subresource=status --type=merge \
+                -p '{"status":{"storedVersions":["v1"]}}' >/dev/null
+              stored=$(kubectl get crd "${CRD}" -o jsonpath='{.status.storedVersions}')
+              echo "[promoter] status.storedVersions is now: ${stored}"

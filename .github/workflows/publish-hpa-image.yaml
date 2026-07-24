@@ -1,0 +1,51 @@
+name: Publish HPA controller image
+on:
+  push:
+    branches:
+      - "feature/hpa-**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392  # v3.6.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1  # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tag
+        id: tag
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          # Strip the leading "v" from RELEASE_VERSION to match the chart-version convention.
+          version=$(awk -F= '/^RELEASE_VERSION=/{gsub(/v/,"",$2); print $2; exit}' Makefile)
+          sha_short=$(git rev-parse --short HEAD)
+          echo "ref=ghcr.io/${owner}/lws:${version}-dev_${sha_short}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6.18.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tag.outputs.ref }}
+          build-args: |
+            BASE_IMAGE=gcr.io/distroless/static:nonroot
+            BUILDER_IMAGE=golang:1.26.0
+            CGO_ENABLED=0

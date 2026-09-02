@@ -3,752 +3,471 @@
 <!-- toc -->
 - [Summary](#summary)
 - [Motivation](#motivation)
-  - [Current Behavior](#current-behavior)
+  - [Current behavior](#current-behavior)
+  - [What PR #907 changes](#what-pr-907-changes)
   - [Goals](#goals)
-  - [Non-Goals](#non-goals)
+  - [Non-goals](#non-goals)
 - [Proposal](#proposal)
-  - [User Stories](#user-stories)
-    - [Scale Up During a Slow Rollout](#scale-up-during-a-slow-rollout)
-    - [Scale Down During a Rollout](#scale-down-during-a-rollout)
-  - [Behavioral Contract](#behavioral-contract)
-  - [Risks and Mitigations](#risks-and-mitigations)
-- [Design Details](#design-details)
-  - [Dependency on the Pipelined Rollout Model](#dependency-on-the-pipelined-rollout-model)
-  - [State Model](#state-model)
-  - [Safety Invariants](#safety-invariants)
-  - [Reconciliation](#reconciliation)
-  - [Required Controller Changes](#required-controller-changes)
-  - [Scale Up](#scale-up)
-  - [Scale Down](#scale-down)
-  - [Replica Fractions and Moving Targets](#replica-fractions-and-moving-targets)
-  - [Multiple Old Revisions](#multiple-old-revisions)
-  - [Changing and Oscillating Targets](#changing-and-oscillating-targets)
-  - [Completion and Status](#completion-and-status)
-  - [API and Compatibility](#api-and-compatibility)
-  - [Observability](#observability)
-  - [Test Plan](#test-plan)
-    - [Prerequisite Testing](#prerequisite-testing)
-    - [Unit Tests](#unit-tests)
-    - [Integration Tests](#integration-tests)
-    - [End-to-End Tests](#end-to-end-tests)
-  - [Graduation Criteria](#graduation-criteria)
-- [Implementation History](#implementation-history)
-- [Drawbacks](#drawbacks)
+  - [Scale up during a rollout](#scale-up-during-a-rollout)
+  - [Scale down during a rollout](#scale-down-during-a-rollout)
+  - [If the target changes again](#if-the-target-changes-again)
+- [Design details](#design-details)
+  - [Safety rules](#safety-rules)
+  - [How one reconcile works](#how-one-reconcile-works)
+  - [How replica fractions help](#how-replica-fractions-help)
+  - [Multiple old revisions](#multiple-old-revisions)
+  - [Completion and status](#completion-and-status)
+  - [Required code changes](#required-code-changes)
+  - [API and compatibility](#api-and-compatibility)
+  - [Test plan](#test-plan)
+    - [Unit tests](#unit-tests)
+    - [Integration tests](#integration-tests)
+    - [End-to-end tests](#end-to-end-tests)
+  - [Graduation criteria](#graduation-criteria)
+- [Risks](#risks)
 - [Alternatives](#alternatives)
-  - [Keep the Current No-Shrink Guard](#keep-the-current-no-shrink-guard)
-  - [Support Only Scale Up During a Rollout](#support-only-scale-up-during-a-rollout)
-  - [Restart the Rollout When the Target Changes](#restart-the-rollout-when-the-target-changes)
-  - [Encode Replica Counts in the Revision](#encode-replica-counts-in-the-revision)
+- [Implementation history](#implementation-history)
 <!-- /toc -->
 
 ## Summary
 
-This KEP allows a DisaggregatedSet role's replica target to change while a
-rolling update is in progress. The controller responds to both increases and
-decreases without waiting for the rollout to finish, while preserving the
-rollout's surge, availability, pending-work, cross-role coordination, and
-newest-first drain guarantees.
+Today, changing a role's replica target during a DisaggregatedSet rolling
+update may have little immediate effect. Scale-up waits whenever the new
+revision is not fully Ready. Scale-down cannot shrink replicas already created
+in the new revision.
 
-The proposal builds on the pipelined rollout model introduced by
-[PR #907](https://github.com/kubernetes-sigs/lws/pull/907). That model removes
-the global `isRevisionStable` gate, distinguishes work issued through `Spec`
-from capacity available through `Ready`, and expresses multi-role progress as
-replica fractions. This KEP uses those primitives to reconcile against the
-latest replica target on every pass.
+This KEP makes scaling and rolling updates work together:
 
-No API change is required. A target may come from
-`DisaggregatedSetRoleScaler.spec.replicas` for an External role or from the
-role's inline replicas for a Static role. The existing scale subresource and
-status fields remain unchanged.
+- **Scaling decides how many replicas the role needs.**
+- **The rolling update decides whether those replicas belong to the old or new
+  revision.**
+
+When the target increases, additional replicas are created in the new
+revision. When it decreases, old-revision replicas are removed first; the new
+revision is reduced only when necessary. Every action remains limited by
+`maxSurge`, `maxUnavailable`, and the amount of work already waiting to become
+Ready.
+
+This design builds on the Spec/Ready and replica-fraction model introduced by
+[PR #907](https://github.com/kubernetes-sigs/lws/pull/907). It requires no API
+change.
 
 ## Motivation
 
-[KEP-849](/keps/849-DisaggregatedSet-HPA) provides a stable, per-role scale
-target across revision changes. It deliberately treats the scaler value as a
-post-rollout target: a target increase is consumed only when the rollout
-planner next runs, and a target below the new revision's current Spec is
-clamped until old revisions have drained.
+DisaggregatedSet pods can take minutes to become Ready because they may need to
+load a model or wait for accelerators. A rolling update can therefore be in
+progress for a long time. During that time, load can still change.
 
-That behavior is safe, but it delays a capacity response at exactly the time
-an operator may need it most. A rollout can take minutes when pods load large
-models, wait for accelerators, or perform startup checks. During that interval:
+An operator or autoscaler should not have to choose between finishing the
+rollout and responding to current demand.
 
-- an HPA scale-up should be able to add capacity without waiting for every
-  already-issued pod to become Ready; and
-- an HPA scale-down should be able to remove excess capacity, preferentially
-  from obsolete revisions, without waiting for the entire replacement to
-  finish.
+### Current behavior
 
-### Current Behavior
+There are two separate reasons scaling is delayed today.
 
-On the controller behavior preceding PR #907, every rolling-update pass first
-checks whether all new-revision roles have `Spec.Replicas ==
-Status.ReadyReplicas`. If any role has pending work, reconciliation returns
-before resolving and applying a changed target. A scaler update enqueues the
-DisaggregatedSet correctly, but that event cannot make progress through this
-global readiness gate.
+First, the rolling-update executor on `main` has a global stability check. If
+any new-revision role has `Spec.Replicas != Status.ReadyReplicas`, it returns
+without running the planner. A scaler update does trigger reconciliation, but
+the new target cannot pass this check until all previously created replicas
+are Ready.
 
-KEP-849 adds a second, independent restriction for scale-down. During a
-rollout, an External role's target is floored at the new revision's current
-Spec. This no-shrink guard prevents a scale-down/scale-up flip, but means the
-new revision can never contract until the old revisions reach zero and the
-controller returns to its steady-state path.
+Second, [KEP-849](/keps/849-DisaggregatedSet-HPA) intentionally prevents the
+new revision from shrinking during a rollout:
 
-PR #907 fixes the first architectural problem by replacing global stability
-with action-specific bounds. It does not remove the no-shrink guard and does
-not provide a new-revision scale-down operation. This KEP specifies that
-remaining behavior.
+```text
+effective target = max(scaler target, new revision Spec)
+```
+
+This avoids changing direction in the middle of a rollout, but a lower target
+cannot be reached until every old revision has drained.
+
+### What PR #907 changes
+
+PR #907 removes the global stability check. There is no replacement
+`isRevisionStable` function. Instead, it answers three questions separately:
+
+1. How much work has already been requested? Use `Spec`.
+2. How much capacity is serving? Use `Ready`.
+3. Is another scale-up or scale-down safe? Apply the relevant bound to that
+   action.
+
+This allows the controller to create more new replicas while earlier replicas
+are still starting. Ready capacity still controls whether old replicas may be
+removed.
+
+PR #907 also gives differently sized roles a shared progress scale. This keeps
+roles such as `8 prefill / 4 decode` moving through a revision together.
+
+These are the foundations needed by this KEP. PR #907 does not itself support
+shrinking the new revision.
 
 ### Goals
 
-1. Process the latest resolved replica target on every rolling-update
-   reconcile, even while some issued replicas are not Ready.
-2. Allow a target increase to grow the new revision within the existing surge
-   and pending-work bounds.
-3. Allow a target decrease to reduce the aggregate fleet during the rollout,
-   removing obsolete old-revision replicas before new-revision replicas.
-4. Converge to exactly the latest target: old Spec is zero, new Spec equals the
-   target, and the target replicas are Ready.
-5. Preserve per-role `maxSurge`, `maxUnavailable`, committed-availability,
-   cross-role fraction, whole-revision, and newest-first guarantees.
-6. Remain stateless across reconciles. A controller restart must not require a
-   remembered previous autoscaler target or rollout step.
-7. Cover upward, downward, and repeatedly changing targets with transition-
-   level invariant tests and deterministic end-to-end tests.
+1. Apply a higher or lower replica target while a rolling update is active.
+2. Put scale-up capacity directly in the new revision.
+3. Remove old-revision capacity before removing new-revision capacity.
+4. Preserve rollout availability, surge, pending-work, and role-coordination
+   guarantees.
+5. Always converge to the latest target if the target and pod readiness stop
+   changing.
+6. Remain stateless: controller restarts must not lose scaling progress.
 
-### Non-Goals
+### Non-goals
 
-1. Changing how HPA or KEDA calculates a desired replica count.
-2. Adding controller-specific scale stabilization. HPA/KEDA behavior and
-   stabilization windows remain the source of target smoothing.
-3. Supporting External scaling with `spec.slices > 1`. KEP-849 currently
-   excludes that combination; this KEP does not resolve the aggregate versus
-   per-slice target question.
-4. Changing pod termination order within a LeaderWorkerSet. Scaling a LWS uses
-   its existing replica semantics.
-5. Guaranteeing immediate convergence when doing so would violate
-   availability, surge, pending-work, or coordinated-revision constraints.
-6. Treating a replica-target change as a new revision. Replica counts remain
-   outside the revision hash.
+1. Changing how HPA or KEDA computes a target.
+2. Adding another stabilization window. HPA/KEDA remain responsible for
+   smoothing their output.
+3. Supporting External scaling with `spec.slices > 1`; KEP-849 currently
+   excludes that combination.
+4. Treating replica changes as new revisions.
 
 ## Proposal
 
-The controller continuously reconciles the observed rollout state toward the
-latest target vector. It does not classify a request using a stored previous
-target. Instead, each role's current target is compared with the current old
-and new Spec footprints:
+On every reconcile, the controller reads the latest target and observes how
+many old and new replicas exist and are Ready. It then moves toward that target
+without waiting for the current rollout step to become fully Ready.
 
-- `newSpec < target` represents remaining new-revision growth;
-- `oldSpec + newSpec > target + maxSurge` represents aggregate excess outside
-  the target's current rollout envelope; and
-- `newSpec > target` represents new-revision excess that must eventually be
-  removed.
-
-Revision replacement and capacity correction remain separate concerns. The
-replica-fraction planner coordinates how roles advance from old revisions to
-the new revision. A capacity-correction phase reacts to a decreased target by
-draining old revisions first and shrinking the new revision only when old
-replicas cannot absorb the excess or have already reached zero.
-
-All actions use one observed snapshot and one target snapshot per reconcile.
-A newer scaler write triggers another reconcile and supersedes the prior
-target naturally.
-
-### User Stories
-
-#### Scale Up During a Slow Rollout
-
-An External prefill role is rolling from revision A to revision B. Revision B
-has issued four replicas, but only two are Ready because model loading is
-slow. HPA raises the target from eight to twelve.
-
-The controller does not wait for all four issued replicas to become Ready. It
-rebases the new-side fraction curve on twelve and may issue more revision-B
-replicas immediately, provided the resulting Spec stays within both the surge
-ceiling and the pending allowance. Old revision-A replicas drain only when
-committed Ready capacity makes that safe.
-
-#### Scale Down During a Rollout
-
-A role has four old replicas and five new replicas while rolling toward eight.
-HPA lowers the target to four with `maxSurge: 1`. The current rollout envelope
-is therefore five replicas.
-
-The controller observes four excess Spec replicas, uses the shared safe-drain
-budget, and removes them from the old revision first. If the new revision is
-still above four after the old revision reaches zero, it scales the new
-revision to four. It never counts terminating replicas twice and never reduces
-committed availability below the configured floor.
-
-### Behavioral Contract
-
-For each role, target changes have the following observable behavior:
-
-| State | Behavior during the rollout |
-| --- | --- |
-| Target increases above new Spec | Grow the new revision using pipelined, bounded issuance. |
-| Target decreases but remains at or above new Spec | Stop unnecessary new growth and accelerate safe old-revision drain toward the smaller envelope. |
-| Target decreases below new Spec | Drain old revisions first; shrink the new revision when old drain alone cannot satisfy the envelope or old Spec is zero. |
-| Target changes while pods are pending | Recompute from current Spec and committed Ready; do not wait for global stability. |
-| Target changes repeatedly | The newest observed target wins; no stored transition must complete first. |
-
-`maxSurge` remains permission for temporary rollout capacity, not part of the
-steady-state target. Consequently, a downscale first converges inside
-`target + maxSurge`; the remaining surge disappears as old revisions finish
-draining. Final completion requires new Spec to equal the target exactly.
-
-### Risks and Mitigations
-
-**Risk: Autoscaler feedback oscillates because scaler status includes rollout
-surge.** `DisaggregatedSetRoleScaler.status.replicas` aggregates old and new
-revisions, so an autoscaler observes temporary rollout replicas.
-
-**Mitigation:** The controller acts only on the explicit target written to
-`scaler.spec.replicas`, retains up to `maxSurge` while replacement is active,
-and removes old replicas before new ones. HPA's existing scale-down
-stabilization and rate policies remain applicable. The controller preserves
-safety under an oscillating target but does not duplicate autoscaler
-stabilization policy.
-
-**Risk: A stale Ready count authorizes the same scale-down twice.** LWS status
-can remain above Spec after a previous scale-down while pods terminate.
-
-**Mitigation:** Every availability calculation uses committed Ready:
-`min(status.readyReplicas, spec.replicas)` per LWS. All old and new reductions
-in one pass consume a single per-role safe-reduction budget.
-
-**Risk: Shrinking the new revision wastes successfully updated pods.** A later
-scale-up may have to create them again.
-
-**Mitigation:** Old revisions are always the first source of capacity
-reduction. The new revision shrinks only when removing all eligible old Spec
-cannot restore the target envelope or when old Spec has reached zero.
-
-**Risk: Independent role targets break a serving revision by removing one
-role before the others.** A per-role autoscaler may request different changes
-at different times.
-
-**Mitigation:** Existing fraction coordination and whole-revision retirement
-rules remain in force. A revision is retired as a unit only when every affected
-role can spend the required safe-drain budget; otherwise the planner keeps the
-revision alive while safe replacement or capacity correction continues.
-
-**Risk: A target change makes the observed state immediately exceed a new
-surge or pending bound.** The controller cannot undo already-issued API work
-atomically.
-
-**Mitigation:** Bounds govern controller-authored transitions. When a target
-decrease makes the observed state out of bounds, the controller performs no
-additional growth and monotonically repairs the excess as availability
-permits. Such an inherited state is not treated as a controller safety
-violation.
-
-## Design Details
-
-### Dependency on the Pipelined Rollout Model
-
-This proposal assumes the state and safety model from PR #907. If the two
-features are implemented in a different order, equivalent prerequisites must
-land first:
-
-1. Rollout progress is based on Spec, representing issued work.
-2. Availability is based on committed Ready, representing serving work.
-3. There is no global `isRevisionStable` progress gate.
-4. New Spec is bounded independently by surge and pending allowances.
-5. Old drain is bounded independently by committed availability.
-6. Completion is separate from permission to make progress.
-
-There is intentionally no replacement `isRevisionStableV2` Boolean. A single
-predicate cannot express whether scale-up, old drain, new shrink, and rollout
-completion are independently safe. This KEP extends the same action-specific
-model to target decreases.
-
-### State Model
-
-For each role `i`, reconciliation constructs the following snapshot:
+The basic policy is:
 
 ```text
-initialOld[i] = old-revision Spec captured when the rollout started
-oldSpec[i]    = aggregate Spec across all old revisions
-oldReady[i]   = aggregate committed Ready across all old revisions
-newSpec[i]    = target-revision Spec
-newReady[i]   = target-revision committed Ready
-target[i]     = latest resolved target
-surge[i]      = resolved maxSurge
-unavailable[i]= resolved maxUnavailable
+Need more replicas: create them in the new revision.
+Need fewer replicas: remove old replicas first, then new replicas.
 ```
 
-Committed Ready is calculated per LWS before aggregation:
+The target may come from `DisaggregatedSetRoleScaler.spec.replicas` for an
+External role or from the role's inline replicas for a Static role. Both use
+the same reconciliation logic.
+
+### Scale up during a rollout
+
+Suppose a role is rolling from A to B:
 
 ```text
-committedReady(lws) = min(lws.status.readyReplicas,
-                          lws.spec.replicas)
+old A Spec:  6
+new B Spec:  2
+new B Ready: 1
+target:      8 -> 12
 ```
 
-The per-LWS cap matters. Capping only the aggregate can let stale Ready from a
-retired LWS fund a reduction in another LWS.
+The desired fleet has grown by four replicas. Those replicas, as well as the
+remaining replacements for A, belong to B. The controller may start creating
+them immediately, even though one existing B replica is still starting.
 
-The target is resolved once for the reconcile:
+It cannot create all remaining replicas without limits. The proposed new Spec
+must fit within:
 
-- External role: `DisaggregatedSetRoleScaler.spec.replicas`;
-- Static role: `spec.roles[].spec.replicas`, defaulting as today.
+- the configured surge limit; and
+- PR #907's pending allowance, which limits how far Spec may move ahead of
+  Ready.
 
-The controller stores no previous target and adds no target annotation. The
-observed Spec, Ready, rollout snapshot, and latest target are sufficient to
-compute the next idempotent action after a restart.
+Old A replicas are removed only when enough Ready capacity exists. Raising the
+target therefore increases capacity first; it does not sacrifice existing
+Ready capacity to make the rollout appear further along.
 
-### Safety Invariants
+### Scale down during a rollout
 
-PR #907 provides the fraction projection and pending-work model. This KEP
-distinguishes the fraction's role size from the hard bounds associated with
-the latest desired capacity:
+Suppose the state is:
 
 ```text
-roleSize          = max(initialOld, target)  // fraction projection
-targetCeiling     = target + maxSurge        // hard Spec bound
-availabilityFloor = max(0, target - maxUnavailable)
-pending           = newSpec - newReady
+old Spec: 4
+new Spec: 5
+target:   8 -> 4
+maxSurge: 1
 ```
 
-PR #907 uses `min(initialOld, target)` in the availability floor for a fixed
-source-to-target rollout. A live target increase needs the stronger dynamic
-floor above: otherwise the controller could drain old Ready capacity while the
-fleet is still below the newly requested capacity. Immediately after an
-increase, observed availability may already be below the new floor; that is
-not a controller-authored violation. The controller freezes further drain and
-uses the additional target headroom for growth until availability catches up.
+At the new target, the rollout may temporarily contain at most five replicas.
+The current total is nine, so four replicas are excess. Assuming Ready capacity
+makes that safe, the controller removes those four replicas from the old
+revision.
 
-The pending allowance is the proportionally projected
-`maxSurge + maxUnavailable` budget from PR #907. Controller-authored growth
-must satisfy both:
+The resulting new revision still has five replicas. Once the old revision is
+gone, the controller reduces the new revision from five to four. The final
+state is:
 
 ```text
-oldSpec + proposedNewSpec <= target + maxSurge
-proposedNewSpec - newReady <= pendingAllowance
+old Spec: 0
+new Spec: 4
+new Ready: 4
 ```
 
-Using `target + maxSurge` for new growth is important after a target decrease.
-The broader `max(initialOld, target) + maxSurge` value remains useful for
-fraction projection and for describing a state inherited from before the
-decrease, but it must not permit new growth above the latest target's rollout
-envelope.
+If old Spec is not large enough to absorb the required reduction, the
+remaining excess is removed from the new revision. All reductions share the
+same availability budget; scaling old and new down in one reconcile must not
+spend the same Ready replica twice.
 
-Any controller-authored Spec reduction must satisfy:
+The controller may pause a downscale when insufficient Ready capacity exists.
+This is expected: a lower target does not override `maxUnavailable`.
 
-```text
-postReductionCommittedReady >= availabilityFloor
-```
+### If the target changes again
 
-Because the controller cannot know whether LWS will remove a Ready or unready
-replica, it conservatively assumes every Spec reduction removes one committed
-Ready replica. The maximum reduction that all old and new scale-down actions
-may share in one reconcile is therefore:
-
-```text
-safeReduction = max(0, oldReady + newReady - availabilityFloor)
-```
-
-When a target change makes the observed state violate a new ceiling, the
-controller must not worsen the violation. It either reduces the excess or
-waits for enough committed availability to do so safely.
-
-### Reconciliation
-
-Each rolling-update reconcile follows these logical phases. An implementation
-may combine calculations, but it must preserve their budgets and ordering.
-
-1. **Observe:** list all old and new LWS objects and build the Spec/Ready state.
-2. **Resolve:** snapshot the latest per-role targets and percentage-derived
-   surge/unavailable values.
-3. **Correct capacity excess:** calculate Spec above `target + maxSurge` and
-   allocate the safe reduction old-first, newest revision first.
-4. **Plan revision progress:** use the replica-fraction planner against the
-   current target vector to propose new growth and old drain.
-5. **Apply hard bounds:** clamp all proposals to the remaining surge, pending,
-   availability, and coordination budgets after capacity correction.
-6. **Execute reductions before growth:** scale down old revisions, then any
-   unavoidable new-revision excess, then scale up the new revision. This
-   ordering cannot create a transient surge breach between API calls.
-7. **Requeue:** if the rollout or target convergence is incomplete, request a
-   bounded requeue even when no API object changed; readiness and termination
-   status may be the only expected progress.
-
-The target snapshot is immutable within one pass. If it changes during API
-updates, the scaler watch enqueues another reconcile, which computes a new
-safe plan from observed state.
-
-### Required Controller Changes
-
-The implementation is expected to evolve the PR #907 executor in the
-following focused ways:
-
-1. Remove the External-role target clamp in `buildRolloutState`; retain the
-   scaler target even when it is below new Spec.
-2. Change structural completion from `newSpec >= target` to
-   `newSpec == target`.
-3. Keep `boundNewReplicaTargets` as a growth bound, but use
-   `target + maxSurge` as its hard Spec envelope.
-4. Add one capacity-correction calculation that shares `safeReduction` across
-   old and new Spec reductions.
-5. Add a new-revision scale-down operation, or generalize the current
-   scale-up-only helper into exact new-Spec reconciliation.
-6. Preserve `maxSafeDrain`, `committedReadyReplicas`, pending allowance, and
-   fraction coordination as the safety inputs rather than adding another
-   global readiness predicate.
-7. Make the planned action explicitly distinguish rollout drain from capacity
-   correction so execution cannot accidentally spend either budget twice.
-
-This does not require replacing the whole fraction planner. Upward movement
-continues through its existing new-side calculation; target-envelope repair is
-a bounded executor concern around that planner.
-
-### Scale Up
-
-When `newSpec < target`, the current target vector defines the new-side
-fraction curve. Because progress is reconstructed from observed Spec rather
-than a stored step index, increasing the target simply places the observed
-new revision at an earlier point on the new curve.
-
-The planner may issue additional new Spec while earlier replicas remain
-pending. Growth is limited by:
-
-1. the latest `target + maxSurge` envelope;
-2. the remaining projected pending allowance;
-3. the largest-replica-fraction coordination bound; and
-4. any per-role raw API limits.
-
-Ready does not drive the new-side progress calculation. It authorizes pending
-capacity and old-revision drain. This prevents both failure modes of using
-Ready as rollout progress: repeatedly reissuing work already present in Spec,
-and globally stalling on one slow pod.
-
-An increased target may also increase percentage-based `maxSurge` and
-`maxUnavailable`. These values are resolved from the same target snapshot and
-remain constant for that reconcile.
-
-### Scale Down
-
-The no-shrink target clamp is removed. A target below new Spec is represented
-explicitly and is not interpreted as rollout completion.
-
-Scale-down has two stages:
-
-1. **Restore the target rollout envelope.** For each role:
-
-   ```text
-   envelopeExcess = max(0, oldSpec + newSpec - (target + maxSurge))
-   reduction      = min(envelopeExcess, safeReduction)
-   ```
-
-   Allocate `reduction` to old revisions first, newest revision first. This
-   turns an autoscaler downscale into useful rollout work by removing obsolete
-   capacity instead of updated capacity.
-
-2. **Converge the new revision exactly.** If removing every eligible old
-   replica cannot restore the envelope, the remainder may shrink the new
-   revision using the same safe-reduction budget. Once old Spec is zero, any
-   `newSpec > target` is removed without leaving the rolling-update path first.
-
-The implementation must not calculate independent old and new safe-drain
-budgets. They spend the same `safeReduction`; otherwise stale Ready could
-authorize two reductions against one unit of availability.
-
-If availability is insufficient, the downscale pauses even though the target
-is lower. This can occur when many Ready replicas are already committed to
-termination. Subsequent LWS status changes or the bounded requeue resume
-progress.
-
-The controller does not scale new down merely because old capacity is still
-temporarily above the steady target. Up to `maxSurge` remains valid rollout
-capacity. This avoids deleting updated pods only to recreate them to finish
-the replacement.
-
-### Replica Fractions and Moving Targets
-
-PR #907 defines a fraction scale independently for each rollout side:
-
-```text
-sideSteps               = max(roleSizes)
-smallestReplicaFraction = 1 / max(roleSizes)
-largestReplicaFraction  = 1 / minPositive(roleSizes)
-```
-
-At step `k`, integer projection gives every role its count on the same
-normalized curve. The smallest fraction is the finest shared rollout tick;
-the largest fraction is the maximum rounding skew represented by one replica
-of the smallest positive role.
-
-This KEP retains that model for revision coordination:
-
-- The old side remains anchored to `initialOld`, so a scaler write cannot
-  rewrite rollout history or resurrect drained old replicas.
-- The new side uses the latest target vector. A target increase extends or
-  reshapes the curve, and observed new Spec is projected onto that curve.
-- A target decrease may place new Spec beyond the end of the new curve. The
-  capacity-correction phase handles that excess; the growth-only fraction
-  calculation must not treat it as successful final convergence.
-- After correction, the ordinary fraction planner resumes from the observed
-  Spec without a stored step number.
-
-Capacity reduction is not modeled as a reverse rollout. It must not scale an
-old revision back up or undo old-side fraction progress. The fraction model is
-used to keep role/revision progress coordinated; the old-first capacity rule
-decides which revision supplies a requested reduction.
-
-If target changes alter role ratios, proposed actions remain subject to the
-existing largest-replica-fraction skew bound. A role may wait at that boundary
-while another role catches up or acquires safe capacity.
-
-### Multiple Old Revisions
-
-An interrupted A-to-B-to-C rollout can leave A and B as old revisions while C
-is the target. Capacity correction follows the same newest-first order as
-ordinary rollout drain:
-
-1. drain B before A;
-2. consider a revision retired when all its role Specs are zero; and
-3. do not wait for a retired revision's stale status or terminating pods
-   before considering an older revision, provided committed availability
-   remains sufficient.
-
-Whole-revision coordination remains a preference, not permission to bypass
-availability. If retiring B for every role would exceed any role's remaining
-safe-reduction budget, the controller performs only a safe coordinated step
-or waits.
-
-### Changing and Oscillating Targets
-
-The latest target is authoritative. No target-generation queue is introduced:
+The controller does not remember or finish a sequence of past targets. For
+example:
 
 ```text
 8 -> 12 -> 5 -> 9
 ```
 
-does not require completing 12 or 5 before moving toward 9. Every pass
-recomputes from observed Spec and Ready toward the target it read for that
-pass.
+Each reconcile uses the newest target and the state currently observed in the
+cluster. It never recreates an old revision or scales an old revision back up.
 
-Safety is independent of target monotonicity:
+This makes the behavior restart-safe and avoids a queue of obsolete scaling
+decisions. A rapidly changing target may still create churn; autoscaler
+stabilization policies are responsible for controlling that.
 
-- a higher target opens growth only within current surge and pending bounds;
-- a lower target opens reduction only within current committed availability;
-- an inherited bound violation is repaired rather than amplified; and
-- no pass scales the same LWS both down and up.
+## Design details
 
-Efficiency under a rapidly oscillating custom autoscaler is not guaranteed.
-Users who require dampening should configure their autoscaler's stabilization
-and rate policies. The controller guarantees convergence once the target and
-pod readiness eventually stabilize.
+### Safety rules
 
-### Completion and Status
-
-Rollout planning and completion use different predicates.
-
-The rollout is structurally converged for a role only when:
+For one role, define:
 
 ```text
-oldSpec == 0 && newSpec == target
+total Spec      = old Spec + new Spec
+committed Ready = sum(min(LWS status.readyReplicas, LWS spec.replicas))
 ```
 
-The rollout is Ready only when it is structurally converged and:
+Ready is capped at Spec separately for each LWS. This matters after a
+scale-down: status can still include terminating replicas, but those replicas
+must not authorize another removal.
+
+The controller follows three rules.
+
+**1. Surge limits growth**
 
 ```text
-newReady == target
+total Spec after growth <= target + maxSurge
 ```
 
-Equality replaces the existing `newSpec >= target` completion assumption,
-which is valid only while new Spec is monotonic. A new-revision fleet above a
-decreased target is incomplete and requires contraction.
+If a lower target makes the current total larger than this limit, the
+controller performs no more growth and safely reduces the excess.
 
-`DisaggregatedSetRoleScaler.status.replicas` continues to report observed LWS
-replicas aggregated across revisions. It may lag Spec while pods terminate.
-The DisaggregatedSet remains Progressing until old revisions are gone and the
-new revision is at the latest target in both Spec and Ready.
+**2. Ready capacity limits reduction**
 
-### API and Compatibility
+Before removing `n` replicas:
 
-This proposal adds no fields, resources, or feature gates. It changes
-controller behavior only when a resolved replica target changes during a
-rolling update.
+```text
+committed Ready - n >= max(0, target - maxUnavailable)
+```
 
-The change is intentionally observable: a scale-down that was previously
-deferred can now terminate old-revision pods before rollout completion. The
-same `maxUnavailable`, `maxSurge`, and autoscaler policies already configured
-by the user bound that behavior.
+The controller assumes every removed replica might be Ready. This is
+conservative, but it remains correct regardless of which LWS ordinal is
+deleted.
 
-Downgrading to a controller without this feature is safe. The older controller
-reintroduces the no-shrink behavior and may delay further scale-down, but no
-new persisted state requires migration or interpretation.
+PR #907 uses `min(initial, target) - maxUnavailable` for a rollout with a fixed
+target. This KEP uses the latest target for scale decisions. In particular,
+when the target increases, old Ready replicas must not drain until availability
+catches up with the newly requested capacity.
 
-### Observability
+**3. Pending work limits pipelining**
 
-Existing scaling events should identify the reason and target snapshot. Logs
-for every applied step should include, per role:
+PR #907 bounds `new Spec - new Ready` using a proportional projection of
+`maxSurge + maxUnavailable`. This KEP keeps that rule unchanged. A target
+increase creates room to grow, but does not create unlimited pending pods.
 
-- old and new Spec;
-- old and new committed Ready;
-- resolved target;
-- pending allowance and pending count;
-- surge ceiling and availability floor; and
-- whether a reduction was capacity correction or ordinary rollout drain.
+These are bounds on controller actions. A target change can instantly make the
+observed state fall outside a new bound; the controller must repair that state
+without making it worse.
 
-The implementation should expose enough information to distinguish a rollout
-waiting for readiness from one repairing a decreased target. New API status
-conditions are not required for the initial implementation.
+### How one reconcile works
 
-### Test Plan
+One rolling-update reconcile performs the following steps:
+
+1. Read old/new Spec and committed Ready for every role.
+2. Read one consistent snapshot of the latest targets.
+3. If total Spec is above `target + maxSurge`, calculate how much can safely be
+   removed. Allocate that reduction to old revisions first.
+4. Ask PR #907's fraction planner for the next revision-replacement step.
+5. Bound the combined plan by the remaining surge, pending, and availability
+   budgets.
+6. Apply scale-downs before scale-ups so separate API calls cannot temporarily
+   exceed `maxSurge`.
+7. Requeue while either the rollout or target convergence remains incomplete,
+   even when the controller is only waiting for readiness or termination.
+
+The scaler may change while these calls run. That change triggers another
+reconcile, which starts again from observed state.
+
+### How replica fractions help
+
+PR #907 expresses rollout progress as fractions rather than requiring every
+role to change by one replica at the same time:
+
+```text
+smallestReplicaFraction = 1 / max(role sizes)
+largestReplicaFraction  = 1 / min(positive role sizes)
+```
+
+For an `8 prefill / 4 decode` revision, the smallest fraction is `1/8`.
+The shared curve begins like this:
+
+| Progress | Prefill | Decode |
+| --- | ---: | ---: |
+| 0 | 0 | 0 |
+| 1/8 | 1 | 1 |
+| 2/8 | 2 | 1 |
+| 3/8 | 3 | 2 |
+
+Integer rounding can put the smaller role ahead temporarily. The
+`largestReplicaFraction`, `1/4` in this example, bounds that skew.
+
+When the target increases, the new-side curve is recomputed using the new role
+sizes. Current new Spec is projected onto that curve, so the rollout continues
+without a stored step number.
+
+When the target decreases below current new Spec, the fraction planner alone
+is insufficient: its new side was designed to grow. The capacity-reduction
+step first removes the excess, after which fraction-based rollout coordination
+continues normally. Scale-down is therefore not modeled as a rollout running
+backward.
+
+The old-side curve remains anchored to the replica counts captured when the
+rollout began. A target change never resurrects an old replica.
+
+### Multiple old revisions
+
+An interrupted A-to-B-to-C rollout can leave both A and B as old revisions.
+Existing newest-first behavior remains:
+
+1. remove B before A;
+2. consider a revision retired when all of its role Specs are zero; and
+3. ignore stale Ready status from a retired revision.
+
+Where possible, every role in an old revision is retired together. That
+coordination preference never permits crossing a role's availability floor.
+
+### Completion and status
+
+A rollout is complete only when every role satisfies:
+
+```text
+old Spec == 0
+new Spec == target
+new Ready == target
+```
+
+The equality for new Spec is important. The existing `new Spec >= target`
+check assumes that new Spec never shrinks; it would incorrectly call a
+downscaled rollout complete while excess replicas still exist.
+
+`DisaggregatedSetRoleScaler.status.replicas` continues to report observed
+replicas across all revisions. It can temporarily be higher than Spec while
+pods terminate. The DisaggregatedSet remains Progressing until it reaches the
+latest target and old revisions are gone.
+
+### Required code changes
+
+The implementation after PR #907 needs to:
+
+1. remove the no-shrink target clamp;
+2. require exact new-Spec equality for completion;
+3. bound new growth by `target + maxSurge`;
+4. calculate one shared safe-reduction budget;
+5. remove excess from old revisions first;
+6. add an operation that can reduce new-revision Spec; and
+7. retain PR #907's Spec/Ready, pending allowance, and fraction coordination.
+
+There is no need to replace the fraction planner or add another global
+stability function.
+
+### API and compatibility
+
+No new API field or resource is introduced. Replica counts remain outside the
+revision hash, so changing a Static role's replicas also uses this behavior
+without creating a new revision.
+
+The behavior change is intentional: a downscale that was previously deferred
+can now terminate old replicas during a rollout. Existing `maxSurge`,
+`maxUnavailable`, and autoscaler policies bound that change.
+
+Downgrading the controller is safe. An older controller simply returns to
+deferring new-revision scale-down; there is no new persisted state to migrate.
+
+### Test plan
 
 [X] I/we understand the owners of the involved components may require updates
 to existing tests to make this code solid enough prior to committing the
 changes necessary to implement this enhancement.
 
-#### Prerequisite Testing
+#### Unit tests
 
-PR #907 must retain tests proving:
+Use a transition-level test harness that changes targets between reconciles
+and checks the safety rules after every action. The important cases are:
 
-- new Spec can advance while earlier replicas are pending;
-- pending work never exceeds its projected allowance;
-- old drain uses committed Ready and cannot spend stale Ready twice;
-- raw per-role surge and availability limits hold after every transition; and
-- old Spec is monotonic downward and new Spec is monotonic upward when the
-  target itself is fixed.
+- scale up while new Spec is ahead of new Ready;
+- scale down to a target above, equal to, and below new Spec;
+- old replicas are removed before new replicas;
+- old replicas are insufficient, requiring new-revision scale-down;
+- stale `Ready > Spec` cannot fund another reduction;
+- one role scales up while another scales down;
+- imbalanced role sizes preserve fraction coordination;
+- A-to-B-to-C drains newest first; and
+- repeated target changes converge once the target stabilizes.
 
-#### Unit Tests
+Small replica counts should be exhaustively enumerated across target,
+readiness, `maxSurge`, and `maxUnavailable` values.
 
-Add a transition harness that changes the target between reconciles and checks
-all safety invariants after every controller-authored action. Cover:
+#### Integration tests
 
-- target increase while new Spec is ahead of new Ready;
-- target increase beyond `initialOld`;
-- target decrease above, equal to, and below new Spec;
-- target decrease below aggregate old-plus-new Spec;
-- target decrease to zero;
-- old-first reduction and the case where old replicas are insufficient;
-- new-revision shrink after old Spec reaches zero;
-- one shared safe-reduction budget across old and new shrink;
-- stale `Ready > Spec` after an earlier reduction;
-- percentage budgets recalculated from a changed target;
-- imbalanced two-role and N-role targets;
-- one role scaling up while another scales down;
-- smallest- and largest-replica-fraction coordination after target rebasing;
-- multiple old revisions with newest-first drain;
-- added, removed, and zero-target roles;
-- rapid `8 -> 12 -> 5 -> 9` target changes; and
-- controller restart from every intermediate observed state.
+- Change `DisaggregatedSetRoleScaler.spec.replicas` upward during an active
+  rollout and verify the new target is consumed before all existing new pods
+  are Ready.
+- Change it below current new Spec and verify old-first reduction followed by
+  exact convergence.
+- Verify the same behavior for Static replica changes.
+- Verify scaler status remains correct while old and terminating replicas
+  coexist.
 
-For small replica vectors, exhaustively enumerate readiness progress, targets,
-and integer surge/unavailable values. Assert:
+#### End-to-end tests
 
-```text
-controller does not grow while total Spec exceeds target + maxSurge
-a growth transition ends at or below target + maxSurge
-controller reduction never crosses the availability floor
-pending growth never exceeds the pending allowance
-old revisions never scale up
-the same LWS is not scaled both directions in one pass
-stable target plus eventual readiness converges to old=0, new=target
-```
+Use direct `/scale` writes and deterministic slow-starting pods:
 
-#### Integration Tests
+1. Raise the target while `new Spec > new Ready`; prove another bounded batch
+   is issued before the previous batch becomes fully Ready.
+2. Lower the target below new Spec; prove total Spec decreases during the
+   rollout, old replicas are selected first, and final new Spec/Ready equals
+   the lower target.
+3. Observe surge, availability, pending-work, and role-fraction bounds
+   throughout both tests.
 
-- Update `DisaggregatedSetRoleScaler.spec.replicas` upward during an active
-  rollout and verify the reconciler consumes the new target before all
-  previously issued pods are Ready.
-- Update the scaler downward to a value below new Spec and verify old Spec is
-  reduced first, followed by exact new-target convergence.
-- Verify scaler watch events enqueue the parent DisaggregatedSet during a
-  rollout.
-- Verify Static replica changes follow the same resolved-target behavior and
-  do not create a new revision.
-- Verify status aggregation remains consistent across old, new, and
-  terminating replicas.
-
-#### End-to-End Tests
-
-Use deterministic startup delays and direct `/scale` writes rather than an
-uncontrolled metric source for the core behavior tests.
-
-1. **Mid-rollout scale-up:** begin an imbalanced, slow-pod rollout; wait until
-   new Spec exceeds new Ready; raise the scaler target; prove new Spec advances
-   toward the higher target before the prior wave becomes fully Ready.
-2. **Mid-rollout scale-down:** lower the target below current new Spec; prove
-   aggregate Spec decreases while an old revision still exists, old Spec is
-   selected first, and final new Spec/Ready equals the lower target.
-3. **Safety observation:** at every sampled transition, assert the surge,
-   committed-availability, pending, and role-fraction bounds.
-4. **Eventual convergence:** require old Spec and old observed replicas to
-   reach zero and only the target revision to remain active.
-
-An HPA-backed smoke test may additionally verify integration with HPA
-stabilization, but deterministic `/scale` tests are the release-blocking
-coverage.
-
-### Graduation Criteria
+### Graduation criteria
 
 This behavior graduates with DisaggregatedSet and
 `DisaggregatedSetRoleScaler`.
 
-**Alpha:**
+Alpha requires moving-target unit coverage and deterministic scale-up and
+scale-down end-to-end tests. Beta requires production feedback and sufficient
+events or metrics to explain why convergence is waiting.
 
-- moving-target reconciliation for both Static and External roles;
-- scale-up, old-first scale-down, and new-revision contraction;
-- transition-level invariant coverage;
-- deterministic scale-up and scale-down end-to-end tests; and
-- user documentation describing rollout-time scaling semantics.
+## Risks
 
-**Beta:**
+**Autoscaler feedback:** scaler status includes both old and new replicas,
+including rollout surge. Responding to every lower target could amplify
+oscillation. The controller keeps the configured surge allowance, removes old
+replicas first, and relies on the autoscaler's stabilization policy.
 
-- production feedback from autoscaled rolling updates;
-- metrics or structured events sufficient to diagnose blocked target
-  convergence; and
-- no unresolved correctness issues involving target oscillation, status lag,
-  or multiple old revisions.
+**Wasted startup work:** if old replicas cannot absorb a large reduction, a
+new pod that just became Ready may be removed. This is preferable to ignoring
+the requested target, but old-first reduction minimizes it.
 
-**Stable:** follows the graduation requirements of KEP-766 and KEP-849.
-
-## Implementation History
-
-- 2026-09-02: Initial KEP draft.
-
-## Drawbacks
-
-- The rolling-update executor gains a second direction for new-revision Spec;
-  its previous monotonic-growth assumption is simpler to reason about.
-- A target reduction can terminate pods sooner than the current no-shrink
-  behavior, which makes correct availability accounting essential.
-- Stateless target rebasing can produce a different sequence of integer
-  fraction steps after every target change, although hard bounds remain stable.
-- Autoscaler oscillation may waste pod startup work even when all safety
-  constraints are preserved.
+**More executor states:** new Spec is no longer monotonic. Exact completion,
+shared reduction accounting, and transition-level tests are required to keep
+the additional states understandable.
 
 ## Alternatives
 
-### Keep the Current No-Shrink Guard
+**Keep the current no-shrink guard.** This is simpler but can retain excess
+capacity for the full duration of a slow rollout.
 
-Continue treating the scaler value only as the post-rollout target. This is
-the simplest and safest behavior, but it can retain expensive excess capacity
-for the full duration of a slow rollout and does not meet the goal.
+**Support scale-up only.** PR #907 makes this relatively small and it could be
+delivered first, but it does not solve rollout-time scale-down.
 
-### Support Only Scale Up During a Rollout
+**Restart the rollout when the target changes.** This would require persistent
+target history and could continually reset progress under HPA. Recomputing
+from observed state is simpler and restart-safe.
 
-PR #907's Spec/Ready and pending-work model makes upward target changes much
-simpler than downward changes. Shipping only scale-up would address emergency
-capacity growth with less risk, while preserving deferred scale-down.
+**Include replicas in the revision hash.** Every autoscaler write would create
+a revision, LWS objects, and Services. Capacity is intentionally independent
+from application revision.
 
-This remains a viable staged implementation, but not the final behavior: long
-rollouts would still ignore legitimate cost- or load-driven reductions.
+## Implementation history
 
-### Restart the Rollout When the Target Changes
-
-Snapshot the current aggregate fleet as a new rollout source every time the
-target changes. This gives each transition a fixed curve, but HPA updates could
-continually reset progress, require new persistent annotations, and obscure
-newest-first revision history. Recomputing from observed state is simpler and
-restart-safe.
-
-### Encode Replica Counts in the Revision
-
-Include replicas in the revision hash so every scale event creates a new
-revision. This conflates capacity with application version, creates LWS and
-Service churn under autoscaling, and can leave many short-lived revisions.
-Replica targets deliberately remain independent of revision identity.
+- 2026-09-02: Initial KEP draft.

@@ -15,6 +15,7 @@
   - [Safety rules](#safety-rules)
   - [How one reconcile works](#how-one-reconcile-works)
   - [How replica fractions help](#how-replica-fractions-help)
+  - [Safe old-revision drain](#safe-old-revision-drain)
   - [Multiple old revisions](#multiple-old-revisions)
   - [Completion and status](#completion-and-status)
   - [Required code changes](#required-code-changes)
@@ -176,9 +177,10 @@ maxSurge: 1
 ```
 
 At the new target, the rollout may temporarily contain at most five replicas.
-The current total is nine, so four replicas are excess. Assuming Ready capacity
-makes that safe, the controller removes those four replicas from the old
-revision.
+The current total is nine, so four replicas are excess. The lower target is fed
+back into the planner, which advances the old side through one or more legal
+fraction steps. Assuming Ready capacity makes each step safe, all four excess
+replicas are eventually removed from the old revision.
 
 The resulting new revision still has five replicas. Once the old revision is
 gone, the controller reduces the new revision from five to four. The final
@@ -229,7 +231,7 @@ Ready is capped at Spec separately for each LWS. This matters after a
 scale-down: status can still include terminating replicas, but those replicas
 must not authorize another removal.
 
-The controller follows three rules.
+The controller follows four rules.
 
 **1. Surge limits growth**
 
@@ -263,6 +265,14 @@ PR #907 bounds `new Spec - new Ready` using a proportional projection of
 `maxSurge + maxUnavailable`. This KEP keeps that rule unchanged. A target
 increase creates room to grow, but does not create unlimited pending pods.
 
+**4. The planner limits old-revision drain**
+
+The planner's proposed old count is a hard floor. Target-driven capacity
+correction may cause the planner to advance faster, but the executor cannot
+independently drain below that floor. A revision also keeps at least one
+replica of every role until every role in that revision can be retired
+together.
+
 These are bounds on controller actions. A target change can instantly make the
 observed state fall outside a new bound; the controller must repair that state
 without making it worse.
@@ -273,14 +283,17 @@ One rolling-update reconcile performs the following steps:
 
 1. Read old/new Spec and committed Ready for every role.
 2. Read one consistent snapshot of the latest targets.
-3. If total Spec is above `target + maxSurge`, calculate how much can safely be
-   removed. Allocate that reduction to old revisions first.
-4. Ask PR #907's fraction planner for the next revision-replacement step.
-5. Bound the combined plan by the remaining surge, pending, and availability
-   budgets.
-6. Apply scale-downs before scale-ups so separate API calls cannot temporarily
+3. Give the latest target and any capacity excess to PR #907's fraction
+   planner. Its proposed old count is the minimum the executor may retain.
+4. Intersect the planner's old-drain budget with the availability budget.
+5. Spend that budget on the newest old revision without removing the last
+   replica of only some roles.
+6. If planner-authorized old drain cannot absorb all necessary reduction,
+   reduce the new revision using any remaining availability budget.
+7. Bound new growth by the remaining surge and pending budgets.
+8. Apply scale-downs before scale-ups so separate API calls cannot temporarily
    exceed `maxSurge`.
-7. Requeue while either the rollout or target convergence remains incomplete,
+9. Requeue while either the rollout or target convergence remains incomplete,
    even when the controller is only waiting for readiness or termination.
 
 The scaler may change while these calls run. That change triggers another
@@ -313,14 +326,52 @@ When the target increases, the new-side curve is recomputed using the new role
 sizes. Current new Spec is projected onto that curve, so the rollout continues
 without a stored step number.
 
-When the target decreases below current new Spec, the fraction planner alone
-is insufficient: its new side was designed to grow. The capacity-reduction
-step first removes the excess, after which fraction-based rollout coordination
-continues normally. Scale-down is therefore not modeled as a rollout running
-backward.
+When the target decreases, it is an input to the planner rather than permission
+for the executor to bypass the planner. The planner may advance the old side
+through legal fraction points to absorb the reduction. If new Spec remains
+above the target after planner-authorized old drain, a separate bounded action
+shrinks the new revision. Scale-down is therefore not modeled as a rollout
+running backward.
 
 The old-side curve remains anchored to the replica counts captured when the
 rollout began. A target change never resurrects an old replica.
+
+### Safe old-revision drain
+
+The planner returns `Past`, the aggregate old Spec that should remain after
+the next step. For each role, the executor derives two budgets:
+
+```text
+planner budget      = max(0, current old Spec - Past)
+availability budget = max(0, committed Ready - availability floor)
+allowed drain       = min(planner budget, availability budget)
+```
+
+The planner budget prevents the executor from moving further than the chosen
+fraction step. The availability budget decides whether that step is safe with
+the Ready capacity observed now.
+
+The executor spends the allowed drain only on the newest non-retired old
+revision. A partial drain must leave at least one replica of every role that
+exists in that revision. A role may reach zero only as part of retiring the
+whole revision, and whole-revision retirement is allowed only when every
+role's remaining replicas fit within both budgets.
+
+For example:
+
+```text
+allowed drain:       2 prefill / 1 decode
+newest old revision: 1 prefill / 2 decode
+```
+
+The executor cannot apply the raw budget as `0 prefill / 1 decode`, because
+that would leave a decode-only revision. It instead leaves the revision at
+`1 prefill / 1 decode`. On a later reconcile, when both roles have at least one
+unit of allowed drain, it retires them together as `0 prefill / 0 decode`.
+
+If neither a safe partial drain nor full retirement is possible, the rollout
+waits for more Ready capacity or for the planner to advance. There is no
+uncoordinated fallback.
 
 ### Multiple old revisions
 
@@ -331,8 +382,10 @@ Existing newest-first behavior remains:
 2. consider a revision retired when all of its role Specs are zero; and
 3. ignore stale Ready status from a retired revision.
 
-Where possible, every role in an old revision is retired together. That
-coordination preference never permits crossing a role's availability floor.
+Every role present in an old revision remains nonzero until that revision can
+be retired as a unit. This is a hard invariant, not a preference. The executor
+also never starts draining an older revision until the newer revision has been
+retired.
 
 ### Completion and status
 
@@ -360,10 +413,13 @@ The implementation after PR #907 needs to:
 1. remove the no-shrink target clamp;
 2. require exact new-Spec equality for completion;
 3. bound new growth by `target + maxSurge`;
-4. calculate one shared safe-reduction budget;
-5. remove excess from old revisions first;
-6. add an operation that can reduce new-revision Spec; and
-7. retain PR #907's Spec/Ready, pending allowance, and fraction coordination.
+4. treat the planner's proposed old count as a hard executor floor;
+5. intersect planner and availability drain budgets;
+6. retire every role in an old revision together, without an uncoordinated
+   fallback;
+7. remove excess from old revisions first;
+8. add an operation that can reduce new-revision Spec; and
+9. retain PR #907's Spec/Ready, pending allowance, and fraction coordination.
 
 There is no need to replace the fraction planner or add another global
 stability function.
@@ -396,6 +452,11 @@ and checks the safety rules after every action. The important cases are:
 - scale down to a target above, equal to, and below new Spec;
 - old replicas are removed before new replicas;
 - old replicas are insufficient, requiring new-revision scale-down;
+- aggregate old Spec never falls below the planner's proposed count;
+- a partial drain keeps every role in the old revision nonzero;
+- whole-revision retirement occurs only when every role fits both its planner
+  and availability budgets;
+- an otherwise blocked rollout waits instead of using an uncoordinated drain;
 - stale `Ready > Spec` cannot fund another reduction;
 - one role scales up while another scales down;
 - imbalanced role sizes preserve fraction coordination;
@@ -425,8 +486,10 @@ Use direct `/scale` writes and deterministic slow-starting pods:
 2. Lower the target below new Spec; prove total Spec decreases during the
    rollout, old replicas are selected first, and final new Spec/Ready equals
    the lower target.
-3. Observe surge, availability, pending-work, and role-fraction bounds
-   throughout both tests.
+3. During old-revision drain, prove no role reaches zero before all roles in
+   that revision can reach zero together.
+4. Observe surge, availability, pending-work, planner-floor, and role-fraction
+   bounds throughout both tests.
 
 ### Graduation criteria
 
@@ -451,6 +514,12 @@ the requested target, but old-first reduction minimizes it.
 **More executor states:** new Spec is no longer monotonic. Exact completion,
 shared reduction accounting, and transition-level tests are required to keep
 the additional states understandable.
+
+**Strict revision coordination can block progress:** if no planner step can
+keep every role alive or retire the revision safely, the controller waits. This
+is deliberate; it is safer than silently leaving a partial revision serving.
+Scenario tests must prove that supported rollout configurations eventually
+produce a legal coordinated step once new replicas become Ready.
 
 ## Alternatives
 

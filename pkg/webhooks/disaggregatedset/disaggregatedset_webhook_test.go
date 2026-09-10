@@ -925,11 +925,11 @@ func TestValidateSubRoles(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("rejects Hash until its assignment protocol is implemented", func(t *testing.T) {
+	t.Run("accepts Hash sub-roles", func(t *testing.T) {
 		obj := build()
 		obj.Spec.Roles[0].Spec.GroupIdentity = leaderworkerset.GroupIdentityHash
 		_, err := webhook.ValidateCreate(ctx, obj)
-		require.ErrorContains(t, err, "groupIdentity Hash is not supported when subRoles are defined")
+		require.NoError(t, err)
 	})
 
 	t.Run("rejects parent scaling", func(t *testing.T) {

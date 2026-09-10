@@ -132,7 +132,7 @@ func TestLeaderDeploymentApplyConfigPolicyAnnotations(t *testing.T) {
 	}
 }
 
-func TestLeaderDeploymentApplyConfigSizeOneHasNoGate(t *testing.T) {
+func TestLeaderDeploymentApplyConfigSizeOneHasDrainGate(t *testing.T) {
 	lws := wrappers.BuildBasicLeaderWorkerSet("test-hash", "default").
 		Replica(2).
 		RolloutStrategy(leaderworkerset.RolloutStrategy{
@@ -150,9 +150,13 @@ func TestLeaderDeploymentApplyConfigSizeOneHasNoGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	foundGate := false
 	for _, gate := range deployConfig.Spec.Template.Spec.ReadinessGates {
 		if gate.ConditionType != nil && *gate.ConditionType == leaderworkerset.GroupReadyConditionType {
-			t.Error("size 1 groups must not carry the group-ready readiness gate")
+			foundGate = true
 		}
+	}
+	if !foundGate {
+		t.Error("size 1 Hash groups must carry the group-ready readiness gate for draining")
 	}
 }

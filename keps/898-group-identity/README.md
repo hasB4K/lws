@@ -127,7 +127,9 @@ The webhook defaults an empty value to `Ordinal` and rejects updates to it.
 
 In hash mode, the controller owns a Deployment (named after the LeaderWorkerSet) instead of a leader StatefulSet. `maxSurge` and `maxUnavailable` from the LWS rolling update configuration map directly onto the Deployment strategy.
 
-Leader pods carry a `leaderworkerset.sigs.k8s.io/group-ready` readiness gate. The pod controller sets the condition to true once the group's worker StatefulSet is ready, so a leader counts as ready only when its whole group is. This makes the Deployment's availability budget count groups rather than bare leader pods, which is what paces rollouts group by group and what makes the ReplicaSet prefer broken groups at scale down.
+All leader pods carry a `leaderworkerset.sigs.k8s.io/group-ready` readiness gate. The pod controller sets the condition to true once the group's worker StatefulSet is ready (immediately for a size-one group), so a leader counts as ready only when its whole group is. This makes the Deployment's availability budget count groups rather than bare leader pods, which is what paces rollouts group by group and what makes the ReplicaSet prefer broken groups at scale down.
+
+A cooperating controller can request an intentional drain by adding the `leaderworkerset.sigs.k8s.io/group-draining` annotation to a leader. The pod controller remains the sole owner of the readiness condition and sets it false while that annotation is present. This avoids competing status writers while allowing a higher-level controller to make a chosen group a preferred ReplicaSet scale-down victim.
 
 ### Group Identity Assignment
 
@@ -137,7 +139,7 @@ The webhook also sets the leader's `hostname` to the LeaderWorkerSet name plus a
 
 ### Worker StatefulSets and Leader Address
 
-Each group's worker StatefulSet is named after its leader pod, as today. The hostname and subdomain assigned at admission give each leader a DNS record under the LeaderWorkerSet headless service, which is created with `publishNotReadyAddresses` so the record resolves while the readiness gate holds the leader not-ready. Workers receive this DNS name through the `leaderworkerset.sigs.k8s.io/leader-address` annotation, surfaced to containers as the `LWS_LEADER_ADDRESS` environment variable, matching the form ordinal mode provides. Groups of size 1 get no readiness gate and no worker StatefulSet.
+Each group's worker StatefulSet is named after its leader pod, as today. The hostname and subdomain assigned at admission give each leader a DNS record under the LeaderWorkerSet headless service, which is created with `publishNotReadyAddresses` so the record resolves while the readiness gate holds the leader not-ready. Workers receive this DNS name through the `leaderworkerset.sigs.k8s.io/leader-address` annotation, surfaced to containers as the `LWS_LEADER_ADDRESS` environment variable, matching the form ordinal mode provides. Groups of size 1 keep the readiness gate for drain coordination but get no worker StatefulSet.
 
 ### Rollouts
 
@@ -154,6 +156,7 @@ DisaggregatedSet roles embed the full LeaderWorkerSet spec, so a role sets `grou
 1. The DisaggregatedSet CRD schema is regenerated to include the field. Without this the API server prunes it from role templates silently.
 2. The DisaggregatedSet webhook runs the same hash-mode validation per role, so an unsupported combination fails at DisaggregatedSet admission instead of surfacing later as LeaderWorkerSet creation failures in a reconcile loop.
 3. The DisaggregatedSet revision hash includes the field, normalized so an empty value and the CRD default `Ordinal` hash identically. Objects persisted before the field existed keep their revision when the new CRD starts defaulting it, so upgrading the controller does not roll existing DisaggregatedSets.
+4. For a sub-role scale-down, DisaggregatedSet relabels the intended victims, requests their drain, and assigns low pod deletion cost to them while protecting survivors. It lowers the LWS replica count only after those leaders are NotReady, leaving ReplicaSet responsible for the actual deletion.
 
 Because the revision includes the field and DisaggregatedSet rolls template changes by replacing whole LeaderWorkerSets, changing a role from `Ordinal` to `Hash` is a normal rolling update rather than a forbidden in-place mutation. NOTE: the DisaggregatedSet revision covers all roles jointly, so changing one role's identity mode rolls the whole slice, the same as any other role template change.
 
@@ -188,7 +191,7 @@ Validation rejects hash mode combined with features whose semantics depend on st
 - Readiness gate lifecycle: false while workers are pending, true when the group is ready.
 - Scale up and scale down, including to zero and back.
 - Rolling updates respect `maxSurge` and `maxUnavailable` in units of groups.
-- Size 1 groups: no gate, no worker StatefulSet.
+- Size 1 groups: a drain-capable gate, no worker StatefulSet.
 - Leaders resolve by DNS name, and `subGroupPolicy` and `UniquePerReplica` work in hash mode with group key derived values.
 - A `groupIdentity: Hash` DisaggregatedSet role survives the CRD schema and is rejected when combined with volume claim templates.
 
@@ -212,6 +215,7 @@ Beta: feedback, make `Hash` recommended for serving workloads in the documentati
 - 2026-08-17: KEP drafted after a working prototype was built and tested.
 - 2026-08-18: DisaggregatedSet integration added to the prototype.
 - 2026-08-24: Review updates. Leaders get DNS names derived from the group key, and `subGroupPolicy` and `UniquePerReplica` move from rejected to supported through group key derivation.
+- 2026-09-10: Added the coordinated readiness/deletion-cost drain protocol used by DisaggregatedSet sub-roles.
 
 ## Drawbacks
 

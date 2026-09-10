@@ -166,12 +166,11 @@ func constructLeaderDeploymentApplyConfiguration(lws *leaderworkerset.LeaderWork
 	}
 	podTemplateApplyConfiguration.Spec.WithSubdomain(lws.Name)
 
-	// The gate keeps a leader pod not-ready until its worker statefulset is ready,
-	// so the Deployment's maxUnavailable budget counts whole groups.
-	if *lws.Spec.LeaderWorkerTemplate.Size > 1 {
-		podTemplateApplyConfiguration.Spec.WithReadinessGates(
-			coreapplyv1.PodReadinessGate().WithConditionType(leaderworkerset.GroupReadyConditionType))
-	}
+	// Every Hash leader carries the gate, including a size-one group. In addition
+	// to pacing groups with workers, this gives cooperating controllers a safe
+	// drain handshake before the Deployment is scaled down.
+	podTemplateApplyConfiguration.Spec.WithReadinessGates(
+		coreapplyv1.PodReadinessGate().WithConditionType(leaderworkerset.GroupReadyConditionType))
 
 	deploymentLabels, deploymentAnnotations := leaderMetadata(lws, revisionKey)
 

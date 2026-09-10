@@ -186,8 +186,12 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 	if err := executor.scaleUpNew(ctx, disaggregatedSet, slice, newRevision, allRoleNames, specRoleSet, currentNew, nextStep.New); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := executor.scaleDownOld(ctx, disaggregatedSet, slice, newRevision.Revision, oldRevisions, allRoleNames, currentOld, nextStep.Past, scalers); err != nil {
+	prepared, err := executor.scaleDownOld(ctx, disaggregatedSet, slice, newRevision.Revision, oldRevisions, allRoleNames, currentOld, nextStep.Past, scalers)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if !prepared {
+		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -375,7 +379,7 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 	roleNames []string,
 	current, target RoleReplicaState,
 	scalers ScalerMap,
-) error {
+) (bool, error) {
 	budget := make([]int, len(roleNames))
 	for i := range roleNames {
 		budget[i] = current[i] - target[i]
@@ -391,6 +395,7 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 		plannedDrain := make(map[string]int)
 		triggersCoordinated := make(map[string]bool)
 
+		prepared := true
 		for i, name := range roleNames {
 			lws, exists := wl.Roles[name]
 			if !exists {
@@ -414,7 +419,7 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 			}
 		}
 
-		for i, name := range roleNames {
+		for _, name := range roleNames {
 			lws, exists := wl.Roles[name]
 			if !exists {
 				continue
@@ -424,15 +429,31 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 				continue
 			}
 			if executor.RolloutCoordinator != nil {
-				if err := executor.RolloutCoordinator.PrepareScaleDown(ctx, ds, slice, targetRevision, name, lws, newReplicas[name], scalers); err != nil {
-					return fmt.Errorf("prepare sub-role scale-down for %s: %w", lws.Name, err)
+				lwsPrepared, err := executor.RolloutCoordinator.PrepareScaleDown(ctx, ds, slice, targetRevision, name, lws, newReplicas[name], scalers)
+				if err != nil {
+					return false, fmt.Errorf("prepare sub-role scale-down for %s: %w", lws.Name, err)
 				}
+				prepared = prepared && lwsPrepared
+			}
+		}
+		if !prepared {
+			return false, nil
+		}
+
+		for i, name := range roleNames {
+			lws, exists := wl.Roles[name]
+			if !exists {
+				continue
+			}
+			replicas := int(getLWSReplicas(lws))
+			if replicas <= newReplicas[name] {
+				continue
 			}
 			// Address by the LWS's actual name so a legacy slice-0 object drains too.
 			lwsName := lws.Name
 			log.Info("Scaling down", "lws", lwsName, "from", replicas, "to", newReplicas[name])
 			if err := executor.LWSManager.Scale(ctx, ds, lwsName, newReplicas[name]); err != nil {
-				return fmt.Errorf("failed to scale %s: %w", lwsName, err)
+				return false, fmt.Errorf("failed to scale %s: %w", lwsName, err)
 			}
 			executor.Record.Eventf(ds, nil, corev1.EventTypeNormal, EventReasonScalingDown,
 				"Update", "Scaling down %s LWS %s from %d to %d replicas", name, lwsName, replicas, newReplicas[name])
@@ -442,7 +463,7 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 			}
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func allZero(s []int) bool {

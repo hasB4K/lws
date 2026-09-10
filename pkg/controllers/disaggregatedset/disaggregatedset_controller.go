@@ -230,7 +230,7 @@ func (r *DisaggregatedSetReconciler) updateStatus(ctx context.Context, disaggreg
 				if err != nil {
 					return fmt.Errorf("observe sub-role assignments for %s status: %w", lws.Name, err)
 				}
-				if summary.Unassigned != 0 || !hasExpectedGroupOrdinals(summary, int(getLWSReplicas(lws))) {
+				if summary.Unassigned != 0 || !hasExpectedGroupCount(summary, int(getLWSReplicas(lws))) {
 					assignmentsConverged = false
 				}
 				for name, count := range summary.Replicas {
@@ -658,27 +658,32 @@ func (r *DisaggregatedSetReconciler) createRollingUpdateExecutor() *RollingUpdat
 	}
 }
 
-//nolint:unparam // Result is always empty but signature matches controller-runtime pattern
 func (r *DisaggregatedSetReconciler) reconcileSimple(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, revision string, scalers ScalerMap) (ctrl.Result, error) {
 	roleConfigs := disaggregatedsetutils.GetRoleConfigs(disaggregatedSet)
+	prepared := true
 
 	for role, config := range roleConfigs {
-		if err := r.reconcileRoleSimple(ctx, disaggregatedSet, slice, role, config, revision, scalers); err != nil {
+		rolePrepared, err := r.reconcileRoleSimple(ctx, disaggregatedSet, slice, role, config, revision, scalers)
+		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile %s role: %w", role, err)
 		}
+		prepared = prepared && rolePrepared
 	}
 
+	if !prepared {
+		return ctrl.Result{RequeueAfter: 250 * time.Millisecond}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
-func (r *DisaggregatedSetReconciler) reconcileRoleSimple(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, role string, config *disaggregatedsetv1.DisaggregatedRoleSpec, revision string, scalers ScalerMap) error {
+func (r *DisaggregatedSetReconciler) reconcileRoleSimple(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, role string, config *disaggregatedsetv1.DisaggregatedRoleSpec, revision string, scalers ScalerMap) (bool, error) {
 	log := logf.FromContext(ctx)
 
 	// GetForRole adopts a legacy slice-0 LWS in place, so we do not create a
 	// duplicate slice-aware object over a pre-slices deployment.
 	existing, err := r.LWSManager.GetForRole(ctx, disaggregatedSet, slice, revision, role)
 	if err != nil {
-		return fmt.Errorf("failed to get LWS for role %s revision %s: %w", role, revision, err)
+		return false, fmt.Errorf("failed to get LWS for role %s revision %s: %w", role, revision, err)
 	}
 
 	// External roles pull replicas from the scaler; Static roles use spec.replicas.
@@ -694,7 +699,7 @@ func (r *DisaggregatedSetReconciler) reconcileRoleSimple(ctx context.Context, di
 		lwsName := disaggregatedsetutils.GenerateName(disaggregatedSet.Name, slice, revision, role)
 		labels := disaggregatedsetutils.GenerateLabels(disaggregatedSet.Name, slice, revision, role)
 		log.Info("Creating LWS", "role", role, "name", lwsName, "replicas", desiredReplicas)
-		return r.LWSManager.Create(ctx, disaggregatedsetutils.CreateParams{
+		err := r.LWSManager.Create(ctx, disaggregatedsetutils.CreateParams{
 			DisaggregatedSet: disaggregatedSet,
 			Role:             role,
 			Slice:            slice,
@@ -703,6 +708,7 @@ func (r *DisaggregatedSetReconciler) reconcileRoleSimple(ctx context.Context, di
 			Labels:           labels,
 			Replicas:         int(desiredReplicas),
 		})
+		return true, err
 	}
 
 	existingReplicas := int32(1)
@@ -711,17 +717,21 @@ func (r *DisaggregatedSetReconciler) reconcileRoleSimple(ctx context.Context, di
 	}
 	if existingReplicas != desiredReplicas {
 		if existingReplicas > desiredReplicas {
-			if err := r.SubRoleRollout.PrepareScaleDown(ctx, disaggregatedSet, slice, revision, role, existing, int(desiredReplicas), scalers); err != nil {
-				return err
+			prepared, err := r.SubRoleRollout.PrepareScaleDown(ctx, disaggregatedSet, slice, revision, role, existing, int(desiredReplicas), scalers)
+			if err != nil {
+				return false, err
+			}
+			if !prepared {
+				return false, nil
 			}
 		}
 		log.Info("Scaling LWS", "role", role, "name", existing.Name, "from", existingReplicas, "to", desiredReplicas)
 		if err := r.LWSManager.Scale(ctx, disaggregatedSet, existing.Name, int(desiredReplicas)); err != nil {
-			return fmt.Errorf("failed to scale LWS %s: %w", existing.Name, err)
+			return false, fmt.Errorf("failed to scale LWS %s: %w", existing.Name, err)
 		}
 	}
 
-	return nil
+	return true, nil
 }
 
 // cleanupDrainedLWS deletes all LWS objects for old revisions where every role

@@ -923,8 +923,9 @@ func TestScaleDownOld(t *testing.T) {
 				current[0] - tc.prefillBudget,
 				current[1] - tc.decodeBudget,
 			}
-			err := executor.scaleDownOld(context.TODO(), ds, 0, "new", grouped, roleNames, current, target, nil)
+			prepared, err := executor.scaleDownOld(context.TODO(), ds, 0, "new", grouped, roleNames, current, target, nil)
 			require.NoError(t, err)
+			require.True(t, prepared)
 
 			for _, workload := range tc.workloads {
 				prefillName := fmt.Sprintf("test-0-%s-prefill", workload.revision)
@@ -1021,8 +1022,9 @@ func TestScaleDownOldWithMissingRole(t *testing.T) {
 				current[1] - tc.decodeBudget,
 				current[2] - tc.encodeBudget,
 			}
-			err := executor.scaleDownOld(context.TODO(), ds, 0, "new", grouped, threeRoleNames, current, target, nil)
+			prepared, err := executor.scaleDownOld(context.TODO(), ds, 0, "new", grouped, threeRoleNames, current, target, nil)
 			require.NoError(t, err)
+			require.True(t, prepared)
 
 			// Verify prefill and decode were scaled correctly
 			assert.Equal(t, tc.expectedPrefill,

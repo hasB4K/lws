@@ -113,12 +113,18 @@ const (
 	// in both group identity modes, so that pod admission can inject
 	// LWS_LEADER_ADDRESS without recomputing it.
 	LeaderAddressAnnotationKey string = "leaderworkerset.sigs.k8s.io/leader-address"
+
+	// GroupDrainingAnnotationKey requests that the pod controller mark a Hash
+	// identity leader unavailable before its group is selected for scale-down.
+	// The controller that requests the drain owns the annotation; the LWS pod
+	// controller remains the sole writer of GroupReadyConditionType.
+	GroupDrainingAnnotationKey string = "leaderworkerset.sigs.k8s.io/group-draining"
 )
 
 // GroupReadyConditionType is the pod readiness gate condition set on leader pods when
 // GroupIdentity=Hash. The pod controller marks it True once the group's worker
-// statefulset is ready, which makes Deployment rollout pacing count whole groups
-// instead of bare leader pods.
+// statefulset is ready and no drain was requested, which makes Deployment rollout
+// pacing and scale-down count whole groups instead of bare leader pods.
 const GroupReadyConditionType corev1.PodConditionType = "leaderworkerset.sigs.k8s.io/group-ready"
 
 // One group consists of a single leader and M workers, and the total number of pods in a group is M+1.

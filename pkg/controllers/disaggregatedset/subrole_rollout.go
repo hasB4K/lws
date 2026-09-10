@@ -107,7 +107,7 @@ func (c *SubRoleRolloutCoordinator) SnapshotInitialAssignments(
 			if err != nil {
 				return err
 			}
-			if summary.Unassigned != 0 || !hasExpectedGroupOrdinals(summary, int(getLWSReplicas(lws))) {
+			if summary.Unassigned != 0 || !hasExpectedGroupCount(summary, int(getLWSReplicas(lws))) {
 				return fmt.Errorf("cannot snapshot sub-role assignments for %s before assignments converge", lws.Name)
 			}
 			distribution := make(map[string]int, len(order))
@@ -122,8 +122,9 @@ func (c *SubRoleRolloutCoordinator) SnapshotInitialAssignments(
 	return nil
 }
 
-// PrepareScaleDown assigns the post-scale distribution and places its retained
-// groups on low ordinals before the caller lowers LWS.spec.replicas.
+// PrepareScaleDown assigns the post-scale distribution and prepares the exact
+// groups that the underlying StatefulSet or ReplicaSet should remove. It
+// returns false while label or readiness changes still need to be observed.
 func (c *SubRoleRolloutCoordinator) PrepareScaleDown(
 	ctx context.Context,
 	ds *disaggregatedsetv1.DisaggregatedSet,
@@ -132,27 +133,30 @@ func (c *SubRoleRolloutCoordinator) PrepareScaleDown(
 	victim *leaderworkersetv1.LeaderWorkerSet,
 	retained int,
 	scalers ScalerMap,
-) error {
+) (bool, error) {
 	role := c.targets.Role(ds, roleName)
 	if role == nil || len(role.SubRoles) == 0 || retained >= int(getLWSReplicas(victim)) {
-		return nil
+		return true, nil
 	}
 	all, err := c.lwsManager.List(ctx, ds, slice, roleName)
 	if err != nil {
-		return fmt.Errorf("list LWS for sub-role scale-down: %w", err)
+		return false, fmt.Errorf("list LWS for sub-role scale-down: %w", err)
 	}
 	overrides := map[string]int{victim.Name: retained}
-	_, err = c.reconcileRole(ctx, ds, role, all, targetRevision, scalers, overrides)
+	converged, err := c.reconcileRole(ctx, ds, role, all, targetRevision, scalers, overrides)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if !converged {
+		return false, nil
 	}
 
 	states, complete, err := c.observeStates(ctx, ds.Namespace, role, all, targetRevision, overrides)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !complete {
-		return fmt.Errorf("cannot prepare scale-down for %s before all current groups are observed", victim.Name)
+		return false, nil
 	}
 	current := aggregateSubRoleCounts(roleName, states)
 	quotas := planSubRoleQuotas(states, subRoleNames(role), c.targets.SubRoleTargets(ds, roleName, scalers, current))
@@ -165,9 +169,8 @@ func (c *SubRoleRolloutCoordinator) prepareVictim(
 	victim *leaderworkersetv1.LeaderWorkerSet,
 	order []string,
 	retained map[string]int,
-) error {
-	_, err := c.assignments.PrepareScaleDown(ctx, namespace, victim.Name, order, retained)
-	return err
+) (bool, error) {
+	return c.assignments.PrepareScaleDown(ctx, namespace, victim.Name, victim.Spec.GroupIdentity, order, retained)
 }
 
 func (c *SubRoleRolloutCoordinator) reconcileRole(
@@ -179,8 +182,17 @@ func (c *SubRoleRolloutCoordinator) reconcileRole(
 	scalers ScalerMap,
 	capacityOverrides map[string]int,
 ) (bool, error) {
+	metadataConverged := true
+	for _, lws := range workloads {
+		changed, err := c.assignments.CleanupScaleDown(ctx, ds.Namespace, lws.Name, int(getLWSReplicas(lws)))
+		if err != nil {
+			return false, err
+		}
+		metadataConverged = metadataConverged && !changed
+	}
+
 	if len(role.SubRoles) == 0 {
-		converged := true
+		converged := metadataConverged
 		for _, lws := range workloads {
 			changed, _, err := c.assignments.Reconcile(ctx, ds.Namespace, lws.Name, nil, nil)
 			if err != nil {
@@ -200,7 +212,7 @@ func (c *SubRoleRolloutCoordinator) reconcileRole(
 	targets := c.targets.SubRoleTargets(ds, role.Name, scalers, current)
 	quotas := planSubRoleQuotas(states, order, targets)
 
-	converged := true
+	converged := metadataConverged
 	for _, state := range states {
 		changed, summary, err := c.assignments.Reconcile(ctx, ds.Namespace, state.lws.Name, order, quotas[state.lws.Name])
 		if err != nil {
@@ -229,7 +241,7 @@ func (c *SubRoleRolloutCoordinator) observeStates(
 		if err != nil {
 			return nil, false, err
 		}
-		observedCapacity := len(summary.GroupIndexes)
+		observedCapacity := len(summary.GroupIDs)
 		currentCapacity := int(getLWSReplicas(lws))
 		if observedCapacity != currentCapacity {
 			complete = false

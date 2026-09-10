@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	podutils "sigs.k8s.io/lws/pkg/utils/pod"
 	revisionutils "sigs.k8s.io/lws/pkg/utils/revision"
 	"sigs.k8s.io/lws/test/wrappers"
 )
@@ -920,5 +921,38 @@ func TestConstructWorkerStatefulSetServiceNameHashUniquePerReplica(t *testing.T)
 	}
 	if got := *cfg.Spec.ServiceName; got != "test-sample-9f2ac71b" {
 		t.Errorf("expected the worker StatefulSet to use the group key derived service name, got %q", got)
+	}
+}
+
+func TestSyncGroupReadyConditionHonorsDrainRequest(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hash-leader",
+			Namespace: "default",
+			Annotations: map[string]string{
+				leaderworkerset.GroupDrainingAnnotationKey: "1",
+			},
+		},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type:   leaderworkerset.GroupReadyConditionType,
+			Status: corev1.ConditionTrue,
+			Reason: "WorkerStatefulSetReady",
+		}}},
+	}
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1.Pod{}).WithObjects(pod).Build()
+	reconciler := PodReconciler{Client: fakeClient, Scheme: scheme}
+
+	if err := reconciler.syncGroupReadyCondition(context.Background(), pod, true); err != nil {
+		t.Fatalf("syncGroupReadyCondition() error = %v", err)
+	}
+	got := &corev1.Pod{}
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(pod), got); err != nil {
+		t.Fatal(err)
+	}
+	_, condition := podutils.GetPodCondition(&got.Status, leaderworkerset.GroupReadyConditionType)
+	if condition == nil || condition.Status != corev1.ConditionFalse || condition.Reason != "GroupDraining" {
+		t.Fatalf("group-ready condition = %#v, want False/GroupDraining", condition)
 	}
 }

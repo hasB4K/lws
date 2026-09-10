@@ -169,12 +169,19 @@ func (r *PodReconciler) reconcilePod(ctx context.Context, req podReconcileReques
 		}
 	}
 
-	// Once size = 1, no need to create worker statefulSets.
+	hashIdentity := leaderWorkerSet.Spec.GroupIdentity == leaderworkerset.GroupIdentityHash
+
+	// Once size = 1, no need to create worker statefulSets. Hash leaders still
+	// need their readiness gate maintained so they can participate in the same
+	// drain protocol as multi-pod groups.
 	if *leaderWorkerSet.Spec.LeaderWorkerTemplate.Size == 1 {
+		if hashIdentity {
+			if err := r.syncGroupReadyCondition(ctx, &pod, true); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		return ctrl.Result{}, nil
 	}
-
-	hashIdentity := leaderWorkerSet.Spec.GroupIdentity == leaderworkerset.GroupIdentityHash
 
 	// logic for handling leader pod
 	if leaderWorkerSet.Spec.StartupPolicy == leaderworkerset.LeaderReadyStartupPolicy {
@@ -276,7 +283,7 @@ func (r *PodReconciler) reconcilePod(ctx context.Context, req podReconcileReques
 }
 
 // syncGroupReadyCondition patches the leader pod's group-ready condition to match
-// the readiness of its worker statefulset.
+// the readiness of its worker statefulset and any explicit drain request.
 func (r *PodReconciler) syncGroupReadyCondition(ctx context.Context, pod *corev1.Pod, ready bool) error {
 	status := corev1.ConditionFalse
 	reason := "WorkerStatefulSetNotReady"
@@ -284,7 +291,11 @@ func (r *PodReconciler) syncGroupReadyCondition(ctx context.Context, pod *corev1
 		status = corev1.ConditionTrue
 		reason = "WorkerStatefulSetReady"
 	}
-	if _, existing := podutils.GetPodCondition(&pod.Status, leaderworkerset.GroupReadyConditionType); existing != nil && existing.Status == status {
+	if _, draining := pod.Annotations[leaderworkerset.GroupDrainingAnnotationKey]; draining {
+		status = corev1.ConditionFalse
+		reason = "GroupDraining"
+	}
+	if _, existing := podutils.GetPodCondition(&pod.Status, leaderworkerset.GroupReadyConditionType); existing != nil && existing.Status == status && existing.Reason == reason {
 		return nil
 	}
 	newPod := pod.DeepCopy()

@@ -86,13 +86,6 @@ func (w *DisaggregatedSetWebhook) validate(obj *disaggv1.DisaggregatedSet) (admi
 				allErrs = append(allErrs, field.Forbidden(rolePath.Child("scaling"),
 					"parent scaling must be omitted when subRoles is present"))
 			}
-			// TODO: Support sub-roles with groupIdentity: Hash in a follow-up PR.
-			// Hash-mode Deployment scale-down does not expose the deterministic
-			// victim ordinal required by the initial assignment protocol.
-			if role.Spec.GroupIdentity == leaderworkerset.GroupIdentityHash {
-				allErrs = append(allErrs, field.Forbidden(rolePath.Child("spec", "groupIdentity"),
-					"groupIdentity Hash is not supported when subRoles are defined"))
-			}
 			if role.Spec.Replicas != nil && *role.Spec.Replicas > 1 {
 				warnings = append(warnings, fmt.Sprintf(
 					"role %q defines subRoles and spec.replicas: %d — parent spec.replicas is ignored; replicas are the sum of sub-role targets",

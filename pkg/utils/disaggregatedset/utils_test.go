@@ -467,7 +467,7 @@ func TestSliceLabelMatches(t *testing.T) {
 	}
 }
 
-func revisionRoleLWS(revision, role string, replicas *int32, initialReplicas string) *leaderworkersetv1.LeaderWorkerSet {
+func revisionRoleLWS(revision, role string, replicas *int32, intendedReplicas string) *leaderworkersetv1.LeaderWorkerSet {
 	lws := &leaderworkersetv1.LeaderWorkerSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: revision + "-" + role,
@@ -478,8 +478,8 @@ func revisionRoleLWS(revision, role string, replicas *int32, initialReplicas str
 		},
 		Spec: leaderworkersetv1.LeaderWorkerSetSpec{Replicas: replicas},
 	}
-	if initialReplicas != "" {
-		lws.Annotations = map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: initialReplicas}
+	if intendedReplicas != "" {
+		lws.Annotations = map[string]string{disaggregatedsetv1.IntendedReplicasAnnotationKey: intendedReplicas}
 	}
 	return lws
 }
@@ -538,11 +538,11 @@ func TestRevisionRolesListTotals(t *testing.T) {
 		assert.Equal(t, 0, revisions.GetTotalReplicasPerRole("unknown"))
 	})
 
-	t.Run("initial replicas prefer the annotation and fall back to spec replicas", func(t *testing.T) {
-		// rev-a prefill annotation 5 + rev-b prefill nil→1 + rev-c prefill invalid annotation → spec 4
-		assert.Equal(t, 10, revisions.GetTotalInitialReplicasPerRole(testUtilsRolePrefill))
-		// decode has no annotation anywhere → spec replicas
-		assert.Equal(t, 3, revisions.GetTotalInitialReplicasPerRole(testUtilsRoleDecode))
+	t.Run("intended replicas use the maximum revision target and fall back to spec replicas", func(t *testing.T) {
+		// max(rev-a annotation 5, rev-b nil→1, rev-c invalid annotation→spec 4)
+		assert.Equal(t, 5, revisions.GetMaxIntendedReplicasPerRole(testUtilsRolePrefill))
+		// decode has no annotation anywhere, so its Spec is the only target.
+		assert.Equal(t, 3, revisions.GetMaxIntendedReplicasPerRole(testUtilsRoleDecode))
 	})
 }
 

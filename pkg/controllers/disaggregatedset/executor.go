@@ -87,10 +87,10 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdateNew(
 	if len(oldRevisions) == 0 {
 		return ctrl.Result{}, nil
 	}
-	// Objects created before intended-replicas was introduced have no durable
-	// target. Snapshot their current Spec once; revisions created by this
-	// controller already carry their intended target and are never overwritten
-	// after they become old.
+	// Migrate the legacy initial-replicas value before using Spec as a fallback:
+	// an old revision's Spec may already be partially drained. Objects carrying
+	// neither annotation use their current Spec as the best available baseline.
+	// Once written, intended-replicas is immutable for an old revision.
 	if err := executor.ensureOldIntendedReplicas(ctx, disaggregatedSet, oldRevisions); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -666,9 +666,9 @@ func (executor *RollingUpdateExecutor) ensureNewLWSExists(
 	return true, nil
 }
 
-// ensureOldIntendedReplicas backfills only legacy objects. An existing value
-// is immutable once the revision is old, even when its Spec has already been
-// partially drained.
+// ensureOldIntendedReplicas migrates legacy objects to intended-replicas. An
+// existing value is immutable once the revision is old, even when its Spec has
+// already been partially drained.
 func (executor *RollingUpdateExecutor) ensureOldIntendedReplicas(
 	ctx context.Context,
 	ds *disaggregatedsetv1.DisaggregatedSet,
@@ -676,10 +676,14 @@ func (executor *RollingUpdateExecutor) ensureOldIntendedReplicas(
 ) error {
 	for _, revision := range oldRevisions {
 		for _, lws := range revision.Roles {
-			if _, ok := disaggregatedsetutils.GetIntendedReplicas(lws); ok {
+			if _, ok := disaggregatedsetutils.GetIntendedReplicasAnnotation(lws); ok {
 				continue
 			}
-			intended := int(getLWSReplicas(lws))
+			intendedReplicas, ok := disaggregatedsetutils.GetIntendedReplicas(lws)
+			if !ok {
+				intendedReplicas = int32(getLWSReplicas(lws))
+			}
+			intended := int(intendedReplicas)
 			if _, err := executor.LWSManager.SetIntendedReplicas(ctx, ds.Namespace, lws.Name, intended); err != nil {
 				return fmt.Errorf("failed to backfill intended replicas on %s: %w", lws.Name, err)
 			}
@@ -705,7 +709,7 @@ func (executor *RollingUpdateExecutor) syncTargetIntendedReplicas(
 			continue
 		}
 		intended := getTargetReplicas(ds, roleName, scalers, int(getLWSReplicas(lws)))
-		current, ok := disaggregatedsetutils.GetIntendedReplicas(lws)
+		current, ok := disaggregatedsetutils.GetIntendedReplicasAnnotation(lws)
 		if ok && int(current) == intended {
 			continue
 		}

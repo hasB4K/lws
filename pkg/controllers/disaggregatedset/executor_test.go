@@ -1533,6 +1533,32 @@ func TestOldIntendedReplicasAreBackfilledOnlyOnce(t *testing.T) {
 	assert.EqualValues(t, 5, intended)
 }
 
+func TestOldLegacyInitialReplicasAreMigrated(t *testing.T) {
+	ctx := context.Background()
+	ds := &disaggregatedsetv1.DisaggregatedSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "test", Namespace: testNamespace, UID: "uid",
+	}}
+	// The legacy target must win over the partially drained Spec during
+	// migration; otherwise an upgrade in the middle of a rollout loses the
+	// original old-side baseline.
+	lws := buildTestLWS("test-0-hashA-prefill", testNamespace, testRolePrefill, "hashA").
+		Replica(2).
+		Annotation(map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "5"}).
+		Obj()
+	fakeClient := fake.NewClientBuilder().WithScheme(testSchemeForUnit()).WithObjects(lws).Build()
+	executor := newTestExecutor(fakeClient)
+	old := disaggregatedsetutils.RevisionRolesList{{Revision: "hashA", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+		testRolePrefill: lws,
+	}}}
+
+	require.NoError(t, executor.ensureOldIntendedReplicas(ctx, ds, old))
+	stored, err := executor.LWSManager.Get(ctx, ds, lws.Name)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "5", stored.Annotations[disaggregatedsetv1.IntendedReplicasAnnotationKey])
+	assert.Equal(t, "5", stored.Annotations[disaggregatedsetv1.InitialReplicasAnnotationKey])
+}
+
 func TestExternalTargetUpdatesCurrentRevisionIntendedReplicas(t *testing.T) {
 	ctx := context.Background()
 	ds := &disaggregatedsetv1.DisaggregatedSet{

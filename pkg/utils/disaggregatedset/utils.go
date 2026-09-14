@@ -30,27 +30,33 @@ import (
 
 const NumRequiredRoles = 2
 
+func getReplicasAnnotation(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet, key string) (int32, bool) {
+	if leaderWorkerSet.Annotations == nil {
+		return 0, false
+	}
+	value, exists := leaderWorkerSet.Annotations[key]
+	if !exists || value == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 32)
+	return int32(parsed), err == nil
+}
+
+// GetIntendedReplicasAnnotation reads only the canonical intended-replicas
+// annotation. Reconcilers use this to detect legacy objects that still need
+// migration even when their initial-replicas fallback has the correct value.
+func GetIntendedReplicasAnnotation(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) (int32, bool) {
+	return getReplicasAnnotation(leaderWorkerSet, disaggregatedsetv1.IntendedReplicasAnnotationKey)
+}
+
 // GetIntendedReplicas returns the replica count that this revision was meant
 // to reach. The initial-replicas fallback keeps existing rollouts readable
 // across an upgrade to the intended-replicas annotation.
 func GetIntendedReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) (int32, bool) {
-	if leaderWorkerSet.Annotations == nil {
-		return 0, false
+	if replicas, ok := GetIntendedReplicasAnnotation(leaderWorkerSet); ok {
+		return replicas, true
 	}
-	for _, key := range []string{
-		disaggregatedsetv1.IntendedReplicasAnnotationKey,
-		disaggregatedsetv1.InitialReplicasAnnotationKey,
-	} {
-		value, exists := leaderWorkerSet.Annotations[key]
-		if !exists || value == "" {
-			continue
-		}
-		parsed, err := strconv.ParseInt(value, 10, 32)
-		if err == nil {
-			return int32(parsed), true
-		}
-	}
-	return 0, false
+	return getReplicasAnnotation(leaderWorkerSet, disaggregatedsetv1.InitialReplicasAnnotationKey)
 }
 
 func SetIntendedReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet, replicas int32) {

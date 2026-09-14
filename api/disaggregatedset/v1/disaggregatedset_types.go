@@ -45,6 +45,9 @@ const (
 	// InitialReplicasAnnotationKey is the legacy annotation used before intended
 	// replica counts were recorded when a revision was created. Readers retain
 	// support for it so in-progress rollouts survive a controller upgrade.
+	// TODO: Remove this key and its compatibility readers in v0.13.0. Releases
+	// v0.11.x and v0.12.x migrate observed LWS objects by copying this value to
+	// IntendedReplicasAnnotationKey.
 	// Deprecated: use IntendedReplicasAnnotationKey.
 	InitialReplicasAnnotationKey string = "disaggregatedset.x-k8s.io/initial-replicas"
 )

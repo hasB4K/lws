@@ -105,6 +105,23 @@ func TestGetInitialReplicas(t *testing.T) {
 	})
 }
 
+func TestGetIntendedReplicasAnnotationDoesNotUseLegacyFallback(t *testing.T) {
+	legacyOnly := &leaderworkersetv1.LeaderWorkerSet{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		disaggregatedsetv1.InitialReplicasAnnotationKey: "5",
+	}}}
+	_, ok := GetIntendedReplicasAnnotation(legacyOnly)
+	assert.False(t, ok)
+
+	legacyCompatible, ok := GetIntendedReplicas(legacyOnly)
+	require.True(t, ok)
+	assert.EqualValues(t, 5, legacyCompatible)
+
+	SetIntendedReplicas(legacyOnly, 5)
+	canonical, ok := GetIntendedReplicasAnnotation(legacyOnly)
+	require.True(t, ok)
+	assert.EqualValues(t, 5, canonical)
+}
+
 func TestSetIntendedReplicas(t *testing.T) {
 	t.Run("sets annotation as string on LWS with nil annotations", func(t *testing.T) {
 		leaderWorkerSet := &leaderworkersetv1.LeaderWorkerSet{

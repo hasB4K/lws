@@ -343,6 +343,27 @@ func TestManagerSetIntendedReplicas(t *testing.T) {
 		require.Nil(t, oldValue)
 	})
 
+	t.Run("migrates legacy annotation when value is unchanged", func(t *testing.T) {
+		existingLWS := buildManagerTestLWS(
+			map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "5"},
+		)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithRuntimeObjects(existingLWS).
+			Build()
+
+		manager := NewLeaderWorkerSetManager(fakeClient)
+		oldValue, err := manager.SetIntendedReplicas(context.Background(), "default", "test-lws", 5)
+
+		require.NoError(t, err)
+		require.NotNil(t, oldValue)
+		require.Equal(t, 5, *oldValue)
+		var stored leaderworkersetv1.LeaderWorkerSet
+		require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "test-lws"}, &stored))
+		assert.Equal(t, "5", stored.Annotations[disaggregatedsetv1.IntendedReplicasAnnotationKey])
+	})
+
 	t.Run("returns error when LWS not found", func(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).

@@ -1185,6 +1185,75 @@ func TestScaleDownOld(t *testing.T) {
 	}
 }
 
+func TestReconcileRollingUpdateCoordinatesRetirementWhileRoleReadinessIsSlow(t *testing.T) {
+	createdAt := time.Now()
+	prefillName := "test-0-oldhash-prefill"
+	decodeName := "test-0-oldhash-decode"
+	newPrefillName := "test-0-newhash-prefill"
+	newDecodeName := "test-0-newhash-decode"
+	initialOne := map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "1"}
+	initialTwo := map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "2"}
+	objects := []client.Object{
+		buildTestLWS(prefillName, testNamespace, testRolePrefill, "oldhash").
+			Replica(1).StatusReplicas(1).ReadyReplicas(1).CreationTimestamp(createdAt).Annotation(initialOne).Obj(),
+		buildTestLWS(decodeName, testNamespace, testRoleDecode, "oldhash").
+			Replica(1).StatusReplicas(1).ReadyReplicas(1).CreationTimestamp(createdAt).Annotation(initialTwo).Obj(),
+		buildTestLWS(newPrefillName, testNamespace, testRolePrefill, "newhash").
+			Replica(1).StatusReplicas(1).ReadyReplicas(1).CreationTimestamp(createdAt.Add(time.Second)).Obj(),
+		buildTestLWS(newDecodeName, testNamespace, testRoleDecode, "newhash").
+			Replica(2).StatusReplicas(2).ReadyReplicas(1).CreationTimestamp(createdAt.Add(time.Second)).Obj(),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(testSchemeForUnit()).
+		WithObjects(objects...).WithStatusSubresource(&leaderworkersetv1.LeaderWorkerSet{}).Build()
+	executor := newTestExecutor(fakeClient)
+	zero := intstr.FromInt(0)
+	one := intstr.FromInt(1)
+	ds := &disaggregatedsetv1.DisaggregatedSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: testNamespace, UID: "uid"},
+		Spec: disaggregatedsetv1.DisaggregatedSetSpec{Roles: []disaggregatedsetv1.DisaggregatedRoleSpec{
+			makeRoleSpec(testRolePrefill, 1, corev1.PodSpec{}, one, zero),
+			makeRoleSpec(testRoleDecode, 2, corev1.PodSpec{}, one, zero),
+		}},
+	}
+	oldRevision := disaggregatedsetutils.RevisionRoles{
+		Revision: "oldhash",
+		Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+			testRolePrefill: makeLWS(withName(prefillName), withReplicas(1), withReadyReplicas(1), withInitialReplicasAnnotation(1), withCreationTimestamp(createdAt)),
+			testRoleDecode:  makeLWS(withName(decodeName), withReplicas(1), withReadyReplicas(1), withInitialReplicasAnnotation(2), withCreationTimestamp(createdAt)),
+		},
+	}
+	newRevision := disaggregatedsetutils.RevisionRoles{
+		Revision: "newhash",
+		Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+			testRolePrefill: makeLWS(withName(newPrefillName), withReplicas(1), withReadyReplicas(1)),
+			testRoleDecode:  makeLWS(withName(newDecodeName), withReplicas(2), withReadyReplicas(1)),
+		},
+	}
+
+	// The replacement prefill is Ready, but one replacement decode is still
+	// pending. Repeated reconciles must not use the deadlock fallback to retire
+	// prefill alone while that pending replica can unblock joint retirement.
+	_, err := executor.ReconcileRollingUpdate(context.TODO(), ds,
+		disaggregatedsetutils.RevisionRolesList{oldRevision}, newRevision, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), getTestLWSReplicas(fakeClient, testNamespace, prefillName))
+	assert.Equal(t, int32(1), getTestLWSReplicas(fakeClient, testNamespace, decodeName))
+	_, err = executor.ReconcileRollingUpdate(context.TODO(), ds,
+		disaggregatedsetutils.RevisionRolesList{oldRevision}, newRevision, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), getTestLWSReplicas(fakeClient, testNamespace, prefillName))
+	assert.Equal(t, int32(1), getTestLWSReplicas(fakeClient, testNamespace, decodeName))
+
+	// Once replacement decode catches up, both remaining old roles fit within
+	// their availability budgets and the revision retires together.
+	newRevision.Roles[testRoleDecode].Status.ReadyReplicas = 2
+	_, err = executor.ReconcileRollingUpdate(context.TODO(), ds,
+		disaggregatedsetutils.RevisionRolesList{oldRevision}, newRevision, nil)
+	require.NoError(t, err)
+	assert.Zero(t, getTestLWSReplicas(fakeClient, testNamespace, prefillName))
+	assert.Zero(t, getTestLWSReplicas(fakeClient, testNamespace, decodeName))
+}
+
 // TestScaleDownOldWithMissingRole tests that roles not present in
 // old workloads don't trigger false coordinated drain. This was a bug where
 // adding a new role would cause all old workloads to be brutally drained to 0
@@ -1446,11 +1515,10 @@ func TestReconcileRollingUpdateABCScenario(t *testing.T) {
 			expectedA: [2]int32{0, 0}, expectedB: [2]int32{2, 2}, expectedC: [2]int32{3, 3},
 		},
 		{
-			// total=6 already exceeds ceiling=5, addBudget=0. Two-minU planner
-			// caps drain at the next old-sync target (1 per sync window), not
-			// the full drainBudget — drain progresses one sync-window at a
-			// time. Drain 1 from newest old (B); subsequent reconciles
-			// continue per sync window.
+			// total=6 already exceeds ceiling=5, addBudget=0. The fractional
+			// planner caps drain at the next old-side target rather than using
+			// the full drain budget. Drain 1 from newest old (B); subsequent
+			// reconciles continue one fractional step at a time.
 			name: "above ceiling: drains newest old workload to recover", aPrefill: 2, aDecode: 2, bPrefill: 2, bDecode: 2, cPrefill: 2, cDecode: 2,
 			expectedA: [2]int32{2, 2}, expectedB: [2]int32{1, 1}, expectedC: [2]int32{2, 2},
 		},

@@ -61,7 +61,7 @@ Currently, deploying disaggregated inference workloads requires users to manuall
 
 1. **Unified Management**: Provide a single CRD that manages multiple LeaderWorkerSets (2-10 roles) as a cohesive unit.
 
-2. **Coordinated Rolling Updates**: Implement an N-dimensional rolling update algorithm that updates all roles in lockstep, respecting per-role surge constraints.
+2. **Coordinated Rolling Updates**: Implement an N-dimensional rolling update algorithm that coordinates roles on a shared fractional progress scale, bounds inter-role skew, and respects per-role surge and availability constraints.
 
 3. **Stateless Controller**: Design the controller to derive all state from observed resources, enabling safe restarts at any point.
 
@@ -87,7 +87,10 @@ We propose adding a new CRD called `DisaggregatedSet` that acts as a higher-leve
 
 **Risk**: The N-dimensional rolling update algorithm adds complexity that could lead to stuck rollouts.
 
-**Mitigation**: The algorithm is designed with safety invariants (scale up before scale down, coordinated drain) and the controller is stateless, allowing manual intervention by scaling replicas directly if needed.
+**Mitigation**: The executor enforces hard per-role surge, availability, and
+pending-work bounds. It applies only availability-safe old-replica drains
+before growing the new revision, prefers whole-revision retirement, and is
+stateless so reconciliation can safely resume after a restart.
 
 **Risk**: Adding a new CRD increases the API surface and maintenance burden.
 
@@ -194,6 +197,12 @@ availability-safe replacement drain may temporarily relax this aliveness
 preference when strict coordination would otherwise deadlock a zero-surge
 rollout.
 
+This is bounded fractional coordination, not atomic lockstep. Different-sized
+roles normally change by different absolute replica counts, and a role may wait
+at a readiness or capacity bound while another role advances within the allowed
+fractional skew. `MaxSurge` and `MaxUnavailable` are enforced independently for
+each role; they do not provide an atomic cross-role availability guarantee.
+
 #### Issued work and available capacity
 
 The controller deliberately distinguishes the desired replica count in the
@@ -265,8 +274,16 @@ mistaking the no-op for completion.
 Interrupted rollouts drain old revisions newest first. A revision is retired
 as soon as all of its role Specs are zero; stale status from its terminating
 pods neither blocks the next older revision nor contributes availability.
-Where possible, the executor retires all roles in one revision together. That
-coordination preference never overrides a role's availability floor.
+Where possible, the executor retires all roles in one revision together. If
+only some roles can be retired while another role can make a partial drain, it
+keeps the retiring roles alive and takes the partial drain first. If neither a
+coordinated retirement nor a partial drain can make progress, no new growth can
+be issued, and no issued new replicas are pending readiness, it may take an
+already-budgeted per-role drain to avoid a permanent zero-surge deadlock. This
+fallback still respects every role's availability floor, but it can leave an
+old revision without all of its roles. Such an incomplete revision is not
+independently routable: traffic management must derive usable revision capacity
+from the least-available required role.
 
 A rollout is complete only when every old role Spec is zero, every new role
 Spec has reached its target, and every new role has at least its target number
@@ -331,7 +348,7 @@ to implement this enhancement.
 
 - Rolling update planner: step computation, edge cases, constraint violations
 - Executor: Spec/Ready separation, pending bounds, availability-safe drains,
-  and newest-first retirement
+  slow-role readiness, coordinated retirement, and newest-first retirement
 - Service manager: creation conditions, cleanup logic
 - API validation: role count, unique names, replica constraints
 
@@ -366,6 +383,11 @@ to implement this enhancement.
 - 2026-03-05: Initial KEP draft
 - 2026-03-22: Updated to reflect N-dimensional roles API
 - 2026-03-23: Renamed "phase" to "role" throughout for semantic clarity
+- 2026-09-14: Updated the rollout contract: replaced strict readiness gating
+  with a bounded pending-work window, clarified bounded fractional coordination
+  instead of atomic lockstep, documented availability-safe drain-before-grow
+  ordering, and made whole-revision retirement best effort with a per-role-safe
+  liveness fallback.
 
 ## Drawbacks
 

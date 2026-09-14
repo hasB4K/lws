@@ -181,12 +181,12 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 	ensureExecutableStep(state, nextStep)
 
 	log.Info("Next step computed", buildStepLogArgs(allRoleNames, nextStep)...)
-	newGrowthPlanned := false
+	newGrowthPlanned, newReadinessPending := false, false
 	for i := range allRoleNames {
 		if nextStep.New[i] > state[i].NewSpec {
 			newGrowthPlanned = true
-			break
 		}
+		newReadinessPending = newReadinessPending || state[i].NewReady < state[i].NewSpec
 	}
 
 	// Scale down old replicas before scaling up new ones. This ordering ensures
@@ -194,7 +194,8 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 	// API calls: e.g. with surge=0, scaling up first would briefly make
 	// (currentOld + nextStep.New) exceed the target before scaleDownOld brings
 	// currentOld down.
-	if err := executor.scaleDownOld(ctx, disaggregatedSet, oldRevisions, allRoleNames, state, nextStep.Past, !newGrowthPlanned); err != nil {
+	allowUncoordinatedDrain := !newGrowthPlanned && !newReadinessPending
+	if err := executor.scaleDownOld(ctx, disaggregatedSet, oldRevisions, allRoleNames, state, nextStep.Past, allowUncoordinatedDrain); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := executor.scaleUpNew(ctx, disaggregatedSet, newRevision, specRoleNames, nextStep.New); err != nil {
@@ -583,7 +584,10 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 // coordinateRevisionDrain keeps all roles in an old revision alive together
 // when possible. It may retire the whole revision if every role fits within
 // its availability budget. If strict coordination would make a legal rollout
-// immobile, the already-budgeted drain is allowed as a last resort.
+// immobile, with no new replicas growing or pending readiness, the
+// already-budgeted drain is allowed as a last resort. That fallback remains
+// per-role availability-safe, but may leave the revision incomplete and
+// therefore unsuitable for independent routing.
 func coordinateRevisionDrain(
 	roleNames []string,
 	roles map[string]*leaderworkersetv1.LeaderWorkerSet,

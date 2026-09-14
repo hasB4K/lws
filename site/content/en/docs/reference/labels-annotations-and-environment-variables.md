@@ -34,7 +34,8 @@ description:  A reference for all labels, annotations, and environment variables
 | `leaderworkerset.sigs.k8s.io/subgroup-size`               | The number of pods per subgroup.                                       | 2                                | Pod (only if SubGroup is set)                                                          |
 | `leaderworkerset.sigs.k8s.io/subgroup-exclusive-topology` | Specifies the topology for exclusive 1:1 scheduling within a subgroup. | topologyKey                      | LeaderWorkerSet, Pod (only if SubGroup is set and subgroup-exclusive-topology is used) |
 | `leaderworkerset.sigs.k8s.io/leader-requests-tpus`        | Indicates if the leader pod requests TPU.                              | true                             | Pod (only if leader pod requests TPU)                                                  |
-| `disaggregatedset.x-k8s.io/initial-replicas`              | Initial replica count captured when a DisaggregatedSet rollout starts. | 2                                | LeaderWorkerSet                                                                         |
+| `disaggregatedset.x-k8s.io/intended-replicas`             | Replica target the DisaggregatedSet revision is intended to reach.     | 2                                | LeaderWorkerSet                                                                         |
+| `disaggregatedset.x-k8s.io/initial-replicas`              | Deprecated legacy key, read for compatibility during controller upgrades. | 2                             | LeaderWorkerSet                                                                         |
 
 # Environment Variables
 

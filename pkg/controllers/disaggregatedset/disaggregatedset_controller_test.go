@@ -167,10 +167,16 @@ func TestScalingWithoutRollingUpdate(t *testing.T) {
 	prefillInfo, _ := lwsManager.Get(ctx, disaggregatedSet, disaggregatedsetutils.GenerateName(disaggregatedSet.Name, 0, revision, testControllerRolePrefill))
 	require.NotNil(t, prefillInfo, "prefill LWS should exist")
 	assert.Equal(t, 5, int(*prefillInfo.Spec.Replicas), "prefill replicas should be scaled to 5")
+	prefillIntended, ok := disaggregatedsetutils.GetIntendedReplicas(prefillInfo)
+	require.True(t, ok)
+	assert.EqualValues(t, 5, prefillIntended, "replica-only scaling must update the revision's intended target")
 
 	decodeInfo, _ := lwsManager.Get(ctx, disaggregatedSet, disaggregatedsetutils.GenerateName(disaggregatedSet.Name, 0, revision, testControllerRoleDecode))
 	require.NotNil(t, decodeInfo, "decode LWS should exist")
 	assert.Equal(t, 4, int(*decodeInfo.Spec.Replicas), "decode replicas should be scaled to 4")
+	decodeIntended, ok := disaggregatedsetutils.GetIntendedReplicas(decodeInfo)
+	require.True(t, ok)
+	assert.EqualValues(t, 4, decodeIntended, "replica-only scaling must update the revision's intended target")
 }
 
 // createSliceLWS builds an LWS for a specific slice using the real name/label

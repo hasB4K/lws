@@ -340,7 +340,7 @@ The DS controller writes back to each scaler's status at the end of every reconc
 
 ### Rolling Update Interaction
 
-`scaler.spec.replicas` is the target for the role's post-rollout steady state. The DS controller feeds it as the new-revision LeaderWorkerSet's target; old revisions continue to drain on the schedule the planner set at rollout start (the pre-existing `initial-replicas` annotation mechanism), independent of the scaler.
+`scaler.spec.replicas` is the target for the role's post-rollout steady state. The DS controller feeds it to the planner and records it on the current revision as `intended-replicas`. If another template update interrupts the rollout, that value freezes as the revision's completed target; the old-side baseline is the per-role maximum intended count across the interrupted revisions, while their current Specs are still summed for physical capacity accounting.
 
 Because `status.selector` is leader-only and aggregate across revisions, HPA sees the serving fleet's leaders during a rolling update and its math stays self-consistent — the count HPA divides its metric by (`status.replicas`, LWS groups) matches the number of pods its selector matches (one leader per group), and the value it writes (`spec.replicas`, LWS groups) becomes the new-revision target as the old revision drains to zero.
 
@@ -457,4 +457,3 @@ Skip the new CRD; instead embed autoscaling target/current fields on the role it
 Same CRD, but with an explicit `spec.targetRef {name, role}` field the user fills in. The DS controller reads whatever scaler the user created and attaches a non-controller ownerRef for GC.
 
 **Rejected because**: it makes users author `2N+1` manifests for `N` scalable roles instead of `N+1`, and forces the controller to use a non-standard ownerRef (`Controller=false`) since the user owns the object — breaking with the Kubernetes precedent that composite workloads own their subordinate objects (Deployment→ReplicaSet, DisaggregatedSet→LeaderWorkerSet). The autocreate design keeps the same CRD schema; the (DS, role) association just moves from an explicit spec field to the deterministic name + controller ownerRef.
-

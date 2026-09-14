@@ -97,6 +97,11 @@ func (manager *LeaderWorkerSetManager) Create(ctx context.Context, params disagg
 		},
 		Spec: lwsSpec,
 	}
+	intendedReplicas := params.Replicas
+	if params.IntendedReplicas != nil {
+		intendedReplicas = *params.IntendedReplicas
+	}
+	disaggregatedsetutils.SetIntendedReplicas(leaderWorkerSet, int32(intendedReplicas))
 
 	if err := manager.client.Create(ctx, leaderWorkerSet); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
@@ -282,62 +287,60 @@ func (manager *LeaderWorkerSetManager) GetRevisionRolesList(
 	return oldRevisions, newRevision, nil
 }
 
-func parseInitialReplicasAnnotation(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) *int {
-	if leaderWorkerSet.Annotations == nil {
-		return nil
-	}
-	valueStr, ok := leaderWorkerSet.Annotations[disaggregatedsetv1.InitialReplicasAnnotationKey]
+func parseIntendedReplicasAnnotation(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) *int {
+	value, ok := disaggregatedsetutils.GetIntendedReplicas(leaderWorkerSet)
 	if !ok {
 		return nil
 	}
-	parsed, err := strconv.Atoi(valueStr)
-	if err != nil {
-		return nil
-	}
+	parsed := int(value)
 	return &parsed
 }
 
-func (manager *LeaderWorkerSetManager) patchInitialReplicasAnnotation(
+// Deprecated: use parseIntendedReplicasAnnotation.
+func parseInitialReplicasAnnotation(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) *int {
+	return parseIntendedReplicasAnnotation(leaderWorkerSet)
+}
+
+func (manager *LeaderWorkerSetManager) patchIntendedReplicasAnnotation(
 	ctx context.Context,
 	leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet,
 	value int,
 ) error {
 	patch := client.MergeFrom(leaderWorkerSet.DeepCopy())
-	if leaderWorkerSet.Annotations == nil {
-		leaderWorkerSet.Annotations = make(map[string]string)
-	}
-	leaderWorkerSet.Annotations[disaggregatedsetv1.InitialReplicasAnnotationKey] = strconv.Itoa(value)
+	disaggregatedsetutils.SetIntendedReplicas(leaderWorkerSet, int32(value))
 	return manager.client.Patch(ctx, leaderWorkerSet, patch)
 }
 
-func (manager *LeaderWorkerSetManager) SetInitialReplicas(
+func (manager *LeaderWorkerSetManager) SetIntendedReplicas(
 	ctx context.Context,
 	namespace, name string,
 	replicas int,
 ) (*int, error) {
-	log := logf.FromContext(ctx)
-
 	leaderWorkerSet := &leaderworkersetv1.LeaderWorkerSet{}
 	if err := manager.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, leaderWorkerSet); err != nil {
 		return nil, fmt.Errorf("failed to get LeaderWorkerSet %s: %w", name, err)
 	}
 
-	oldValue := parseInitialReplicasAnnotation(leaderWorkerSet)
+	oldValue := parseIntendedReplicasAnnotation(leaderWorkerSet)
 
-	if oldValue != nil && *oldValue != replicas {
-		log.Info("WARNING: Overwriting initial-replicas annotation with different value",
-			"workload", name,
-			"oldValue", *oldValue,
-			"newValue", replicas)
-	}
-
-	if oldValue != nil && *oldValue == replicas {
+	if current, ok := leaderWorkerSet.Annotations[disaggregatedsetv1.IntendedReplicasAnnotationKey]; ok && current == strconv.Itoa(replicas) {
 		return oldValue, nil
 	}
 
-	if err := manager.patchInitialReplicasAnnotation(ctx, leaderWorkerSet, replicas); err != nil {
-		return nil, fmt.Errorf("failed to update initial-replicas annotation on %s: %w", name, err)
+	if err := manager.patchIntendedReplicasAnnotation(ctx, leaderWorkerSet, replicas); err != nil {
+		return nil, fmt.Errorf("failed to update intended-replicas annotation on %s: %w", name, err)
 	}
 
 	return oldValue, nil
+}
+
+// SetInitialReplicas preserves source compatibility for callers using the old
+// name while writing the intended-replicas annotation.
+// Deprecated: use SetIntendedReplicas.
+func (manager *LeaderWorkerSetManager) SetInitialReplicas(
+	ctx context.Context,
+	namespace, name string,
+	replicas int,
+) (*int, error) {
+	return manager.SetIntendedReplicas(ctx, namespace, name, replicas)
 }

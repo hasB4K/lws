@@ -552,6 +552,17 @@ func (r *DisaggregatedSetReconciler) reconcileRoleSimple(ctx context.Context, di
 		})
 	}
 
+	// This revision remains the active target on the simple scaling path, so
+	// replica-only changes (including external-scaler writes) update its durable
+	// intended count before Spec is changed. Once a revision becomes old, the
+	// rolling-update path freezes this value.
+	intendedReplicas, hasIntendedReplicas := disaggregatedsetutils.GetIntendedReplicas(existing)
+	if !hasIntendedReplicas || intendedReplicas != desiredReplicas {
+		if _, err := r.LWSManager.SetIntendedReplicas(ctx, disaggregatedSet.Namespace, existing.Name, int(desiredReplicas)); err != nil {
+			return fmt.Errorf("failed to update intended replicas on LWS %s: %w", existing.Name, err)
+		}
+	}
+
 	existingReplicas := int32(1)
 	if existing.Spec.Replicas != nil {
 		existingReplicas = *existing.Spec.Replicas

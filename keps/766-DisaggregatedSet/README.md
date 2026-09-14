@@ -170,6 +170,17 @@ N-dimensional side. The old side drains from its initial counts to zero while
 the new side grows from zero to its target counts. Each side has its own
 fraction scale:
 
+For every revision and role, the controller stores `intended-replicas`: the
+replica count that revision would reach if its rollout completed. While the
+revision is current, replica-only and external-scaler changes update this
+value; once the revision becomes old, the value is immutable. For an
+interrupted rollout with several old revisions, `initialOld` is the per-role
+maximum of their intended counts, not their sum. Revisions are successive
+replacements of the same role capacity, whereas `oldSpec` still sums their
+current Specs to account for all capacity physically occupying the cluster.
+Objects created by an older controller without the annotation are backfilled
+once from their current Spec.
+
 ```
 sideSteps                = max(roleSizes)
 smallestReplicaFraction  = 1 / max(roleSizes)
@@ -340,7 +351,10 @@ Headless Services are automatically created for each role per revision. This all
 
 ### Controller Architecture
 
-The controller is stateless—all state is derived from observed resources. An `initial-replicas` annotation tracks the starting replica count for rolling updates. Owner references on managed LeaderWorkerSets and Services ensure proper garbage collection.
+The controller is stateless—all state is derived from observed resources. An
+`intended-replicas` annotation tracks each revision's completed replica target
+across rolling updates. Owner references on managed LeaderWorkerSets and
+Services ensure proper garbage collection.
 
 ### Test Plan
 
@@ -391,6 +405,9 @@ to implement this enhancement.
   with a bounded pending-work window, defined fractional lockstep and its skew
   bound, documented availability-safe drain-before-grow ordering, and made
   whole-revision retirement best effort with a per-role-safe liveness fallback.
+- 2026-09-14: Defined interrupted-rollout baselines as the per-role maximum of
+  immutable revision targets, so deleting a partially rolled-out revision does
+  not shrink the availability baseline.
 
 ## Drawbacks
 

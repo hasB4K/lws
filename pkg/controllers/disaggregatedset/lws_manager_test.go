@@ -79,8 +79,8 @@ func buildOwnedManagerTestLWS(name string, replicas int32, owner *disaggregateds
 		Obj()
 }
 
-// TestParseInitialReplicasAnnotation tests the parseInitialReplicasAnnotation function.
-func TestParseInitialReplicasAnnotation(t *testing.T) {
+// TestParseIntendedReplicasAnnotation tests the parseIntendedReplicasAnnotation function.
+func TestParseIntendedReplicasAnnotation(t *testing.T) {
 	testCases := []struct {
 		name        string
 		annotations map[string]string
@@ -98,18 +98,23 @@ func TestParseInitialReplicasAnnotation(t *testing.T) {
 		},
 		{
 			name:        "invalid non-numeric annotation returns nil",
-			annotations: map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "not-a-number"},
+			annotations: map[string]string{disaggregatedsetv1.IntendedReplicasAnnotationKey: "not-a-number"},
 			expected:    nil,
 		},
 		{
 			name:        "valid annotation returns correct value",
-			annotations: map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "5"},
+			annotations: map[string]string{disaggregatedsetv1.IntendedReplicasAnnotationKey: "5"},
 			expected:    ptr.To(5),
 		},
 		{
 			name:        "zero value annotation returns zero",
-			annotations: map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "0"},
+			annotations: map[string]string{disaggregatedsetv1.IntendedReplicasAnnotationKey: "0"},
 			expected:    ptr.To(0),
+		},
+		{
+			name:        "legacy annotation remains readable",
+			annotations: map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "4"},
+			expected:    ptr.To(4),
 		},
 	}
 
@@ -120,7 +125,7 @@ func TestParseInitialReplicasAnnotation(t *testing.T) {
 					Annotations: testCase.annotations,
 				},
 			}
-			result := parseInitialReplicasAnnotation(leaderWorkerSet)
+			result := parseIntendedReplicasAnnotation(leaderWorkerSet)
 			if testCase.expected == nil {
 				require.Nil(t, result)
 			} else {
@@ -282,14 +287,14 @@ func TestManagerScale(t *testing.T) {
 	})
 }
 
-// TestManagerSetInitialReplicas tests the manager's disaggregatedsetutils.SetInitialReplicas method.
-func TestManagerSetInitialReplicas(t *testing.T) {
+// TestManagerSetIntendedReplicas tests updates to the durable revision target.
+func TestManagerSetIntendedReplicas(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, leaderworkersetv1.AddToScheme(scheme))
 
 	t.Run("skips update when value already correct", func(t *testing.T) {
 		existingLWS := buildManagerTestLWS(
-			map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "5"},
+			map[string]string{disaggregatedsetv1.IntendedReplicasAnnotationKey: "5"},
 		)
 
 		fakeClient := fake.NewClientBuilder().
@@ -298,7 +303,7 @@ func TestManagerSetInitialReplicas(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		oldValue, err := manager.SetInitialReplicas(context.Background(), "default", "test-lws", 5)
+		oldValue, err := manager.SetIntendedReplicas(context.Background(), "default", "test-lws", 5)
 
 		require.NoError(t, err)
 		require.NotNil(t, oldValue)
@@ -307,7 +312,7 @@ func TestManagerSetInitialReplicas(t *testing.T) {
 
 	t.Run("updates when overwriting different value", func(t *testing.T) {
 		existingLWS := buildManagerTestLWS(
-			map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "5"},
+			map[string]string{disaggregatedsetv1.IntendedReplicasAnnotationKey: "5"},
 		)
 
 		fakeClient := fake.NewClientBuilder().
@@ -316,7 +321,7 @@ func TestManagerSetInitialReplicas(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		oldValue, err := manager.SetInitialReplicas(context.Background(), "default", "test-lws", 10)
+		oldValue, err := manager.SetIntendedReplicas(context.Background(), "default", "test-lws", 10)
 
 		require.NoError(t, err)
 		require.NotNil(t, oldValue)
@@ -332,7 +337,7 @@ func TestManagerSetInitialReplicas(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		oldValue, err := manager.SetInitialReplicas(context.Background(), "default", "test-lws", 5)
+		oldValue, err := manager.SetIntendedReplicas(context.Background(), "default", "test-lws", 5)
 
 		require.NoError(t, err)
 		require.Nil(t, oldValue)
@@ -344,7 +349,7 @@ func TestManagerSetInitialReplicas(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		_, err := manager.SetInitialReplicas(context.Background(), "default", "nonexistent", 5)
+		_, err := manager.SetIntendedReplicas(context.Background(), "default", "nonexistent", 5)
 
 		require.Error(t, err)
 	})

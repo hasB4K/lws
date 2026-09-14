@@ -30,29 +30,49 @@ import (
 
 const NumRequiredRoles = 2
 
-func GetInitialReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) (int32, bool) {
+// GetIntendedReplicas returns the replica count that this revision was meant
+// to reach. The initial-replicas fallback keeps existing rollouts readable
+// across an upgrade to the intended-replicas annotation.
+func GetIntendedReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) (int32, bool) {
 	if leaderWorkerSet.Annotations == nil {
 		return 0, false
 	}
-	value, exists := leaderWorkerSet.Annotations[disaggregatedsetv1.InitialReplicasAnnotationKey]
-	if !exists || value == "" {
-		return 0, false
+	for _, key := range []string{
+		disaggregatedsetv1.IntendedReplicasAnnotationKey,
+		disaggregatedsetv1.InitialReplicasAnnotationKey,
+	} {
+		value, exists := leaderWorkerSet.Annotations[key]
+		if !exists || value == "" {
+			continue
+		}
+		parsed, err := strconv.ParseInt(value, 10, 32)
+		if err == nil {
+			return int32(parsed), true
+		}
 	}
-	parsed, err := strconv.ParseInt(value, 10, 32)
-	if err != nil {
-		return 0, false
-	}
-	return int32(parsed), true
+	return 0, false
 }
 
-func SetInitialReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet, replicas int32) {
+func SetIntendedReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet, replicas int32) {
 	if leaderWorkerSet.Annotations == nil {
 		leaderWorkerSet.Annotations = make(map[string]string)
 	}
-	leaderWorkerSet.Annotations[disaggregatedsetv1.InitialReplicasAnnotationKey] = strconv.FormatInt(int64(replicas), 10)
+	leaderWorkerSet.Annotations[disaggregatedsetv1.IntendedReplicasAnnotationKey] = strconv.FormatInt(int64(replicas), 10)
 }
 
-func ComputeInitialReplicaState(lwsList []leaderworkersetv1.LeaderWorkerSet) map[string]int {
+// GetInitialReplicas is kept for callers compiled against the old helper name.
+// Deprecated: use GetIntendedReplicas.
+func GetInitialReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) (int32, bool) {
+	return GetIntendedReplicas(leaderWorkerSet)
+}
+
+// SetInitialReplicas is kept for callers compiled against the old helper name.
+// Deprecated: use SetIntendedReplicas.
+func SetInitialReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet, replicas int32) {
+	SetIntendedReplicas(leaderWorkerSet, replicas)
+}
+
+func ComputeIntendedReplicaState(lwsList []leaderworkersetv1.LeaderWorkerSet) map[string]int {
 	state := make(map[string]int)
 
 	for i := range lwsList {
@@ -63,7 +83,7 @@ func ComputeInitialReplicaState(lwsList []leaderworkersetv1.LeaderWorkerSet) map
 		}
 
 		var replicas int
-		replicasInt32, ok := GetInitialReplicas(lws)
+		replicasInt32, ok := GetIntendedReplicas(lws)
 		if ok {
 			replicas = int(replicasInt32)
 		} else {
@@ -74,10 +94,18 @@ func ComputeInitialReplicaState(lwsList []leaderworkersetv1.LeaderWorkerSet) map
 			}
 		}
 
-		state[role] += replicas
+		state[role] = max(state[role], replicas)
 	}
 
 	return state
+}
+
+// ComputeInitialReplicaState is kept for callers compiled against the old
+// helper name. Interrupted rollouts now use the maximum intended count rather
+// than summing the targets of replacement revisions.
+// Deprecated: use ComputeIntendedReplicaState.
+func ComputeInitialReplicaState(lwsList []leaderworkersetv1.LeaderWorkerSet) map[string]int {
+	return ComputeIntendedReplicaState(lwsList)
 }
 
 type CreateParams struct {
@@ -88,6 +116,9 @@ type CreateParams struct {
 	Revision         string
 	Labels           map[string]string
 	Replicas         int
+	// IntendedReplicas may differ from Replicas while a new revision starts at
+	// zero and grows through a rolling update. Nil defaults to Replicas.
+	IntendedReplicas *int
 }
 
 func GenerateName(baseName string, slice int, revision, role string) string {
@@ -230,19 +261,26 @@ func (revisions RevisionRolesList) GetTotalReplicasPerRole(role string) int {
 	return total
 }
 
-func (revisions RevisionRolesList) GetTotalInitialReplicasPerRole(role string) int {
-	total := 0
+func (revisions RevisionRolesList) GetMaxIntendedReplicasPerRole(role string) int {
+	intended := 0
 	for _, rev := range revisions {
 		if lws := rev.Roles[role]; lws != nil {
-			initialReplicas, ok := GetInitialReplicas(lws)
+			intendedReplicas, ok := GetIntendedReplicas(lws)
 			if ok {
-				total += int(initialReplicas)
+				intended = max(intended, int(intendedReplicas))
 			} else {
-				total += getLWSReplicas(lws)
+				intended = max(intended, getLWSReplicas(lws))
 			}
 		}
 	}
-	return total
+	return intended
+}
+
+// GetTotalInitialReplicasPerRole preserves source compatibility with the old
+// helper name. Replacement revision targets are no longer summed.
+// Deprecated: use GetMaxIntendedReplicasPerRole.
+func (revisions RevisionRolesList) GetTotalInitialReplicasPerRole(role string) int {
+	return revisions.GetMaxIntendedReplicasPerRole(role)
 }
 
 func GroupByRevision(lwsList []*leaderworkersetv1.LeaderWorkerSet) RevisionRolesList {

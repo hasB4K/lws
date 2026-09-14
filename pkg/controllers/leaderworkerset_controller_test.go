@@ -1140,31 +1140,18 @@ func TestGetUpdatedRevision(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		sts            *appsv1.StatefulSet
 		lws            *leaderworkerset.LeaderWorkerSet
 		modifyRevision func(*appsv1.ControllerRevision)
 		expectUpdate   bool
 	}{
 		{
-			name:         "sts is nil, should return nil",
-			sts:          nil,
-			lws:          wrappers.BuildLeaderWorkerSet("default").Obj(),
-			expectUpdate: false,
-		},
-		{
-			name: "revision matches current spec, no update",
-			sts: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-sample", Namespace: "default"},
-			},
+			name:         "revision matches current spec, no update",
 			lws:          wrappers.BuildLeaderWorkerSet("default").Obj(),
 			expectUpdate: false,
 		},
 		{
 			name: "revision has old serialization with creationTimestamp null, semantic match, no update",
-			sts: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-sample", Namespace: "default"},
-			},
-			lws: wrappers.BuildLeaderWorkerSet("default").Obj(),
+			lws:  wrappers.BuildLeaderWorkerSet("default").Obj(),
 			modifyRevision: func(rev *appsv1.ControllerRevision) {
 				// Simulate old (before v1.34) client-go serialization that includes "creationTimestamp":null
 				rev.Data.Raw = []byte(strings.ReplaceAll(string(rev.Data.Raw), `"metadata":{}`, `"metadata":{"creationTimestamp":null}`))
@@ -1173,10 +1160,7 @@ func TestGetUpdatedRevision(t *testing.T) {
 		},
 		{
 			name: "revision has different spec, should trigger update",
-			sts: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-sample", Namespace: "default"},
-			},
-			lws: wrappers.BuildLeaderWorkerSet("default").Obj(),
+			lws:  wrappers.BuildLeaderWorkerSet("default").Obj(),
 			modifyRevision: func(rev *appsv1.ControllerRevision) {
 				// Simulate a real spec change by modifying the container name
 				rev.Data.Raw = []byte(strings.ReplaceAll(string(rev.Data.Raw), `"name":"leader"`, `"name":"changed"`))
@@ -1202,7 +1186,7 @@ func TestGetUpdatedRevision(t *testing.T) {
 				tc.modifyRevision(revision)
 			}
 
-			updatedRevision, err := reconciler.getUpdatedRevision(context.TODO(), tc.sts, tc.lws, revision)
+			updatedRevision, err := reconciler.getUpdatedRevision(context.TODO(), tc.lws, revision)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1271,6 +1255,172 @@ func TestEnqueueLWSRequests(t *testing.T) {
 			got := enqueueLWSRequests(context.Background(), tc.statefulSet)
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("unexpected reconcile requests (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCalculateContinuousReadyReplicas(t *testing.T) {
+	tests := []struct {
+		name   string
+		states []replicaState
+		want   int32
+	}{
+		{
+			name:   "no replicas",
+			states: nil,
+			want:   0,
+		},
+		{
+			name: "all replicas ready and updated",
+			states: []replicaState{
+				{ready: true, updated: true},
+				{ready: true, updated: true},
+				{ready: true, updated: true},
+			},
+			want: 3,
+		},
+		{
+			name: "counting stops at the first replica that is not updated",
+			states: []replicaState{
+				{ready: true, updated: true},
+				{ready: true, updated: false},
+				{ready: true, updated: true},
+			},
+			want: 1,
+		},
+		{
+			name: "an updated but not ready tail replica counts as zero",
+			states: []replicaState{
+				{ready: true, updated: true},
+				{ready: true, updated: true},
+				{ready: false, updated: true},
+			},
+			want: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := calculateContinuousReadyReplicas(tc.states)
+			if got != tc.want {
+				t.Fatalf("calculateContinuousReadyReplicas()=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCalculateLWSUnreadyReplicas(t *testing.T) {
+	tests := []struct {
+		name        string
+		states      []replicaState
+		lwsReplicas int32
+		want        int32
+	}{
+		{
+			name:        "all desired replicas ready and updated",
+			states:      []replicaState{{ready: true, updated: true}, {ready: true, updated: true}},
+			lwsReplicas: 2,
+			want:        0,
+		},
+		{
+			name:        "ready but not updated replicas count as unready",
+			states:      []replicaState{{ready: true, updated: true}, {ready: true, updated: false}},
+			lwsReplicas: 2,
+			want:        1,
+		},
+		{
+			name:        "replicas without a state yet count as unready",
+			states:      []replicaState{{ready: true, updated: true}, {ready: true, updated: false}},
+			lwsReplicas: 4,
+			want:        3,
+		},
+		{
+			name:        "surge replicas beyond the desired count are ignored",
+			states:      []replicaState{{ready: true, updated: true}, {ready: false, updated: false}, {ready: false, updated: false}},
+			lwsReplicas: 1,
+			want:        0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := calculateLWSUnreadyReplicas(tc.states, tc.lwsReplicas)
+			if got != tc.want {
+				t.Fatalf("calculateLWSUnreadyReplicas()=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRollingUpdatePartition(t *testing.T) {
+	ru := replicaState{ready: true, updated: true}
+	rn := replicaState{ready: true, updated: false}
+	nn := replicaState{ready: false, updated: false}
+
+	tests := []struct {
+		name             string
+		states           []replicaState
+		rollingStep      int32
+		currentPartition int32
+		want             int32
+	}{
+		{
+			name:             "all replicas ready and updated drops the partition to zero",
+			states:           []replicaState{ru, ru, ru, ru},
+			rollingStep:      2,
+			currentPartition: 4,
+			want:             0,
+		},
+		{
+			name:             "rollout start updates rollingStep replicas from the tail",
+			states:           []replicaState{rn, rn, rn, rn},
+			rollingStep:      1,
+			currentPartition: 4,
+			want:             3,
+		},
+		{
+			name:             "partition advances by rollingStep once the tail replica is ready and updated",
+			states:           []replicaState{rn, rn, rn, ru},
+			rollingStep:      1,
+			currentPartition: 3,
+			want:             2,
+		},
+		{
+			name:             "a not ready replica below the update window holds the partition",
+			states:           []replicaState{nn, rn, rn, ru},
+			rollingStep:      1,
+			currentPartition: 3,
+			want:             3,
+		},
+		{
+			name:             "a not ready replica at the window edge is still updated so the rollout cannot get stuck",
+			states:           []replicaState{nn, rn, nn, ru},
+			rollingStep:      1,
+			currentPartition: 3,
+			want:             2,
+		},
+		{
+			name:             "partition never moves back up",
+			states:           []replicaState{rn, rn, rn, rn},
+			rollingStep:      1,
+			currentPartition: 1,
+			want:             1,
+		},
+		{
+			name:             "rollingStep larger than the replica count updates everything at once",
+			states:           []replicaState{rn, rn, rn},
+			rollingStep:      5,
+			currentPartition: 3,
+			want:             0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rollingUpdatePartition(tc.states, int32(len(tc.states)), tc.rollingStep, tc.currentPartition)
+			if got != tc.want {
+				t.Fatalf("rollingUpdatePartition()=%d, want %d", got, tc.want)
 			}
 		})
 	}

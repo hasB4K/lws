@@ -28,6 +28,7 @@ import (
 
 	disaggv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	disaggregatedsetutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 	"sigs.k8s.io/lws/pkg/webhooks"
 )
 
@@ -73,6 +74,9 @@ func (w *DisaggregatedSetWebhook) validate(obj *disaggv1.DisaggregatedSet) (admi
 	for i, role := range obj.Spec.Roles {
 		rolePath := rolesPath.Index(i)
 		allErrs = append(allErrs, w.validateRoleRolloutStrategy(role, rolePath)...)
+		// Reject hash-mode feature combinations the LWS webhook would reject, so
+		// they fail at DisaggregatedSet admission instead of at LWS creation time.
+		allErrs = append(allErrs, webhooks.ValidateGroupIdentity(rolePath.Child("spec"), &role.Spec)...)
 
 		if role.Scaling == nil || role.Scaling.Mode != disaggv1.RoleScalingExternal {
 			continue
@@ -127,8 +131,8 @@ func (w *DisaggregatedSetWebhook) validateGeneratedNames(obj *disaggv1.Disaggreg
 
 	const (
 		dns1035MaxLen                     = 63
-		revisionLen                       = 8  // hex characters in the revision hash
-		serviceSuffixLen                  = 4  // len("-prv")
+		revisionLen                       = 8 // hex characters in the revision hash
+		serviceSuffixLen                  = len(disaggregatedsetutils.PrivateServiceSuffix)
 		separators                        = 3  // three "-" between dsName, slice, revision, roleName
 		statefulSetRevisionLabelSuffixLen = 11 // len("-<10-char-hash>")
 	)

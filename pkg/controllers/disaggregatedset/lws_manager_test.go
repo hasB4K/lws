@@ -25,9 +25,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
@@ -173,16 +175,29 @@ func TestManagerDelete(t *testing.T) {
 
 	t.Run("successfully deletes existing LWS", func(t *testing.T) {
 		existingLWS := buildManagerTestLWS(nil)
+		existingLWS.UID = types.UID("test-lws-uid")
 
+		var deleteOptions client.DeleteOptions
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithRuntimeObjects(existingLWS).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					deleteOptions.ApplyOptions(opts)
+					return c.Delete(ctx, obj, opts...)
+				},
+			}).
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		err := manager.Delete(context.Background(), "default", "test-lws")
+		err := manager.deleteInForeground(context.Background(), existingLWS)
 
 		require.NoError(t, err)
+		require.NotNil(t, deleteOptions.PropagationPolicy)
+		assert.Equal(t, metav1.DeletePropagationForeground, *deleteOptions.PropagationPolicy)
+		require.NotNil(t, deleteOptions.Preconditions)
+		require.NotNil(t, deleteOptions.Preconditions.UID)
+		assert.Equal(t, existingLWS.UID, *deleteOptions.Preconditions.UID)
 	})
 
 	t.Run("returns nil when LWS not found (idempotent)", func(t *testing.T) {
@@ -191,7 +206,9 @@ func TestManagerDelete(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		err := manager.Delete(context.Background(), "default", "nonexistent")
+		err := manager.deleteInForeground(context.Background(), &leaderworkersetv1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "nonexistent", Namespace: "default"},
+		})
 
 		require.NoError(t, err) // Should not error, deletion is idempotent
 	})
@@ -826,5 +843,78 @@ func TestManagerGetForRoleIgnoresForeignOwnedLWS(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, name, got.Name)
+	})
+}
+
+func TestManagerCreateGroupIdentityPassthrough(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, leaderworkersetv1.AddToScheme(scheme))
+	require.NoError(t, disaggregatedsetv1.AddToScheme(scheme))
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	manager := NewLeaderWorkerSetManager(fakeClient)
+
+	params := disaggregatedsetutils.CreateParams{
+		DisaggregatedSet: &disaggregatedsetv1.DisaggregatedSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-deploy",
+				Namespace: "default",
+				UID:       "test-uid",
+			},
+		},
+		Role:     "prefill",
+		Revision: "abc123",
+		Replicas: 2,
+		Labels: map[string]string{
+			disaggregatedsetv1.SetNameLabelKey:  "test-deploy",
+			disaggregatedsetv1.RoleLabelKey:     "prefill",
+			disaggregatedsetv1.RevisionLabelKey: "abc123",
+		},
+		Config: &disaggregatedsetv1.DisaggregatedRoleSpec{
+			LeaderWorkerSetTemplateSpec: leaderworkersetv1.LeaderWorkerSetTemplateSpec{Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+				GroupIdentity: leaderworkersetv1.GroupIdentityHash,
+				LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+					Size: ptr.To(int32(2)),
+				},
+			}},
+		},
+	}
+
+	require.NoError(t, manager.Create(context.Background(), params))
+
+	lwsName := disaggregatedsetutils.GenerateName("test-deploy", params.Slice, "abc123", "prefill")
+	lws, err := manager.Get(context.Background(), params.DisaggregatedSet, lwsName)
+	require.NoError(t, err)
+	require.NotNil(t, lws)
+	require.Equal(t, leaderworkersetv1.GroupIdentityHash, lws.Spec.GroupIdentity)
+}
+
+func TestComputeRevisionGroupIdentity(t *testing.T) {
+	buildRoles := func(groupIdentity leaderworkersetv1.GroupIdentityType) []disaggregatedsetv1.DisaggregatedRoleSpec {
+		return []disaggregatedsetv1.DisaggregatedRoleSpec{
+			{
+				Name: "prefill",
+				LeaderWorkerSetTemplateSpec: leaderworkersetv1.LeaderWorkerSetTemplateSpec{Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+					GroupIdentity: groupIdentity,
+					LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+						Size: ptr.To(int32(1)),
+					},
+				}},
+			},
+		}
+	}
+
+	t.Run("empty and explicit Ordinal produce the same revision", func(t *testing.T) {
+		// Objects persisted before the field existed must keep their revision
+		// once the API server starts defaulting groupIdentity to Ordinal.
+		require.Equal(t,
+			disaggregatedsetutils.ComputeRevision(buildRoles("")),
+			disaggregatedsetutils.ComputeRevision(buildRoles(leaderworkersetv1.GroupIdentityOrdinal)))
+	})
+
+	t.Run("Hash produces a different revision", func(t *testing.T) {
+		require.NotEqual(t,
+			disaggregatedsetutils.ComputeRevision(buildRoles(leaderworkersetv1.GroupIdentityOrdinal)),
+			disaggregatedsetutils.ComputeRevision(buildRoles(leaderworkersetv1.GroupIdentityHash)))
 	})
 }

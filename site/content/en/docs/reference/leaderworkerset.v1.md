@@ -50,6 +50,20 @@ description: Generated API reference documentation for leaderworkerset.x-k8s.io/
 </tbody>
 </table>
 
+## `GroupIdentityType`     {#leaderworkerset-x-k8s-io-v1-GroupIdentityType}
+    
+(Alias of `string`)
+
+**Appears in:**
+
+- [LeaderWorkerSetSpec](#leaderworkerset-x-k8s-io-v1-LeaderWorkerSetSpec)
+
+
+<p>GroupIdentityType defines how group identities are assigned.</p>
+
+
+
+
 ## `LeaderWorkerSetSpec`     {#leaderworkerset-x-k8s-io-v1-LeaderWorkerSetSpec}
     
 
@@ -116,6 +130,19 @@ when a revision is made to the leaderWorkerTemplate.</p>
    <p>networkConfig defines the network configuration of the group</p>
 </td>
 </tr>
+<tr><td><code>groupIdentity</code><br/>
+<a href="#leaderworkerset-x-k8s-io-v1-GroupIdentityType"><code>GroupIdentityType</code></a>
+</td>
+<td>
+   <p>groupIdentity determines how group identities are assigned.
+Ordinal (default) manages leaders through a StatefulSet: groups are named
+<!-- raw HTML omitted -->-0..<!-- raw HTML omitted -->-N-1 and scale down always removes the highest ordinal.
+Hash manages leaders through a Deployment: group names are hash-suffixed,
+scale down prefers unscheduled and not-ready groups over healthy ones, and
+rollouts are paced by a group readiness gate on the leader pods.
+This field is immutable.</p>
+</td>
+</tr>
 </tbody>
 </table>
 
@@ -136,7 +163,7 @@ when a revision is made to the leaderWorkerTemplate.</p>
     
   
 <tr><td><code>conditions</code><br/>
-<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#condition-v1-meta"><code>[]k8s.io/apimachinery/pkg/apis/meta/v1.Condition</code></a>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.37/#condition-v1-meta"><code>[]k8s.io/apimachinery/pkg/apis/meta/v1.Condition</code></a>
 </td>
 <td>
    <p>conditions track the condition of the leaderworkerset.</p>
@@ -204,14 +231,14 @@ API whenever possible.</p>
     
   
 <tr><td><code>leaderTemplate</code> <B>[Required]</B><br/>
-<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#podtemplatespec-v1-core"><code>k8s.io/api/core/v1.PodTemplateSpec</code></a>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.37/#podtemplatespec-v1-core"><code>k8s.io/api/core/v1.PodTemplateSpec</code></a>
 </td>
 <td>
    <p>leaderTemplate defines the pod template for leader pods.</p>
 </td>
 </tr>
 <tr><td><code>workerTemplate</code> <B>[Required]</B><br/>
-<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#podtemplatespec-v1-core"><code>k8s.io/api/core/v1.PodTemplateSpec</code></a>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.37/#podtemplatespec-v1-core"><code>k8s.io/api/core/v1.PodTemplateSpec</code></a>
 </td>
 <td>
    <p>workerTemplate defines the pod template for worker pods.</p>
@@ -245,7 +272,7 @@ in each replica.</p>
 </td>
 </tr>
 <tr><td><code>volumeClaimTemplates</code><br/>
-<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#persistentvolumeclaim-v1-core"><code>[]k8s.io/api/core/v1.PersistentVolumeClaim</code></a>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.37/#persistentvolumeclaim-v1-core"><code>[]k8s.io/api/core/v1.PersistentVolumeClaim</code></a>
 </td>
 <td>
    <p>volumeClaimTemplates is a list of claims that pods are allowed to reference.
@@ -255,7 +282,7 @@ any volumes in the template, with the same name.</p>
 </td>
 </tr>
 <tr><td><code>persistentVolumeClaimRetentionPolicy</code><br/>
-<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#statefulsetpersistentvolumeclaimretentionpolicy-v1-apps"><code>k8s.io/api/apps/v1.StatefulSetPersistentVolumeClaimRetentionPolicy</code></a>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.37/#statefulsetpersistentvolumeclaimretentionpolicy-v1-apps"><code>k8s.io/api/apps/v1.StatefulSetPersistentVolumeClaimRetentionPolicy</code></a>
 </td>
 <td>
    <p>persistentVolumeClaimRetentionPolicy describes the policy used for PVCs created from

@@ -61,7 +61,7 @@ Currently, deploying disaggregated inference workloads requires users to manuall
 
 1. **Unified Management**: Provide a single CRD that manages multiple LeaderWorkerSets (2-10 roles) as a cohesive unit.
 
-2. **Coordinated Rolling Updates**: Implement an N-dimensional rolling update algorithm that coordinates roles on a shared fractional progress scale, bounds inter-role skew, and respects per-role surge and availability constraints.
+2. **Coordinated Rolling Updates**: Implement an N-dimensional rolling update algorithm that advances roles in fractional lockstep, bounds inter-role skew, and respects per-role surge and availability constraints.
 
 3. **Stateless Controller**: Design the controller to derive all state from observed resources, enabling safe restarts at any point.
 
@@ -197,11 +197,15 @@ availability-safe replacement drain may temporarily relax this aliveness
 preference when strict coordination would otherwise deadlock a zero-surge
 rollout.
 
-This is bounded fractional coordination, not atomic lockstep. Different-sized
-roles normally change by different absolute replica counts, and a role may wait
-at a readiness or capacity bound while another role advances within the allowed
-fractional skew. `MaxSurge` and `MaxUnavailable` are enforced independently for
-each role; they do not provide an atomic cross-role availability guarantee.
+Roles advance in fractional lockstep, with temporary skew bounded by the
+largest per-role replica fraction (`largestReplicaFraction`). Here, lockstep
+means that every role's replica target is derived from the same shared
+fractional progress checkpoint; it does not mean that roles change by the same
+absolute replica count or that their API updates happen atomically. A role may
+wait at a readiness or capacity bound while another role advances within the
+allowed fractional skew. `MaxSurge` and `MaxUnavailable` are enforced
+independently for each role; they do not provide an atomic cross-role
+availability guarantee.
 
 #### Issued work and available capacity
 
@@ -384,10 +388,9 @@ to implement this enhancement.
 - 2026-03-22: Updated to reflect N-dimensional roles API
 - 2026-03-23: Renamed "phase" to "role" throughout for semantic clarity
 - 2026-09-14: Updated the rollout contract: replaced strict readiness gating
-  with a bounded pending-work window, clarified bounded fractional coordination
-  instead of atomic lockstep, documented availability-safe drain-before-grow
-  ordering, and made whole-revision retirement best effort with a per-role-safe
-  liveness fallback.
+  with a bounded pending-work window, defined fractional lockstep and its skew
+  bound, documented availability-safe drain-before-grow ordering, and made
+  whole-revision retirement best effort with a per-role-safe liveness fallback.
 
 ## Drawbacks
 

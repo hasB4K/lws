@@ -87,7 +87,7 @@ We propose adding a new CRD called `DisaggregatedSet` that acts as a higher-leve
 
 **Risk**: The N-dimensional rolling update algorithm adds complexity that could lead to stuck rollouts.
 
-**Mitigation**: The algorithm enforces per-role surge and availability limits and coordinates role drains whenever possible. If strict coordination would leave a zero-surge rollout stuck, it may drain one role first while respecting that role's availability limit. The controller derives rollout state from observed LeaderWorkerSets, so it can safely continue after a restart.
+**Mitigation**: The controller distinguishes a completed rollout from one that is temporarily unable to progress. If it is waiting for replicas to become Ready, it requeues and tries again. If a zero-surge rollout cannot progress and no replicas are still starting, it permits a scale-down that respects `maxUnavailable` to unblock the next step. Rollout state is reconstructed from the labels on the existing LeaderWorkerSets, so reconciliation can continue after a controller restart.
 
 **Risk**: Adding a new CRD increases the API surface and maintenance burden.
 

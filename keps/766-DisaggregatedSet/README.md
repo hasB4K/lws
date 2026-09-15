@@ -182,9 +182,11 @@ smallestReplicaFraction  = 1 / max(roleSizes)
 largestReplicaFraction   = 1 / min(positiveRoleSizes)
 ```
 
-`sideSteps` is the number of progress checkpoints for that side. `smallestReplicaFraction` is the distance between two checkpoints. It comes from the largest role because one replica is the smallest fraction of that role. In an `8P/4D` side, Prefill is the largest role, so one Prefill replica represents `1/8` of the rollout and produces eight checkpoints. `largestReplicaFraction` is the width of the coordination window. It comes from the smallest non-zero role because one replica is the largest fraction of that role. Decode is the smallest role in this example, so one Decode replica represents `1/4` of the rollout. The controller therefore allows at most `1/4` difference between role progress.
+`sideSteps` is the number of equal intervals between the start and end of one side. A checkpoint is a reference position at an interval boundary. Checkpoint `0` is the start and checkpoint `sideSteps` is the end, so there are `sideSteps + 1` checkpoint positions. A checkpoint is not a reconcile iteration. The controller may wait at one checkpoint or advance across more than one interval in a reconcile.
 
-`newSideSteps` is `sideSteps` calculated from the new target counts. `oldSideSteps` is `sideSteps` calculated from the `initialOld` counts. `k` is a checkpoint number from zero through the corresponding side's step count. At checkpoint `k`, the replica count for one role is calculated with ceiling division:
+`smallestReplicaFraction` is the distance between adjacent checkpoints. It comes from the largest role because one replica is the smallest fraction of that role. In an `8P/4D` side, Prefill is the largest role, so one Prefill replica represents `1/8` of the rollout and creates eight equal intervals. `largestReplicaFraction` is the width of the coordination window. It comes from the smallest non-zero role because one replica is the largest fraction of that role. Decode is the smallest role in this example, so one Decode replica represents `1/4` of the rollout. The controller therefore allows at most `1/4` difference between role progress.
+
+`newSideSteps` is `sideSteps` calculated from the new target counts. `oldSideSteps` is `sideSteps` calculated from the `initialOld` counts. At checkpoint `k`, the replica count for one role is calculated with ceiling division:
 
 ```
 newAtStep(k) = ceil(target * k / newSideSteps)
@@ -193,26 +195,39 @@ oldAtStep(k) = ceil(initialOld * (oldSideSteps - k) / oldSideSteps)
 
 The controller uses the role that has made the least progress to select the next shared checkpoint. It then calculates the replica count for every role at that checkpoint. Ceiling division keeps each old role above zero until the final checkpoint. It also prevents a smaller role from getting more than one replica's worth of progress ahead.
 
-An in-progress rollout can be visualized as a moving window over these checkpoints. On the new side, progress is the fraction of target replicas already added. On the old side, it is the fraction of initial replicas already removed. Each side has its own window. The least-advanced role sets the left edge, and `largestReplicaFraction` sets the width. The following diagram shows the replica count at every checkpoint. The brackets show a window in the middle of the rollout. The old and new sides select their checkpoints independently, so their windows do not need to occupy the same columns at the same time.
+The following diagram maps every checkpoint to the corresponding Prefill and Decode counts. The new rows show replicas added. The old rows show replicas remaining. Each side chooses its own checkpoint, so the old and new counts in one column do not need to occur in the same reconcile.
 
 ```
-Example: 8P/4D
+Example: checkpoint map for an 8P/4D side
 
-checkpoint       0    1    2    3   [4    5    6]   7    8
-fraction         0   1/8  2/8  3/8 [4/8  5/8  6/8] 7/8   1
+checkpoint       0    1    2    3    4    5    6    7    8
+fraction         0   1/8  2/8  3/8  4/8  5/8  6/8  7/8   1
 
-new Prefill      0    1    2    3   [4    5    6]   7    8
-new Decode       0    1    1    2   [2    3    3]   4    4
+new Prefill      0    1    2    3    4    5    6    7    8
+new Decode       0    1    1    2    2    3    3    4    4
 
-old Prefill      8    7    6    5   [4    3    2]   1    0
-old Decode       4    4    3    3   [2    2    1]   1    0
-                                      <--------->
+old Prefill left 8    7    6    5    4    3    2    1    0
+old Decode left  4    4    3    3    2    2    1    1    0
 
 one checkpoint = 1/8 = smallestReplicaFraction
-window width   = 2 checkpoints = 1/4 = largestReplicaFraction
 ```
 
-A role at the right edge waits. When the slowest role advances, the window moves to the right. The old-side window works the same way, but measures removed replicas instead of added replicas.
+An in-progress rollout is described by a moving window over these checkpoints. On the new side, progress is the fraction of target replicas already added. On the old side, it is the fraction of initial replicas already removed. Each side has its own window. The least-advanced role sets the left edge, and `largestReplicaFraction` sets the width.
+
+```
+One example position of the new-side window:
+
+                         lower edge                 upper edge
+                              |                          |
+                              v                          v
+fraction     0 ------------- 4/8 ====================== 6/8 ------------- 1
+                              |<---- 2/8 = 1/4 wide ---->|
+
+allowed new Prefill counts:   4, 5, or 6
+allowed new Decode counts:    2 or 3
+```
+
+The `4/8` to `6/8` window above is only one example position during the rollout. A role at the right edge waits. When the slowest role advances, both edges move to the right. The old-side window works the same way, but measures removed replicas instead of added replicas.
 
 This moving window is the fractional-lockstep guarantee. Roles can move by different replica counts, and their API updates are not atomic. Readiness, surge, and availability limits may make the executable part of the window smaller. To keep a zero-surge rollout moving, the controller may sometimes drain one old role beyond the normal old-side window, but that drain must still stay above the role's availability floor. `MaxSurge` and `MaxUnavailable` are enforced independently for each role. They do not provide an atomic availability guarantee across roles.
 

@@ -588,29 +588,29 @@ func TestSortByNewestTimestamp(t *testing.T) {
 }
 
 // =============================================================================
-// Unit Tests for rollout state and pending bounds
+// Unit Tests for rollout snapshots and pending bounds
 // =============================================================================
 
 func TestAvailabilityBounds(t *testing.T) {
 	assert.Equal(t, 2, committedReadyReplicas(makeLWS(withReplicas(2), withReadyReplicas(4))))
 	assert.Equal(t, 1, committedReadyReplicas(makeLWS(withReplicas(3), withReadyReplicas(1))))
 	assert.Zero(t, committedReadyReplicas(nil))
-	assert.Equal(t, 1, maxSafeDrain(roleRolloutState{
-		InitialOld: 3, OldSpec: 3, OldReady: 3, NewReady: 1, Target: 4,
+	assert.Equal(t, 1, maxSafeDrain(roleRolloutSnapshot{
+		OldIntendedReplicas: 3, OldSpecReplicas: 3, OldReadyReplicas: 3, NewReadyReplicas: 1, NewTargetReplicas: 4,
 	}))
-	assert.False(t, isRolloutReady(rolloutState{{NewSpec: 4, NewReady: 2, Target: 4}}))
-	assert.True(t, isRolloutReady(rolloutState{{NewSpec: 4, NewReady: 4, Target: 4}}))
+	assert.False(t, isRolloutReady(rolloutSnapshot{{NewSpecReplicas: 4, NewReadyReplicas: 2, NewTargetReplicas: 4}}))
+	assert.True(t, isRolloutReady(rolloutSnapshot{{NewSpecReplicas: 4, NewReadyReplicas: 4, NewTargetReplicas: 4}}))
 }
 
 func TestBoundNewReplicaTargets(t *testing.T) {
 	proposed := []int{8, 4}
-	state := rolloutState{
+	state := rolloutSnapshot{
 		{
-			InitialOld: 8, OldSpec: 6, NewSpec: 3, NewReady: 0, Target: 8,
+			OldIntendedReplicas: 8, OldSpecReplicas: 6, NewSpecReplicas: 3, NewReadyReplicas: 0, NewTargetReplicas: 8,
 			Config: RollingUpdateConfig{MaxSurge: 2, MaxUnavailable: 2},
 		},
 		{
-			InitialOld: 4, OldSpec: 3, NewSpec: 2, NewReady: 0, Target: 4,
+			OldIntendedReplicas: 4, OldSpecReplicas: 3, NewSpecReplicas: 2, NewReadyReplicas: 0, NewTargetReplicas: 4,
 			Config: RollingUpdateConfig{MaxSurge: 2, MaxUnavailable: 2},
 		},
 	}
@@ -621,10 +621,10 @@ func TestBoundNewReplicaTargets(t *testing.T) {
 	assert.Equal(t, 2, bounded[1],
 		"decode cannot grow while its pending allowance is fully consumed")
 
-	state[0].OldSpec = 5
-	state[0].NewReady = 1
-	state[1].OldSpec = 2
-	state[1].NewReady = 1
+	state[0].OldSpecReplicas = 5
+	state[0].NewReadyReplicas = 1
+	state[1].OldSpecReplicas = 2
+	state[1].NewReadyReplicas = 1
 	bounded = boundNewReplicaTargets(state, proposed)
 	assert.Equal(t, 5, bounded[0],
 		"readiness plus released surge headroom opens the next shared fraction")
@@ -633,13 +633,13 @@ func TestBoundNewReplicaTargets(t *testing.T) {
 
 func TestBoundNewReplicaTargetsPreservesLargestReplicaFraction(t *testing.T) {
 	proposed := []int{2, 2}
-	state := rolloutState{
+	state := rolloutSnapshot{
 		{
-			NewSpec: 1, NewReady: 1, Target: 2,
+			NewSpecReplicas: 1, NewReadyReplicas: 1, NewTargetReplicas: 2,
 			Config: RollingUpdateConfig{MaxSurge: 1},
 		},
 		{
-			NewSpec: 1, NewReady: 0, Target: 3,
+			NewSpecReplicas: 1, NewReadyReplicas: 0, NewTargetReplicas: 3,
 			Config: RollingUpdateConfig{MaxSurge: 1},
 		},
 	}
@@ -649,17 +649,17 @@ func TestBoundNewReplicaTargetsPreservesLargestReplicaFraction(t *testing.T) {
 		"100%% versus 33%% would exceed largestReplicaFraction=1/2")
 	assert.Equal(t, 1, bounded[1])
 
-	state[1].NewReady = 1
+	state[1].NewReadyReplicas = 1
 	bounded = boundNewReplicaTargets(state, proposed)
 	assert.Equal(t, 2, bounded[0])
 	assert.Equal(t, 2, bounded[1])
 }
 
 func TestEnsureExecutableStepUsesSafeDrain(t *testing.T) {
-	state := rolloutState{
-		{InitialOld: 4, OldSpec: 1, OldReady: 1, NewSpec: 4, NewReady: 2, Target: 4,
+	state := rolloutSnapshot{
+		{OldIntendedReplicas: 4, OldSpecReplicas: 1, OldReadyReplicas: 1, NewSpecReplicas: 4, NewReadyReplicas: 2, NewTargetReplicas: 4,
 			Config: RollingUpdateConfig{MaxSurge: 1, MaxUnavailable: 1}},
-		{InitialOld: 1, OldSpec: 1, OldReady: 1, NewSpec: 1, NewReady: 1, Target: 1,
+		{OldIntendedReplicas: 1, OldSpecReplicas: 1, OldReadyReplicas: 1, NewSpecReplicas: 1, NewReadyReplicas: 1, NewTargetReplicas: 1,
 			Config: RollingUpdateConfig{MaxSurge: 1, MaxUnavailable: 1}},
 	}
 	step := &UpdateStep{Past: []int{1, 1}, New: []int{4, 1}}
@@ -687,21 +687,21 @@ func TestExecutorStateTransitionsExhaustive(t *testing.T) {
 					target := []int{targetP, targetD}
 					for configIndex, config := range configCases {
 						scenario := fmt.Sprintf("initial=%v target=%v config=%d", initial, target, configIndex)
-						state := make(rolloutState, len(roles))
+						state := make(rolloutSnapshot, len(roles))
 						for i := range roles {
-							state[i] = roleRolloutState{
-								InitialOld: initial[i],
-								OldSpec:    initial[i],
-								OldReady:   initial[i],
-								Target:     target[i],
-								Config:     config[i],
+							state[i] = roleRolloutSnapshot{
+								OldIntendedReplicas: initial[i],
+								OldSpecReplicas:     initial[i],
+								OldReadyReplicas:    initial[i],
+								NewTargetReplicas:   target[i],
+								Config:              config[i],
 							}
 						}
 
 						completed := false
 						for iteration := 0; iteration < 100; iteration++ {
-							assertRolloutStateInvariants(t, roles, state, scenario, iteration)
-							initialOld, currentOld, currentNew, targetNew := plannerState(state)
+							assertRolloutSnapshotInvariants(t, roles, state, scenario, iteration)
+							initialOld, currentOld, currentNew, targetNew := plannerInputs(state)
 							if isComplete(currentOld, currentNew, targetNew) {
 								if isRolloutReady(state) {
 									completed = true
@@ -726,14 +726,14 @@ func TestExecutorStateTransitionsExhaustive(t *testing.T) {
 							ensureExecutableStep(state, step)
 							changed := false
 							for i, roleState := range state {
-								drain := min(max(0, roleState.OldSpec-step.Past[i]), maxSafeDrain(roleState))
+								drain := min(max(0, roleState.OldSpecReplicas-step.Past[i]), maxSafeDrain(roleState))
 								if drain > 0 {
-									roleState.OldSpec -= drain
-									roleState.OldReady = min(roleState.OldReady, roleState.OldSpec)
+									roleState.OldSpecReplicas -= drain
+									roleState.OldReadyReplicas = min(roleState.OldReadyReplicas, roleState.OldSpecReplicas)
 									changed = true
 								}
-								if boundedNew[i] > roleState.NewSpec {
-									roleState.NewSpec = boundedNew[i]
+								if boundedNew[i] > roleState.NewSpecReplicas {
+									roleState.NewSpecReplicas = boundedNew[i]
 									changed = true
 								}
 								state[i] = roleState
@@ -752,10 +752,10 @@ func TestExecutorStateTransitionsExhaustive(t *testing.T) {
 	}
 }
 
-func makeOneNewReplicaReady(state rolloutState) bool {
+func makeOneNewReplicaReady(state rolloutSnapshot) bool {
 	for i, roleState := range state {
-		if roleState.NewReady < roleState.NewSpec {
-			roleState.NewReady++
+		if roleState.NewReadyReplicas < roleState.NewSpecReplicas {
+			roleState.NewReadyReplicas++
 			state[i] = roleState
 			return true
 		}
@@ -763,34 +763,34 @@ func makeOneNewReplicaReady(state rolloutState) bool {
 	return false
 }
 
-func assertRolloutStateInvariants(t *testing.T, roles []string, state rolloutState, scenario string, iteration int) {
+func assertRolloutSnapshotInvariants(t *testing.T, roles []string, state rolloutSnapshot, scenario string, iteration int) {
 	t.Helper()
 	newMinProgress, newMaxProgress := 1.0, 0.0
 	minPositiveTarget := 0
 	budgetSteps := 0
 	for _, roleState := range state {
-		budgetSteps = max(budgetSteps, roleState.InitialOld, roleState.Target)
+		budgetSteps = max(budgetSteps, roleState.OldIntendedReplicas, roleState.NewTargetReplicas)
 	}
 	for i, roleState := range state {
-		roleSize := max(roleState.InitialOld, roleState.Target)
+		roleSize := max(roleState.OldIntendedReplicas, roleState.NewTargetReplicas)
 		ceiling := roleSize + roleState.Config.MaxSurge
-		floor := max(0, min(roleState.InitialOld, roleState.Target)-roleState.Config.MaxUnavailable)
-		if roleState.OldSpec+roleState.NewSpec > ceiling {
+		floor := max(0, min(roleState.OldIntendedReplicas, roleState.NewTargetReplicas)-roleState.Config.MaxUnavailable)
+		if roleState.OldSpecReplicas+roleState.NewSpecReplicas > ceiling {
 			t.Fatalf("surge ceiling violated at iteration %d for %s role=%s: state=%+v", iteration, scenario, roles[i], roleState)
 		}
-		if roleState.OldReady+roleState.NewReady < floor {
+		if roleState.OldReadyReplicas+roleState.NewReadyReplicas < floor {
 			t.Fatalf("availability floor violated at iteration %d for %s role=%s: state=%+v", iteration, scenario, roles[i], roleState)
 		}
 		pendingAllowance := projectBudget(roleSize, roleState.Config.MaxSurge+roleState.Config.MaxUnavailable, budgetSteps)
-		if roleState.NewSpec-roleState.NewReady > pendingAllowance {
+		if roleState.NewSpecReplicas-roleState.NewReadyReplicas > pendingAllowance {
 			t.Fatalf("pending allowance violated at iteration %d for %s role=%s: state=%+v", iteration, scenario, roles[i], roleState)
 		}
-		if roleState.Target > 0 {
-			progress := float64(roleState.NewSpec) / float64(roleState.Target)
+		if roleState.NewTargetReplicas > 0 {
+			progress := float64(roleState.NewSpecReplicas) / float64(roleState.NewTargetReplicas)
 			newMinProgress = min(newMinProgress, progress)
 			newMaxProgress = max(newMaxProgress, progress)
-			if minPositiveTarget == 0 || roleState.Target < minPositiveTarget {
-				minPositiveTarget = roleState.Target
+			if minPositiveTarget == 0 || roleState.NewTargetReplicas < minPositiveTarget {
+				minPositiveTarget = roleState.NewTargetReplicas
 			}
 		}
 	}
@@ -799,7 +799,7 @@ func assertRolloutStateInvariants(t *testing.T, roles []string, state rolloutSta
 	}
 }
 
-func TestBuildRolloutStatePreservesExternalSpecDuringRollout(t *testing.T) {
+func TestBuildRolloutSnapshotPreservesExternalSpecDuringRollout(t *testing.T) {
 	const roleName = "prefill"
 	ds := &disaggregatedsetv1.DisaggregatedSet{
 		Spec: disaggregatedsetv1.DisaggregatedSetSpec{Roles: []disaggregatedsetv1.DisaggregatedRoleSpec{{
@@ -819,7 +819,7 @@ func TestBuildRolloutStatePreservesExternalSpecDuringRollout(t *testing.T) {
 	}
 	config := []RollingUpdateConfig{{MaxSurge: 1}}
 
-	state := buildRolloutState(
+	state := buildRolloutSnapshot(
 		ds,
 		[]string{roleName},
 		map[string]bool{roleName: true},
@@ -829,9 +829,9 @@ func TestBuildRolloutStatePreservesExternalSpecDuringRollout(t *testing.T) {
 		config,
 	)
 
-	assert.Equal(t, 5, state[0].NewSpec, "planner progress must follow issued spec")
-	assert.Equal(t, 3, state[0].NewReady, "availability must follow ready replicas")
-	assert.Equal(t, 5, state[0].Target, "an HPA shrink must not reduce the in-flight new revision spec")
+	assert.Equal(t, 5, state[0].NewSpecReplicas, "planner progress must follow issued spec")
+	assert.Equal(t, 3, state[0].NewReadyReplicas, "availability must follow ready replicas")
+	assert.Equal(t, 5, state[0].NewTargetReplicas, "an HPA shrink must not reduce the in-flight new revision spec")
 }
 
 // =============================================================================
@@ -1078,7 +1078,7 @@ func TestScaleDownOld(t *testing.T) {
 			prefillBudget: 2, decodeBudget: 2,
 		},
 		{
-			// Aliveness: planned drain (1P, 2D) would leave (2P, 0D) — orphan.
+			// Aliveness: planned drain (1P, 2D) would leave the orphaned state (2P, 0D).
 			// Budget can't cover full retirement (P=3 > budget=1), so skip
 			// the D drain that would hit 0. Result: P drains by 1, D untouched.
 			name:          "aliveness skips orphaning drain when retire not budgeted",
@@ -1171,9 +1171,9 @@ func TestScaleDownOld(t *testing.T) {
 				grouped.GetTotalReplicasPerRole(testRoleDecode),
 			}
 			target := RoleReplicaState{current[0] - tc.prefillBudget, current[1] - tc.decodeBudget}
-			state := rolloutState{
-				{OldSpec: current[0], OldReady: tc.prefillBudget},
-				{OldSpec: current[1], OldReady: tc.decodeBudget},
+			state := rolloutSnapshot{
+				{OldSpecReplicas: current[0], OldReadyReplicas: tc.prefillBudget},
+				{OldSpecReplicas: current[1], OldReadyReplicas: tc.decodeBudget},
 			}
 			err := executor.scaleDownOld(context.TODO(), ds, grouped, roleNames,
 				state, target, true)
@@ -1346,10 +1346,10 @@ func TestScaleDownOldWithMissingRole(t *testing.T) {
 				current[1] - tc.decodeBudget,
 				current[2] - tc.encodeBudget,
 			}
-			state := rolloutState{
-				{OldSpec: current[0], OldReady: tc.prefillBudget},
-				{OldSpec: current[1], OldReady: tc.decodeBudget},
-				{OldSpec: current[2], OldReady: tc.encodeBudget},
+			state := rolloutSnapshot{
+				{OldSpecReplicas: current[0], OldReadyReplicas: tc.prefillBudget},
+				{OldSpecReplicas: current[1], OldReadyReplicas: tc.decodeBudget},
+				{OldSpecReplicas: current[2], OldReadyReplicas: tc.encodeBudget},
 			}
 			err := executor.scaleDownOld(context.TODO(), ds, grouped, threeRoleNames,
 				state, target, true)
@@ -1672,7 +1672,7 @@ func TestReconcileRollingUpdateABCScenario(t *testing.T) {
 	testCases := []abcExecutorScenario{
 		{
 			// surge=1 unavail=0 (defaults). total=4=floor, drainBudget=0 so no drain
-			// this reconcile — planner scales up C using the surge headroom only.
+			// this reconcile. The planner scales up C using only the surge headroom.
 			name: "first step scales up C using surge (no drain budget)", aPrefill: 2, aDecode: 2, bPrefill: 2, bDecode: 2, cPrefill: 0, cDecode: 0,
 			expectedA: [2]int32{2, 2}, expectedB: [2]int32{2, 2}, expectedC: [2]int32{1, 1},
 		},

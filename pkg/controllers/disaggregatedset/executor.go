@@ -47,21 +47,26 @@ type RollingUpdateExecutor struct {
 	LWSManager *LeaderWorkerSetManager
 }
 
-// roleRolloutState separates work already issued through Spec from work that
-// has completed and is serving through Ready. The planner advances Spec; Ready
-// only authorizes additional in-flight work and old-replica drains.
-type roleRolloutState struct {
-	InitialOld int
-	OldSpec    int
-	OldReady   int
-	NewSpec    int
-	NewReady   int
-	Target     int
-	Config     RollingUpdateConfig
+// roleRolloutSnapshot is rebuilt from the observed LWS objects on every
+// reconcile. It is not persisted by the controller.
+//
+// OldIntendedReplicas is the largest intended-replicas value for this role
+// across all old revisions. It is the stable old capacity that the rollout
+// must replace. The Spec fields count work sent to the cluster, including pods
+// that are still starting. The Ready fields count serving capacity and exclude
+// replicas already committed to termination.
+type roleRolloutSnapshot struct {
+	OldIntendedReplicas int
+	OldSpecReplicas     int
+	OldReadyReplicas    int
+	NewSpecReplicas     int
+	NewReadyReplicas    int
+	NewTargetReplicas   int
+	Config              RollingUpdateConfig
 }
 
-// rolloutState is index-aligned with the role-name slice used by the caller.
-type rolloutState []roleRolloutState
+// rolloutSnapshot is index-aligned with the role-name slice used by the caller.
+type rolloutSnapshot []roleRolloutSnapshot
 
 // ReconcileRollingUpdateNew is the entry point for rolling update reconciliation.
 // It fetches current cluster state and either:
@@ -69,12 +74,15 @@ type rolloutState []roleRolloutState
 //     revision exist yet, or
 //  2. Continues an in-progress rolling update (ReconcileRollingUpdate) by
 //     computing and executing the next scale step.
+//
+// scalersByRole contains the controller-owned scaler for each External role.
+// Static roles do not use this map.
 func (executor *RollingUpdateExecutor) ReconcileRollingUpdateNew(
 	ctx context.Context,
 	disaggregatedSet *disaggregatedsetv1.DisaggregatedSet,
 	slice int,
 	revision string,
-	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
+	scalersByRole map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	roleNames := disaggregatedsetutils.GetRoleNames(disaggregatedSet)
@@ -87,10 +95,15 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdateNew(
 	if len(oldRevisions) == 0 {
 		return ctrl.Result{}, nil
 	}
-	// Migrate the legacy initial-replicas value before using Spec as a fallback:
-	// an old revision's Spec may already be partially drained. Objects carrying
-	// neither annotation use their current Spec as the best available baseline.
-	// Once written, intended-replicas is immutable for an old revision.
+	// Normalize the replica target stored on every old LWS before planning:
+	//  1. Keep an existing intended-replicas value.
+	//  2. Otherwise, copy the legacy initial-replicas value to intended-replicas.
+	//  3. If neither value is valid, use the current Spec as the best available
+	//     fallback.
+	//
+	// The legacy annotation remains in place for compatibility. This must happen
+	// before draining because an old revision's Spec may already be smaller than
+	// the replica count it was originally intended to reach.
 	if err := executor.ensureOldIntendedReplicas(ctx, disaggregatedSet, oldRevisions); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -101,10 +114,12 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdateNew(
 	}
 
 	if newRevision == nil {
-		return executor.initRollingUpdate(ctx, disaggregatedSet, slice, revision, roleNames, roleConfigs, scalers)
+		return executor.initRollingUpdate(ctx, disaggregatedSet, slice, revision, roleNames, roleConfigs, scalersByRole)
 	}
 
-	return executor.ReconcileRollingUpdate(ctx, disaggregatedSet, oldRevisions, *newRevision, scalers)
+	// Continuing a rollout updates the LWS objects discovered above by their
+	// actual names. The slice is only needed to find or create those objects.
+	return executor.ReconcileRollingUpdate(ctx, disaggregatedSet, oldRevisions, *newRevision, scalersByRole)
 }
 
 func (executor *RollingUpdateExecutor) initRollingUpdate(
@@ -114,19 +129,22 @@ func (executor *RollingUpdateExecutor) initRollingUpdate(
 	revision string,
 	roleNames []string,
 	roleConfigs map[string]*disaggregatedsetv1.DisaggregatedRoleSpec,
-	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
+	scalersByRole map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	log.Info("Initiating new rolling update", "revision", revision)
 	executor.Record.Eventf(disaggregatedSet, nil, corev1.EventTypeNormal, EventReasonRollingUpdateStarted,
 		"Update", "Started rolling update to revision %s", revision)
 
-	// Create new LWS objects (one per role) for the target revision with 0
-	// replicas, but persist the count each role is intended to reach. If another
-	// rollout interrupts this one, that target—not the partial Spec—is its
-	// contribution to the old-side baseline.
+	// Create one LWS per role for the target revision:
+	//  1. Start the LWS at 0 replicas. The executor grows it on later reconciles.
+	//  2. Store the role's final target in intended-replicas.
+	//
+	// If another rollout interrupts this one, the stored target becomes this
+	// revision's contribution to the old-side baseline. Its partially scaled
+	// Spec does not replace that target.
 	for _, roleName := range roleNames {
-		intendedReplicas := getTargetReplicas(disaggregatedSet, roleName, scalers, 0)
+		intendedReplicas := getTargetReplicas(disaggregatedSet, roleName, scalersByRole, 0)
 		if _, err := executor.ensureNewLWSExists(ctx, disaggregatedSet, slice, revision, roleName, roleConfigs[roleName], 0, intendedReplicas); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -135,31 +153,36 @@ func (executor *RollingUpdateExecutor) initRollingUpdate(
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 
-// ReconcileRollingUpdate executes one step of an in-progress rolling update.
-// Spec counts represent already-issued rollout work and drive the planner.
-// Ready counts represent completed work and bound both pending scale-up and
-// safe old-replica drain. Old revisions are drained newest-first.
+// ReconcileRollingUpdate executes one step of an in-progress rolling update:
+//  1. Refresh the current revision's intended replica targets.
+//  2. Build a snapshot of issued and Ready replicas for every role.
+//  3. Ask the planner for the next old and new Spec counts.
+//  4. Limit that plan using current readiness, surge, and availability.
+//  5. Drain old revisions newest-first, then grow the current revision.
+//
+// Object updates and a one-second timer trigger the next step. The rollout is
+// complete only after the old Specs reach zero and the target revision is Ready.
 func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 	ctx context.Context,
 	disaggregatedSet *disaggregatedsetv1.DisaggregatedSet,
 	oldRevisions disaggregatedsetutils.RevisionRolesList,
 	newRevision disaggregatedsetutils.RevisionRoles,
-	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
+	scalersByRole map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	specRoleNames := disaggregatedsetutils.GetRoleNames(disaggregatedSet)
 	specRoleSet, oldRoleSet := buildRoleSets(specRoleNames, oldRevisions)
-	if err := executor.syncTargetIntendedReplicas(ctx, disaggregatedSet, specRoleNames, newRevision, scalers); err != nil {
+	if err := executor.syncTargetIntendedReplicas(ctx, disaggregatedSet, specRoleNames, newRevision, scalersByRole); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	allRoleNames := append(slices.Clone(specRoleNames), removedRoleNames(oldRoleSet, specRoleSet)...)
-	config := extractRollingUpdateConfig(disaggregatedSet, allRoleNames, scalers)
-	state := buildRolloutState(disaggregatedSet, allRoleNames, specRoleSet, oldRevisions, newRevision, scalers, config)
-	initialOld, currentOld, currentNewSpec, targetNew := plannerState(state)
+	config := extractRollingUpdateConfig(disaggregatedSet, allRoleNames, scalersByRole)
+	snapshot := buildRolloutSnapshot(disaggregatedSet, allRoleNames, specRoleSet, oldRevisions, newRevision, scalersByRole, config)
+	initialOld, currentOld, currentNewSpec, targetNew := plannerInputs(snapshot)
 
 	if isComplete(currentOld, currentNewSpec, targetNew) {
-		if !isRolloutReady(state) {
+		if !isRolloutReady(snapshot) {
 			log.V(1).Info("Waiting for target revision to become ready")
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
@@ -173,16 +196,16 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 		log.Info("Rolling update is temporarily blocked; waiting for state to change")
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
-	nextStep.New = boundNewReplicaTargets(state, nextStep.New)
-	ensureExecutableStep(state, nextStep)
+	nextStep.New = boundNewReplicaTargets(snapshot, nextStep.New)
+	ensureExecutableStep(snapshot, nextStep)
 
 	log.Info("Next step computed", buildStepLogArgs(allRoleNames, nextStep)...)
 	newGrowthPlanned, newReadinessPending := false, false
 	for i := range allRoleNames {
-		if nextStep.New[i] > state[i].NewSpec {
+		if nextStep.New[i] > snapshot[i].NewSpecReplicas {
 			newGrowthPlanned = true
 		}
-		newReadinessPending = newReadinessPending || state[i].NewReady < state[i].NewSpec
+		newReadinessPending = newReadinessPending || snapshot[i].NewReadyReplicas < snapshot[i].NewSpecReplicas
 	}
 
 	// Scale down old replicas before scaling up new ones. This ordering ensures
@@ -191,7 +214,7 @@ func (executor *RollingUpdateExecutor) ReconcileRollingUpdate(
 	// (currentOld + nextStep.New) exceed the target before scaleDownOld brings
 	// currentOld down.
 	allowUncoordinatedDrain := !newGrowthPlanned && !newReadinessPending
-	if err := executor.scaleDownOld(ctx, disaggregatedSet, oldRevisions, allRoleNames, state, nextStep.Past, allowUncoordinatedDrain); err != nil {
+	if err := executor.scaleDownOld(ctx, disaggregatedSet, oldRevisions, allRoleNames, snapshot, nextStep.Past, allowUncoordinatedDrain); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := executor.scaleUpNew(ctx, disaggregatedSet, newRevision, specRoleNames, nextStep.New); err != nil {
@@ -230,59 +253,61 @@ func removedRoleNames(oldRoleSet, specRoleSet map[string]bool) []string {
 	return removed
 }
 
-func buildRolloutState(
+func buildRolloutSnapshot(
 	ds *disaggregatedsetv1.DisaggregatedSet,
 	allRoleNames []string,
 	specRoleSet map[string]bool,
 	oldRevisions disaggregatedsetutils.RevisionRolesList,
 	newRevision disaggregatedsetutils.RevisionRoles,
-	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
+	scalersByRole map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 	config []RollingUpdateConfig,
-) rolloutState {
-	state := make(rolloutState, len(allRoleNames))
+) rolloutSnapshot {
+	snapshot := make(rolloutSnapshot, len(allRoleNames))
 
 	for i, roleName := range allRoleNames {
-		roleState := roleRolloutState{
-			InitialOld: oldRevisions.GetMaxIntendedReplicasPerRole(roleName),
-			OldSpec:    oldRevisions.GetTotalReplicasPerRole(roleName),
-			Config:     config[i],
+		roleState := roleRolloutSnapshot{
+			OldIntendedReplicas: oldRevisions.GetMaxIntendedReplicasPerRole(roleName),
+			OldSpecReplicas:     oldRevisions.GetTotalReplicasPerRole(roleName),
+			Config:              config[i],
 		}
 		for _, revision := range oldRevisions {
 			if lws := revision.Roles[roleName]; lws != nil {
-				roleState.OldReady += committedReadyReplicas(lws)
+				roleState.OldReadyReplicas += committedReadyReplicas(lws)
 			}
 		}
 
 		if specRoleSet[roleName] {
 			lws := newRevision.Roles[roleName]
 			if lws != nil {
-				roleState.NewSpec = int(getLWSReplicas(lws))
-				roleState.NewReady = committedReadyReplicas(lws)
+				roleState.NewSpecReplicas = int(getLWSReplicas(lws))
+				roleState.NewReadyReplicas = committedReadyReplicas(lws)
 			}
-			roleState.Target = getTargetReplicas(ds, roleName, scalers, roleState.NewSpec)
+			roleState.NewTargetReplicas = getTargetReplicas(ds, roleName, scalersByRole, roleState.NewSpecReplicas)
 			// No-shrink guard: an External role mid-rollout must not shrink the
 			// new-revision fleet if HPA writes a smaller value while the old
 			// revision is still draining. Releases once the rollout completes.
 			if isExternal(ds, roleName) && len(oldRevisions) > 0 && lws != nil {
-				roleState.Target = max(roleState.Target, roleState.NewSpec)
+				roleState.NewTargetReplicas = max(roleState.NewTargetReplicas, roleState.NewSpecReplicas)
 			}
 		}
-		state[i] = roleState
+		snapshot[i] = roleState
 	}
 
-	return state
+	return snapshot
 }
 
-func plannerState(state rolloutState) (initialOld, currentOld, currentNew, targetNew RoleReplicaState) {
-	initialOld = make(RoleReplicaState, len(state))
-	currentOld = make(RoleReplicaState, len(state))
-	currentNew = make(RoleReplicaState, len(state))
-	targetNew = make(RoleReplicaState, len(state))
-	for i, role := range state {
-		initialOld[i] = role.InitialOld
-		currentOld[i] = role.OldSpec
-		currentNew[i] = role.NewSpec
-		targetNew[i] = role.Target
+// plannerInputs projects the rollout snapshot onto the four replica vectors
+// used by the planner. Ready counts and safety limits remain in the executor.
+func plannerInputs(snapshot rolloutSnapshot) (initialOld, currentOld, currentNew, targetNew RoleReplicaState) {
+	initialOld = make(RoleReplicaState, len(snapshot))
+	currentOld = make(RoleReplicaState, len(snapshot))
+	currentNew = make(RoleReplicaState, len(snapshot))
+	targetNew = make(RoleReplicaState, len(snapshot))
+	for i, role := range snapshot {
+		initialOld[i] = role.OldIntendedReplicas
+		currentOld[i] = role.OldSpecReplicas
+		currentNew[i] = role.NewSpecReplicas
+		targetNew[i] = role.NewTargetReplicas
 	}
 	return
 }
@@ -291,13 +316,13 @@ func plannerState(state rolloutState) (initialOld, currentOld, currentNew, targe
 // spec.replicas from the scaler (always materialised since the CRD defaults it
 // to 0 and the controller seeds it at creation to avoid draining a running
 // Static→External flip).
-func getTargetReplicas(ds *disaggregatedsetv1.DisaggregatedSet, roleName string, scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler, currentNewSpec int) int {
+func getTargetReplicas(ds *disaggregatedsetv1.DisaggregatedSet, roleName string, scalersByRole map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler, currentNewSpec int) int {
 	for _, p := range ds.Spec.Roles {
 		if p.Name != roleName {
 			continue
 		}
 		if p.Scaling != nil && p.Scaling.Mode == disaggregatedsetv1.RoleScalingExternal {
-			if s := scalers[roleName]; s != nil {
+			if s := scalersByRole[roleName]; s != nil {
 				return int(s.Spec.Replicas)
 			}
 			return currentNewSpec
@@ -322,7 +347,7 @@ func isExternal(ds *disaggregatedsetv1.DisaggregatedSet, roleName string) bool {
 func extractRollingUpdateConfig(
 	ds *disaggregatedsetv1.DisaggregatedSet,
 	allRoleNames []string,
-	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
+	scalersByRole map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) []RollingUpdateConfig {
 	config := make([]RollingUpdateConfig, len(allRoleNames))
 	roleIndex := make(map[string]int, len(allRoleNames))
@@ -336,7 +361,7 @@ func extractRollingUpdateConfig(
 			// For External roles this returns the scaler value (or currentNewSpec=0
 			// if none is available); percentages against 0 collapse to 0, which
 			// matches how a paused rollout should behave.
-			replicas := getTargetReplicas(ds, role.Name, scalers, 0)
+			replicas := getTargetReplicas(ds, role.Name, scalersByRole, 0)
 			// Use GetScaledValueFromIntOrPercent to handle both integers and percentages.
 			// For maxSurge, round up (true); for maxUnavailable, round down (false).
 			surge, _ := intstr.GetScaledValueFromIntOrPercent(&rc.MaxSurge, replicas, true)
@@ -376,9 +401,9 @@ func committedReadyReplicas(lws *leaderworkersetv1.LeaderWorkerSet) int {
 	return max(0, min(int(lws.Status.ReadyReplicas), int(getLWSReplicas(lws))))
 }
 
-func isRolloutReady(state rolloutState) bool {
-	for _, role := range state {
-		if role.OldSpec != 0 || role.NewReady < role.Target {
+func isRolloutReady(snapshot rolloutSnapshot) bool {
+	for _, role := range snapshot {
+		if role.OldSpecReplicas != 0 || role.NewReadyReplicas < role.NewTargetReplicas {
 			return false
 		}
 	}
@@ -391,33 +416,33 @@ func isRolloutReady(state rolloutState) bool {
 // replicas. Existing Spec is never reduced here, even if an externally
 // modified object is already outside either bound.
 func boundNewReplicaTargets(
-	state rolloutState,
+	snapshot rolloutSnapshot,
 	proposed RoleReplicaState,
 ) RoleReplicaState {
-	provisional := make(RoleReplicaState, len(state))
+	provisional := make(RoleReplicaState, len(snapshot))
 	budgetSteps := 0
-	for _, role := range state {
-		budgetSteps = max(budgetSteps, role.InitialOld, role.Target)
+	for _, role := range snapshot {
+		budgetSteps = max(budgetSteps, role.OldIntendedReplicas, role.NewTargetReplicas)
 	}
-	for i, roleState := range state {
-		roleSize := max(roleState.InitialOld, roleState.Target)
-		maxBySurge := roleSize + roleState.Config.MaxSurge - roleState.OldSpec
+	for i, roleState := range snapshot {
+		roleSize := max(roleState.OldIntendedReplicas, roleState.NewTargetReplicas)
+		maxBySurge := roleSize + roleState.Config.MaxSurge - roleState.OldSpecReplicas
 		pendingAllowance := projectBudget(
 			roleSize,
 			roleState.Config.MaxSurge+roleState.Config.MaxUnavailable,
 			budgetSteps,
 		)
-		maxByPending := roleState.NewReady + pendingAllowance
-		upperBound := max(roleState.NewSpec, min(maxBySurge, maxByPending))
-		provisional[i] = max(roleState.NewSpec, min(proposed[i], upperBound))
+		maxByPending := roleState.NewReadyReplicas + pendingAllowance
+		upperBound := max(roleState.NewSpecReplicas, min(maxBySurge, maxByPending))
+		provisional[i] = max(roleState.NewSpecReplicas, min(proposed[i], upperBound))
 	}
 
 	// Per-role readiness clamps can trim different parts of the proposal. Keep
 	// the resulting progress within one largestReplicaFraction of the slowest
 	// role. Integer cross-products keep this exact without rational-number state.
 	slowCount, slowTarget, minTarget := 0, 0, 0
-	for i, role := range state {
-		target := role.Target
+	for i, role := range snapshot {
+		target := role.NewTargetReplicas
 		if target <= 0 {
 			continue
 		}
@@ -428,13 +453,13 @@ func boundNewReplicaTargets(
 			slowCount, slowTarget = provisional[i], target
 		}
 	}
-	bounded := make(RoleReplicaState, len(state))
-	for i, roleState := range state {
-		coordinatedTarget := roleState.Target
+	bounded := make(RoleReplicaState, len(snapshot))
+	for i, roleState := range snapshot {
+		coordinatedTarget := roleState.NewTargetReplicas
 		if minTarget > 0 {
-			coordinatedTarget = replicaLimit(roleState.Target, slowCount, slowTarget, minTarget)
+			coordinatedTarget = replicaLimit(roleState.NewTargetReplicas, slowCount, slowTarget, minTarget)
 		}
-		bounded[i] = max(roleState.NewSpec, min(provisional[i], coordinatedTarget))
+		bounded[i] = max(roleState.NewSpecReplicas, min(provisional[i], coordinatedTarget))
 	}
 	return bounded
 }
@@ -452,24 +477,24 @@ func replicaLimit(target, slowCount, slowTarget, minTarget int) int {
 
 // maxSafeDrain returns the number of old replicas that may be removed without
 // crossing the raw MaxUnavailable availability floor. Ready is capped at Spec
-// before entering state, so terminating replicas cannot be spent twice.
-func maxSafeDrain(state roleRolloutState) int {
-	floor := max(0, min(state.InitialOld, state.Target)-state.Config.MaxUnavailable)
-	return min(state.OldSpec, max(0, state.OldReady+state.NewReady-floor))
+// while the snapshot is built, so terminating replicas cannot be spent twice.
+func maxSafeDrain(role roleRolloutSnapshot) int {
+	floor := max(0, min(role.OldIntendedReplicas, role.NewTargetReplicas)-role.Config.MaxUnavailable)
+	return min(role.OldSpecReplicas, max(0, role.OldReadyReplicas+role.NewReadyReplicas-floor))
 }
 
 // The planner may pair a drain with growth that readiness/coordination bounds
 // later remove. If that leaves a permanent no-op, spend one safe drain to open
 // replacement capacity.
-func ensureExecutableStep(state rolloutState, step *UpdateStep) {
-	for i, role := range state {
-		if step.New[i] > role.NewSpec || min(max(0, role.OldSpec-step.Past[i]), maxSafeDrain(role)) > 0 {
+func ensureExecutableStep(snapshot rolloutSnapshot, step *UpdateStep) {
+	for i, role := range snapshot {
+		if step.New[i] > role.NewSpecReplicas || min(max(0, role.OldSpecReplicas-step.Past[i]), maxSafeDrain(role)) > 0 {
 			return
 		}
 	}
-	for i, role := range state {
-		if role.OldSpec > 0 && maxSafeDrain(role) > 0 {
-			step.Past[i] = role.OldSpec - 1
+	for i, role := range snapshot {
+		if role.OldSpecReplicas > 0 && maxSafeDrain(role) > 0 {
+			step.Past[i] = role.OldSpecReplicas - 1
 			return
 		}
 	}
@@ -529,14 +554,14 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 	ds *disaggregatedsetv1.DisaggregatedSet,
 	oldRevisions disaggregatedsetutils.RevisionRolesList,
 	roleNames []string,
-	state rolloutState,
+	snapshot rolloutSnapshot,
 	targetOld RoleReplicaState,
 	allowUncoordinatedDrain bool,
 ) error {
 	budget := make(RoleReplicaState, len(roleNames))
 	for i := range roleNames {
-		roleState := state[i]
-		budget[i] = max(0, min(roleState.OldSpec-targetOld[i], maxSafeDrain(roleState)))
+		roleState := snapshot[i]
+		budget[i] = max(0, min(roleState.OldSpecReplicas-targetOld[i], maxSafeDrain(roleState)))
 	}
 
 	log := logf.FromContext(ctx)
@@ -551,7 +576,7 @@ func (executor *RollingUpdateExecutor) scaleDownOld(
 			continue
 		}
 
-		coordinateRevisionDrain(roleNames, wl.Roles, plannedDrain, state, allowUncoordinatedDrain)
+		coordinateRevisionDrain(roleNames, wl.Roles, plannedDrain, snapshot, allowUncoordinatedDrain)
 
 		for i, name := range roleNames {
 			lws := wl.Roles[name]
@@ -588,7 +613,7 @@ func coordinateRevisionDrain(
 	roleNames []string,
 	roles map[string]*leaderworkersetv1.LeaderWorkerSet,
 	drain RoleReplicaState,
-	state rolloutState,
+	snapshot rolloutSnapshot,
 	allowUncoordinated bool,
 ) {
 	anyAliveAfter, anyRetired, canRetire := false, false, true
@@ -600,7 +625,7 @@ func coordinateRevisionDrain(
 		replicas := int(getLWSReplicas(lws))
 		anyAliveAfter = anyAliveAfter || replicas > drain[i]
 		anyRetired = anyRetired || drain[i] == replicas
-		canRetire = canRetire && replicas <= maxSafeDrain(state[i])
+		canRetire = canRetire && replicas <= maxSafeDrain(snapshot[i])
 	}
 	if !anyAliveAfter || !anyRetired {
 		return
@@ -639,7 +664,7 @@ func (executor *RollingUpdateExecutor) ensureNewLWSExists(
 	slice int,
 	revision, role string,
 	config *disaggregatedsetv1.DisaggregatedRoleSpec,
-	initialReplicas int,
+	startingReplicas int,
 	intendedReplicas int,
 ) (bool, error) {
 	lwsName := disaggregatedsetutils.GenerateName(ds.Name, slice, revision, role)
@@ -658,7 +683,7 @@ func (executor *RollingUpdateExecutor) ensureNewLWSExists(
 		Config:           config,
 		Revision:         revision,
 		Labels:           disaggregatedsetutils.GenerateLabels(ds.Name, slice, revision, role),
-		Replicas:         initialReplicas,
+		Replicas:         startingReplicas,
 		IntendedReplicas: &intendedReplicas,
 	}); err != nil {
 		return false, fmt.Errorf("failed to create LWS %s: %w", lwsName, err)
@@ -701,14 +726,14 @@ func (executor *RollingUpdateExecutor) syncTargetIntendedReplicas(
 	ds *disaggregatedsetv1.DisaggregatedSet,
 	roleNames []string,
 	newRevision disaggregatedsetutils.RevisionRoles,
-	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
+	scalersByRole map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) error {
 	for _, roleName := range roleNames {
 		lws := newRevision.Roles[roleName]
 		if lws == nil {
 			continue
 		}
-		intended := getTargetReplicas(ds, roleName, scalers, int(getLWSReplicas(lws)))
+		intended := getTargetReplicas(ds, roleName, scalersByRole, int(getLWSReplicas(lws)))
 		current, ok := disaggregatedsetutils.GetIntendedReplicasAnnotation(lws)
 		if ok && int(current) == intended {
 			continue

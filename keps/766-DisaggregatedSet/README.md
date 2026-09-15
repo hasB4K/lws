@@ -348,7 +348,7 @@ Headless Services are automatically created for each role per revision. This all
 
 ### Controller Architecture
 
-The controller is stateless—all state is derived from observed resources. An
+The controller is stateless: all state is derived from observed resources. An
 `intended-replicas` annotation tracks each revision's completed replica target
 across rolling updates. Owner references on managed LeaderWorkerSets and
 Services ensure proper garbage collection.

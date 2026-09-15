@@ -195,39 +195,26 @@ oldAtStep(k) = ceil(initialOld * (oldSideSteps - k) / oldSideSteps)
 
 The controller uses the role that has made the least progress to select the next shared checkpoint. It then calculates the replica count for every role at that checkpoint. Ceiling division keeps each old role above zero until the final checkpoint. It also prevents a smaller role from getting more than one replica's worth of progress ahead.
 
-The following diagram maps every checkpoint to the corresponding Prefill and Decode counts. The new rows show replicas added. The old rows show replicas remaining. Each side chooses its own checkpoint, so the old and new counts in one column do not need to occur in the same reconcile.
+The following diagram shows one possible state in the middle of an `8P/4D` rollout. Prefill has replaced 5 of its 8 replicas. Decode has replaced 2 of its 4 replicas. Decode is therefore the least-advanced role and sets the lower edge at `4/8`. The upper edge is `largestReplicaFraction`, or `1/4`, farther at `6/8`.
 
 ```
-Example: checkpoint map for an 8P/4D side
+Current state:
 
-checkpoint       0    1    2    3    4    5    6    7    8
-fraction         0   1/8  2/8  3/8  4/8  5/8  6/8  7/8   1
+role       old replicas   new replicas   progress
+Prefill         3              5           5/8
+Decode          2              2           2/4 = 4/8
 
-new Prefill      0    1    2    3    4    5    6    7    8
-new Decode       0    1    1    2    2    3    3    4    4
+Coordination window for this state:
 
-old Prefill left 8    7    6    5    4    3    2    1    0
-old Decode left  4    4    3    3    2    2    1    1    0
-
-one checkpoint = 1/8 = smallestReplicaFraction
+                         lower edge                              upper edge
+                            4/8                 5/8                 6/8
+                             |===================|===================|
+Decode  old=2, new=2         o-------------------------------------->o  old=1, new=3
+Prefill                                           o----------------->o  old=2, new=6
+                                           old=3, new=5
 ```
 
-An in-progress rollout is described by a moving window over these checkpoints. On the new side, progress is the fraction of target replicas already added. On the old side, it is the fraction of initial replicas already removed. Each side has its own window. The least-advanced role sets the left edge, and `largestReplicaFraction` sets the width.
-
-```
-One example position of the new-side window:
-
-                         lower edge                 upper edge
-                              |                          |
-                              v                          v
-fraction     0 ------------- 4/8 ====================== 6/8 ------------- 1
-                              |<---- 2/8 = 1/4 wide ---->|
-
-allowed new Prefill counts:   4, 5, or 6
-allowed new Decode counts:    2 or 3
-```
-
-The `4/8` to `6/8` window above is only one example position during the rollout. A role at the right edge waits. When the slowest role advances, both edges move to the right. The old-side window works the same way, but measures removed replicas instead of added replicas.
+Each arrow shows how far that role can advance while the other role remains unchanged. Prefill can replace one replica, moving from `5/8` to `6/8`. Decode can replace one replica, which moves it from `2/4` to `3/4`, or from `4/8` to `6/8`. Neither role can move past `6/8` while the lower edge remains at `4/8`. When the least-advanced role moves, the window is recalculated and can move to the right.
 
 This moving window is the fractional-lockstep guarantee. Roles can move by different replica counts, and their API updates are not atomic. Readiness, surge, and availability limits may make the executable part of the window smaller. To keep a zero-surge rollout moving, the controller may sometimes drain one old role beyond the normal old-side window, but that drain must still stay above the role's availability floor. `MaxSurge` and `MaxUnavailable` are enforced independently for each role. They do not provide an atomic availability guarantee across roles.
 

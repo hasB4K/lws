@@ -172,6 +172,8 @@ Suppose a rollout from revision A to revision B is interrupted by revision C. Bo
 
 The legacy `initial-replicas` annotation can appear when the DisaggregatedSet controller is upgraded while a rollout started by the older controller is still in progress. The new controller copies that value to `intended-replicas`. If neither annotation exists on an old LWS, the controller uses its current Spec as the best available fallback.
 
+Within each side, the planner uses discrete linear interpolation. Every role uses the same progress fraction. The resulting replica counts are rounded up to whole numbers.
+
 Each side measures progress on its own fractional scale. For one side, `roleSizes` is the list of replica counts for its roles. `positiveRoleSizes` is the same list without roles whose replica count is zero.
 
 ```

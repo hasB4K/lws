@@ -61,7 +61,7 @@ Currently, deploying disaggregated inference workloads requires users to manuall
 
 1. **Unified Management**: Provide a single CRD that manages multiple LeaderWorkerSets (2-10 roles) as a cohesive unit.
 
-2. **Coordinated Rolling Updates**: Implement an N-dimensional rolling update algorithm that advances roles in fractional lockstep, bounds inter-role skew, and respects per-role surge and availability constraints.
+2. **Coordinated Rolling Updates**: Implement an N-dimensional rolling update algorithm that advances roles in fractional lockstep, limits the difference in progress between roles, and respects per-role surge and availability constraints.
 
 3. **Stateless Controller**: Design the controller to derive all state from observed resources, enabling safe restarts at any point.
 
@@ -162,28 +162,17 @@ type LeaderWorkerSetTemplateSpec struct {
 
 ### N-Dimensional Rolling Update Algorithm
 
-The algorithm tracks the old and new role replica counts as two N-dimensional
-sides. The old side shrinks to zero. The new side grows to its target. Each
-side has its own fractional progress scale:
+During a rolling update, the controller replaces one set of role replicas with another. The replicas being replaced form the old side. The replacement replicas form the new side. Each role is one dimension. The old side shrinks to zero while the new side grows to its target.
 
-Each role in a revision has an `intended-replicas` annotation. It records how
-many replicas that role should have when the rollout finishes. Replica-only
-and external-scaler changes update it while the revision is current. It stops
-changing when the revision becomes old.
+Each managed LWS stores an `intended-replicas` annotation. The annotation records how many replicas that role should reach for that revision. The revision selected by the current DisaggregatedSet template is the target revision. Replica-only changes and external-scaler changes update its intended count. If a template change selects another revision, the previous target becomes an old revision and its intended count no longer changes.
 
-An interrupted rollout can leave several old revisions. These revisions are
-successive attempts to replace the same role capacity, so their intended
-counts are not added together. For each role, `initialOld` is the largest
-intended count across those revisions.
+Suppose a rollout from revision A to revision B is interrupted by revision C. Both A and B are old while C rolls out. B was created to replace A, so their intended counts describe the same role capacity. For each role, `initialOld` is the larger intended count from A and B, rather than their sum.
 
-`oldSpec` answers a different question: how many old replicas currently exist?
-It adds the current Specs across all old revisions because every replica still
-uses cluster capacity.
+`oldSpec` is the total number of old replicas that are currently requested. It adds the current Specs across A and B because all of those replicas use cluster capacity until they are drained.
 
-Older controller versions did not always write `intended-replicas`. If the
-legacy `initial-replicas` annotation exists, the controller copies its value.
-If neither annotation exists, the current Spec is used as the best available
-fallback.
+The legacy `initial-replicas` annotation can appear when the DisaggregatedSet controller is upgraded while a rollout started by the older controller is still in progress. The new controller copies that value to `intended-replicas`. If neither annotation exists on an old LWS, the controller uses its current Spec as the best available fallback.
+
+Each side measures progress on its own fractional scale. For one side, `roleSizes` is the list of replica counts for its roles. `positiveRoleSizes` is the same list without roles whose replica count is zero.
 
 ```
 sideSteps                = max(roleSizes)
@@ -191,36 +180,18 @@ smallestReplicaFraction  = 1 / max(roleSizes)
 largestReplicaFraction   = 1 / min(positiveRoleSizes)
 ```
 
-`smallestReplicaFraction` is the finest shared progress tick: one pod in the
-largest role. `largestReplicaFraction` is the largest fraction represented by
-one pod in any role and therefore bounds the temporary progress skew caused by
-integer rounding. For example, an `8P/4D` side has a
-`smallestReplicaFraction` of `1/8` and a `largestReplicaFraction` of `1/4`.
+`sideSteps` is the number of progress steps for that side. `smallestReplicaFraction` is the smallest shared progress change: one replica in the largest role. `largestReplicaFraction` is the largest progress change represented by one replica in any role. It limits the temporary difference in progress caused by integer rounding. For example, an `8P/4D` side has a `smallestReplicaFraction` of `1/8` and a `largestReplicaFraction` of `1/4`.
 
-For side step `k`, replica targets use ceiling division:
+`newSideSteps` is `sideSteps` calculated from the new target counts. `oldSideSteps` is `sideSteps` calculated from the `initialOld` counts. `k` is a checkpoint number from zero through the corresponding side's step count. At checkpoint `k`, the replica count for one role is calculated with ceiling division:
 
 ```
 newAtStep(k) = ceil(target * k / newSideSteps)
 oldAtStep(k) = ceil(initialOld * (oldSideSteps - k) / oldSideSteps)
 ```
 
-The controller computes each side's progress from the least-advanced role and
-maps every role back onto that common fraction. Ceiling division keeps a
-positive role alive until the old side's final coordinated tick and prevents a
-small role from running ahead by more than one of its replicas. A conservative,
-availability-safe replacement drain may temporarily relax this aliveness
-preference when strict coordination would otherwise deadlock a zero-surge
-rollout.
+The controller uses the role that has made the least progress to select the next shared checkpoint. It then calculates the replica count for every role at that checkpoint. Ceiling division keeps each old role above zero until the final checkpoint. It also prevents a smaller role from getting more than one replica's worth of progress ahead. To keep a zero-surge rollout moving, the controller may sometimes drain one role earlier. That drain must still stay above the role's availability floor.
 
-Roles advance in fractional lockstep, with temporary skew bounded by the
-largest per-role replica fraction (`largestReplicaFraction`). Here, lockstep
-means that every role's replica target is derived from the same shared
-fractional progress checkpoint; it does not mean that roles change by the same
-absolute replica count or that their API updates happen atomically. A role may
-wait at a readiness or capacity bound while another role advances within the
-allowed fractional skew. `MaxSurge` and `MaxUnavailable` are enforced
-independently for each role; they do not provide an atomic cross-role
-availability guarantee.
+Roles therefore advance in fractional lockstep. Every role's replica target comes from the same shared progress checkpoint. The roles may change by different replica counts, and their API updates are not atomic. A role may wait at a readiness or capacity limit while another role advances within the difference allowed by `largestReplicaFraction`. `MaxSurge` and `MaxUnavailable` are enforced independently for each role. They do not provide an atomic availability guarantee across roles.
 
 #### Issued work and available capacity
 

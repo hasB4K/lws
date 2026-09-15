@@ -87,10 +87,7 @@ We propose adding a new CRD called `DisaggregatedSet` that acts as a higher-leve
 
 **Risk**: The N-dimensional rolling update algorithm adds complexity that could lead to stuck rollouts.
 
-**Mitigation**: The executor enforces hard per-role surge, availability, and
-pending-work bounds. It applies only availability-safe old-replica drains
-before growing the new revision, prefers whole-revision retirement, and is
-stateless so reconciliation can safely resume after a restart.
+**Mitigation**: For each role, the controller respects `maxSurge` and `maxUnavailable` and limits how many new replicas can be waiting to become Ready at the same time. It normally scales all roles in an old revision to zero together. If that would leave the rollout permanently stuck, it may scale one role to zero first, but only when doing so still respects that role's `maxUnavailable` limit. The controller derives the rollout state from the LeaderWorkerSets, so it can safely continue after a restart.
 
 **Risk**: Adding a new CRD increases the API surface and maintenance burden.
 
@@ -401,13 +398,7 @@ to implement this enhancement.
 - 2026-03-05: Initial KEP draft
 - 2026-03-22: Updated to reflect N-dimensional roles API
 - 2026-03-23: Renamed "phase" to "role" throughout for semantic clarity
-- 2026-09-14: Updated the rollout contract: replaced strict readiness gating
-  with a bounded pending-work window, defined fractional lockstep and its skew
-  bound, documented availability-safe drain-before-grow ordering, and made
-  whole-revision retirement best effort with a per-role-safe liveness fallback.
-- 2026-09-14: Defined interrupted-rollout baselines as the per-role maximum of
-  immutable revision targets, so deleting a partially rolled-out revision does
-  not shrink the availability baseline.
+- 2026-09-14: Updated the rolling-update contract to cover fractional lockstep, readiness and availability bounds, how old revisions are removed, and how an interrupted rollout remembers the replica counts it was meant to reach.
 
 ## Drawbacks
 

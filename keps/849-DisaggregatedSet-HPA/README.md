@@ -340,7 +340,11 @@ The DS controller writes back to each scaler's status at the end of every reconc
 
 ### Rolling Update Interaction
 
-`scaler.spec.replicas` is the target for the role's post-rollout steady state. The DS controller feeds it to the planner and records it on the current revision as `intended-replicas`. If another template update interrupts the rollout, that value freezes as the revision's completed target; the old-side baseline is the per-role maximum intended count across the interrupted revisions, while their current Specs are still summed for physical capacity accounting.
+`scaler.spec.replicas` is the number of replicas the role should have after the rollout finishes. The DS controller uses it as the current revision's target and copies it to that revision's `intended-replicas` annotation.
+
+If another template update interrupts the rollout, the interrupted revision becomes old before it has necessarily reached its target. Its `intended-replicas` value is then frozen, so the controller remembers the size it was meant to reach instead of treating its partially created replica count as the target.
+
+When more than one interrupted revision exists, they are successive attempts to replace the same role capacity. The controller therefore uses the largest `intended-replicas` value for each role as the old-side baseline: the amount of old capacity the new revision must replace. It does not add those targets together. Separately, it adds the revisions' current LWS `spec.replicas` when checking physical capacity, because all of those replicas remain in the cluster until they are drained.
 
 Because `status.selector` is leader-only and aggregate across revisions, HPA sees the serving fleet's leaders during a rolling update and its math stays self-consistent — the count HPA divides its metric by (`status.replicas`, LWS groups) matches the number of pods its selector matches (one leader per group), and the value it writes (`spec.replicas`, LWS groups) becomes the new-revision target as the old revision drains to zero.
 
@@ -424,6 +428,7 @@ to implement this enhancement.
 - 2026-07-03: Initial KEP draft (user-authored scaler CR shape).
 - 2026-07-04: Documented interaction with KEP-846 slices; scoped alpha to `spec.slices == 1`.
 - 2026-07-08: Redesigned around auto-created scalers.
+- 2026-09-14: Updated rolling-update behavior to preserve each revision's scaler target when a rollout is interrupted.
 
 ## Drawbacks
 

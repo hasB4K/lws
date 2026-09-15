@@ -191,9 +191,26 @@ newAtStep(k) = ceil(target * k / newSideSteps)
 oldAtStep(k) = ceil(initialOld * (oldSideSteps - k) / oldSideSteps)
 ```
 
-The controller uses the role that has made the least progress to select the next shared checkpoint. It then calculates the replica count for every role at that checkpoint. Ceiling division keeps each old role above zero until the final checkpoint. It also prevents a smaller role from getting more than one replica's worth of progress ahead. To keep a zero-surge rollout moving, the controller may sometimes drain one role earlier. That drain must still stay above the role's availability floor.
+The controller uses the role that has made the least progress to select the next shared checkpoint. It then calculates the replica count for every role at that checkpoint. Ceiling division keeps each old role above zero until the final checkpoint. It also prevents a smaller role from getting more than one replica's worth of progress ahead.
 
-Roles therefore advance in fractional lockstep. Every role's replica target comes from the same shared progress checkpoint. The roles may change by different replica counts, and their API updates are not atomic. A role may wait at a readiness or capacity limit while another role advances within the difference allowed by `largestReplicaFraction`. `MaxSurge` and `MaxUnavailable` are enforced independently for each role. They do not provide an atomic availability guarantee across roles.
+An in-progress rollout is described by two moving fractional-lockstep windows: one for removing old replicas and one for adding new replicas. For each non-zero role, progress is calculated as:
+
+```
+newProgress(role) = newSpec / target
+oldProgress(role) = (initialOld - min(oldSpec, initialOld)) / initialOld
+```
+
+On each side, the least-advanced role sets the lower edge of the window. `largestReplicaFraction` sets its width:
+
+```
+slowestProgress <= roleProgress <= min(1, slowestProgress + largestReplicaFraction)
+```
+
+A faster role can advance within this window and then waits at its upper edge. When the slowest role advances, the whole window moves forward. The old and new windows move independently because their role sizes can differ.
+
+For an `8P/4D` new side, the window width is `1/4`. If its lower edge is `1/2`, Prefill can have 4 to 6 of its 8 target replicas and Decode can have 2 to 3 of its 4 target replicas. Neither role advances beyond that window until the slower role moves forward.
+
+This moving window is the fractional-lockstep guarantee. Roles can move by different replica counts, and their API updates are not atomic. Readiness, surge, and availability limits may make the executable part of the window smaller. To keep a zero-surge rollout moving, the controller may sometimes drain one old role beyond the normal old-side window, but that drain must still stay above the role's availability floor. `MaxSurge` and `MaxUnavailable` are enforced independently for each role. They do not provide an atomic availability guarantee across roles.
 
 #### Issued work and available capacity
 

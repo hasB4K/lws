@@ -162,21 +162,28 @@ type LeaderWorkerSetTemplateSpec struct {
 
 ### N-Dimensional Rolling Update Algorithm
 
-The rolling update algorithm treats each set of role replica counts as an
-N-dimensional side. The old side drains from its initial counts to zero while
-the new side grows from zero to its target counts. Each side has its own
-fraction scale:
+The algorithm tracks the old and new role replica counts as two N-dimensional
+sides. The old side shrinks to zero. The new side grows to its target. Each
+side has its own fractional progress scale:
 
-For every revision and role, the controller stores `intended-replicas`: the
-replica count that revision would reach if its rollout completed. While the
-revision is current, replica-only and external-scaler changes update this
-value; once the revision becomes old, the value is immutable. For an
-interrupted rollout with several old revisions, `initialOld` is the per-role
-maximum of their intended counts, not their sum. Revisions are successive
-replacements of the same role capacity, whereas `oldSpec` still sums their
-current Specs to account for all capacity physically occupying the cluster.
-Objects created by an older controller without the annotation are backfilled
-once from their current Spec.
+Each role in a revision has an `intended-replicas` annotation. It records how
+many replicas that role should have when the rollout finishes. Replica-only
+and external-scaler changes update it while the revision is current. It stops
+changing when the revision becomes old.
+
+An interrupted rollout can leave several old revisions. These revisions are
+successive attempts to replace the same role capacity, so their intended
+counts are not added together. For each role, `initialOld` is the largest
+intended count across those revisions.
+
+`oldSpec` answers a different question: how many old replicas currently exist?
+It adds the current Specs across all old revisions because every replica still
+uses cluster capacity.
+
+Older controller versions did not always write `intended-replicas`. If the
+legacy `initial-replicas` annotation exists, the controller copies its value.
+If neither annotation exists, the current Spec is used as the best available
+fallback.
 
 ```
 sideSteps                = max(roleSizes)

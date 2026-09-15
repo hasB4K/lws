@@ -87,7 +87,7 @@ We propose adding a new CRD called `DisaggregatedSet` that acts as a higher-leve
 
 **Risk**: The N-dimensional rolling update algorithm adds complexity that could lead to stuck rollouts.
 
-**Mitigation**: For each role, the controller respects `maxSurge` and `maxUnavailable` and limits how many new replicas can be waiting to become Ready at the same time. It normally scales all roles in an old revision to zero together. If that would leave the rollout permanently stuck, it may scale one role to zero first, but only when doing so still respects that role's `maxUnavailable` limit. The controller derives the rollout state from the LeaderWorkerSets, so it can safely continue after a restart.
+**Mitigation**: The algorithm enforces per-role surge and availability limits and coordinates role drains whenever possible. If strict coordination would leave a zero-surge rollout stuck, it may drain one role first while respecting that role's availability limit. The controller derives rollout state from observed LeaderWorkerSets, so it can safely continue after a restart.
 
 **Risk**: Adding a new CRD increases the API surface and maintenance burden.
 
@@ -197,21 +197,16 @@ Roles therefore advance in fractional lockstep. Every role's replica target come
 
 #### Issued work and available capacity
 
-The controller deliberately distinguishes the desired replica count in the
-LWS Spec from its Ready status:
+The controller deliberately distinguishes the desired replica count in the LWS Spec from its Ready status:
 
 ```
 Spec  = work already issued to the cluster, including pods still starting
 Ready = work that has completed startup and is available to serve
 ```
 
-Spec drives the planner's progress calculation. Re-planning from Ready would
-reissue the same fractional step on every reconcile while a pod is starting.
-Ready instead controls how much additional work may be in flight, whether an
-old replica can be removed safely, and whether the rollout is complete.
+Spec drives the planner's progress calculation. Re-planning from Ready would reissue the same fractional step on every reconcile while a pod is starting. Ready instead controls how much additional work may be in flight, whether an old replica can be removed safely, and whether the rollout is complete.
 
-Status can temporarily remain higher than Spec after a scale-down. The
-controller therefore counts only committed availability:
+Status can temporarily remain higher than Spec after a scale-down. The controller therefore counts only committed availability:
 
 ```
 committedReady = min(status.readyReplicas, spec.replicas)
@@ -221,8 +216,7 @@ This prevents a terminating replica from authorizing another drain.
 
 #### Capacity and pending-work bounds
 
-`MaxSurge` and `MaxUnavailable` remain hard, absolute per-role limits. For each
-role the executor enforces:
+`MaxSurge` and `MaxUnavailable` remain hard, absolute per-role limits. For each role the executor enforces:
 
 ```
 roleSize          = max(initialOld, target)
@@ -233,58 +227,32 @@ oldSpec + newSpec                    <= surgeCeiling
 oldCommittedReady + newCommittedReady >= availabilityFloor
 ```
 
-The proportional planner can intentionally use less than those raw limits to
-keep differently sized roles moving together. Let `budgetSteps` be the larger
-of the old and new side step counts. A raw per-role budget is projected onto
-the shared fraction scale as:
+The proportional planner can intentionally use less than those raw limits to keep differently sized roles moving together. Let `budgetSteps` be the larger of the old and new side step counts. A raw per-role budget is projected onto the shared fraction scale as:
 
 ```
 projected(role, budget) = ceil(roleSize * budget / budgetSteps)
 ```
 
-The same projection defines the maximum new work allowed to be issued but not
-yet Ready:
+The same projection defines the maximum new work allowed to be issued but not yet Ready:
 
 ```
 pendingAllowance = projected(role, MaxSurge + MaxUnavailable)
 newSpec - newCommittedReady <= pendingAllowance
 ```
 
-This bounded window is what permits pipelining across slow pod starts. It does
-not grant every role the unscaled `MaxSurge + MaxUnavailable` sum.
-If independent pending bounds would separate role progress by more than
-`largestReplicaFraction`, faster roles wait at that coordination boundary.
+This bounded window is what permits pipelining across slow pod starts. It does not grant every role the unscaled `MaxSurge + MaxUnavailable` sum. If independent pending bounds would separate role progress by more than `largestReplicaFraction`, faster roles wait at that coordination boundary.
 
 #### Reconcile ordering and completion
 
-One plan may contain both an old-side drain and new-side growth. The executor
-applies the floor-safe old drain first and then grows the new revision, so the
-two API updates cannot create a transient surge violation. If readiness or
-capacity prevents either mutation, the controller requeues rather than
-mistaking the no-op for completion.
+One plan may contain both an old-side drain and new-side growth. The executor applies the floor-safe old drain first and then grows the new revision, so the two API updates cannot create a transient surge violation. If readiness or capacity prevents either mutation, the controller requeues rather than mistaking the no-op for completion.
 
-Interrupted rollouts drain old revisions newest first. A revision is retired
-as soon as all of its role Specs are zero; stale status from its terminating
-pods neither blocks the next older revision nor contributes availability.
-Where possible, the executor retires all roles in one revision together. If
-only some roles can be retired while another role can make a partial drain, it
-keeps the retiring roles alive and takes the partial drain first. If neither a
-coordinated retirement nor a partial drain can make progress, no new growth can
-be issued, and no issued new replicas are pending readiness, it may take an
-already-budgeted per-role drain to avoid a permanent zero-surge deadlock. This
-fallback still respects every role's availability floor, but it can leave an
-old revision without all of its roles. Such an incomplete revision is not
-independently routable: traffic management must derive usable revision capacity
-from the least-available required role.
+Interrupted rollouts drain old revisions newest first. A revision is retired as soon as all of its role Specs are zero; stale status from its terminating pods neither blocks the next older revision nor contributes availability. Where possible, the executor retires all roles in one revision together. If only some roles can be retired while another role can make a partial drain, it keeps the retiring roles alive and takes the partial drain first. If neither a coordinated retirement nor a partial drain can make progress, no new growth can be issued, and no issued new replicas are pending readiness, it may take an already-budgeted per-role drain to avoid a permanent zero-surge deadlock. This fallback still respects every role's availability floor, but it can leave an old revision without all of its roles. Such an incomplete revision is not independently routable: traffic management must derive usable revision capacity from the least-available required role.
 
-A rollout is complete only when every old role Spec is zero, every new role
-Spec has reached its target, and every new role has at least its target number
-of committed Ready replicas.
+A rollout is complete only when every old role Spec is zero, every new role Spec has reached its target, and every new role has at least its target number of committed Ready replicas.
 
 ### Example: Pipelining an 8P/4D Rollout
 
-Consider a template-only update with `MaxSurge=2` and
-`MaxUnavailable=2`. Both sides have eight steps:
+Consider a template-only update with `MaxSurge=2` and `MaxUnavailable=2`. Both sides have eight steps:
 
 ```
 smallestReplicaFraction = 1/8
@@ -295,8 +263,7 @@ availabilityFloor(P/D)  = 6/2
 surgeCeiling(P/D)       = 10/6
 ```
 
-If every issued replica becomes Ready before the next observation, the Spec
-trajectory can be:
+If every issued replica becomes Ready before the next observation, the Spec trajectory can be:
 
 | Observation | Old P | Old D | New P | New D |
 |-------------|------:|------:|------:|------:|
@@ -306,17 +273,9 @@ trajectory can be:
 | 3           | 2 | 1 | 6 | 3 |
 | 4           | 0 | 0 | 8 | 4 |
 
-The observations are planner checkpoints, not a promise that every cluster
-will expose exactly this sequence. Readiness, API observations, and
-interrupted updates may introduce additional reconciles.
+The observations are planner checkpoints, not a promise that every cluster will expose exactly this sequence. Readiness, API observations, and interrupted updates may introduce additional reconciles.
 
-The pending window changes the slow-start case materially. After observation
-1, suppose the new `2P/1D` is still unready. The next reconcile may still
-issue up to `4P/2D` because that is the proportional pending allowance. It
-may drain only availability that is actually committed; it cannot count those
-unready replicas, or stale Ready status above an already-reduced Spec, toward
-the floor. Once Ready advances, pending capacity opens and the pipeline
-continues.
+The pending window changes the slow-start case materially. After observation 1, suppose the new `2P/1D` is still unready. The next reconcile may still issue up to `4P/2D` because that is the proportional pending allowance. It may drain only availability that is actually committed; it cannot count those unready replicas, or stale Ready status above an already-reduced Spec, toward the floor. Once Ready advances, pending capacity opens and the pipeline continues.
 
 ### Service Orchestration
 
@@ -328,10 +287,7 @@ Headless Services are automatically created for each role per revision. This all
 
 ### Controller Architecture
 
-The controller is stateless: all state is derived from observed resources. An
-`intended-replicas` annotation tracks each revision's completed replica target
-across rolling updates. Owner references on managed LeaderWorkerSets and
-Services ensure proper garbage collection.
+The controller is stateless: all state is derived from observed resources. An `intended-replicas` annotation tracks each revision's completed replica target across rolling updates. Owner references on managed LeaderWorkerSets and Services ensure proper garbage collection.
 
 ### Test Plan
 
@@ -342,8 +298,7 @@ to implement this enhancement.
 #### Unit tests
 
 - Rolling update planner: step computation, edge cases, constraint violations
-- Executor: Spec/Ready separation, pending bounds, availability-safe drains,
-  slow-role readiness, coordinated retirement, and newest-first retirement
+- Executor: Spec/Ready separation, pending bounds, availability-safe drains, slow-role readiness, coordinated retirement, and newest-first retirement
 - Service manager: creation conditions, cleanup logic
 - API validation: role count, unique names, replica constraints
 

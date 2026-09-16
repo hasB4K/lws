@@ -195,7 +195,7 @@ oldAtStep(k) = ceil(initialOld * (oldSideSteps - k) / oldSideSteps)
 
 The controller uses the role that has made the least progress to select the next shared checkpoint. It then calculates the replica count for every role at that checkpoint. Ceiling division keeps each old role above zero until the final checkpoint. It also prevents a smaller role from getting more than one replica's worth of progress ahead.
 
-The following diagram shows every old-side step from the intended replica counts to zero. Each column is one fractional step. The coordination window is frozen over steps 4 through 6 for illustration. Decode is currently at step 4 and Prefill is currently at step 5.
+The following diagram shows every old-side step from the intended replica counts to zero. Each column is one fractional step. The coordination window is frozen over steps 4 through 6 for illustration. Roles do not need to occupy the same step. Fractional lockstep only requires them to remain within the same window. Decode is currently the least-advanced role at step 4, so it sets the lower edge. Prefill is one step ahead at step 5.
 
 ```
 Frozen window: steps 4 through 6
@@ -205,10 +205,10 @@ fractional step    0 ---  1  ---  2  ---  3  --- [ 4  ---  5  ---  6 ] ---  7  -
 Prefill remaining  8 ---  7  ---  6  ---  5  --- [ 4  --- 3*  ---  2 ] ---  1  --- 0
 Decode remaining   4 ---  4  ---  3  ---  3  --- [2*  ---  2  ---  1 ] ---  1  --- 0
 
-* = current position
+* = current role position inside the frozen window
 ```
 
-The distance between adjacent columns is `1/8`, the `smallestReplicaFraction`. The frozen window is two columns wide, or `2/8 = 1/4`, the `largestReplicaFraction`. Prefill can advance alone from step 5 to step 6. Decode changes by one replica between steps 4 and 6, so it can also advance alone to step 6. Neither role can move beyond step 6 until the least-advanced role moves and the window is recalculated.
+The distance between adjacent columns is `1/8`, the `smallestReplicaFraction`. The frozen window is two columns wide, or `2/8 = 1/4`, the `largestReplicaFraction`. While Decode remains at step 4, Prefill can advance alone from step 5 to step 6 because step 6 is still within that window. It cannot advance beyond step 6 while Decode stays at step 4. Decode changes by one replica between steps 4 and 6, so its next move takes it directly to step 6. The controller then recalculates the window from the new least-advanced role. If Prefill is still at step 5, the window becomes steps 5 through 7. If Prefill has already reached step 6, both roles are at step 6 and the window becomes steps 6 through 8.
 
 This moving window is the fractional-lockstep guarantee. Roles can move by different replica counts, and their API updates are not atomic. Readiness, surge, and availability limits may make the executable part of the window smaller. To keep a zero-surge rollout moving, the controller may sometimes drain one old role beyond the normal old-side window, but that drain must still stay above the role's availability floor. `MaxSurge` and `MaxUnavailable` are enforced independently for each role. They do not provide an atomic availability guarantee across roles.
 

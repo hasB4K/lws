@@ -602,15 +602,19 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 				By("tracking rollout states")
 				// Exact planner steps are covered by planner unit tests. An e2e
 				// poll can observe the controller between two LWS updates, so record
-				// the distinct Spec states and validate safety properties instead.
+				// distinct Spec states and validate observable Spec invariants instead.
+				// Exact availability decisions require the snapshot seen by the
+				// controller and are covered by deterministic unit tests.
 				observations := []rolloutObservation{initialObservation}
 				lastState := initialObservation.Spec
+				finalObservation := rolloutObservation{}
 
 				// Poll rapidly to capture states
 				finalState := rolloutState{NewPrefill: tc.TargetPrefill, NewDecode: tc.TargetDecode}
 				Eventually(func(g Gomega) bool {
 					observation, err := getCurrentRolloutObservation(deploymentName, oldRevision)
 					g.Expect(err).NotTo(HaveOccurred())
+					finalObservation = observation
 					state := observation.Spec
 
 					// Record state if it's different from the last one
@@ -620,9 +624,13 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 						lastState = state
 					}
 
-					// Check if we've reached the final state
-					return state.Equals(finalState)
-				}, 5*time.Minute, 100*time.Millisecond).Should(BeTrue(), "should reach final state")
+					// Reaching the final Spec does not mean the rollout is Ready yet.
+					// Wait for committed Ready capacity as well so a transient readiness
+					// loss after the final scale operation does not end the test early.
+					return state.Equals(finalState) &&
+						observation.NewReadyPrefill == tc.TargetPrefill &&
+						observation.NewReadyDecode == tc.TargetDecode
+				}, 5*time.Minute, 100*time.Millisecond).Should(BeTrue(), "should reach the final Spec and Ready state")
 
 				By("verifying rollout invariants over every observed Spec state")
 				_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Rollout Summary ===\n")
@@ -634,6 +642,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 					OldDecode:  tc.SourceDecode,
 				}), "initial state should match")
 				Expect(observations[len(observations)-1].Spec).To(Equal(finalState), "final state should match")
+				Expect(finalObservation.NewReadyPrefill).To(Equal(tc.TargetPrefill), "final prefill should be Ready")
+				Expect(finalObservation.NewReadyDecode).To(Equal(tc.TargetDecode), "final decode should be Ready")
 			})
 		}
 	})
@@ -1181,12 +1191,10 @@ func assertRolloutObservations(tc rolloutTestCase, observations []rolloutObserva
 	GinkgoHelper()
 	Expect(observations).NotTo(BeEmpty())
 
-	prefillSurge, prefillUnavailable := rolloutBudgets(tc.PrefillSurge, tc.PrefillUnavail, tc.TargetPrefill)
-	decodeSurge, decodeUnavailable := rolloutBudgets(tc.DecodeSurge, tc.DecodeUnavail, tc.TargetDecode)
+	prefillSurge := rolloutSurge(tc.PrefillSurge, tc.PrefillUnavail, tc.TargetPrefill)
+	decodeSurge := rolloutSurge(tc.DecodeSurge, tc.DecodeUnavail, tc.TargetDecode)
 	prefillCeiling := max(tc.SourcePrefill, tc.TargetPrefill) + prefillSurge
 	decodeCeiling := max(tc.SourceDecode, tc.TargetDecode) + decodeSurge
-	prefillFloor := max(0, min(tc.SourcePrefill, tc.TargetPrefill)-prefillUnavailable)
-	decodeFloor := max(0, min(tc.SourceDecode, tc.TargetDecode)-decodeUnavailable)
 
 	for i, observation := range observations {
 		state := observation.Spec
@@ -1196,10 +1204,6 @@ func assertRolloutObservations(tc rolloutTestCase, observations []rolloutObserva
 			"prefill surge ceiling exceeded at state %s", state)
 		Expect(state.OldDecode+state.NewDecode).To(BeNumerically("<=", decodeCeiling),
 			"decode surge ceiling exceeded at state %s", state)
-		Expect(observation.OldReadyPrefill+observation.NewReadyPrefill).To(BeNumerically(">=", prefillFloor),
-			"prefill availability floor crossed at state %s", state)
-		Expect(observation.OldReadyDecode+observation.NewReadyDecode).To(BeNumerically(">=", decodeFloor),
-			"decode availability floor crossed at state %s", state)
 
 		if i > 0 {
 			previous := observations[i-1].Spec
@@ -1231,27 +1235,24 @@ func assertRolloutObservations(tc rolloutTestCase, observations []rolloutObserva
 	}
 }
 
-func rolloutBudgets(surgeValue, unavailableValue intstr.IntOrString, replicas int) (int, int) {
+func rolloutSurge(surgeValue, unavailableValue intstr.IntOrString, replicas int) int {
 	GinkgoHelper()
 	surge, err := intstr.GetScaledValueFromIntOrPercent(&surgeValue, replicas, true)
 	Expect(err).NotTo(HaveOccurred())
 	unavailable, err := intstr.GetScaledValueFromIntOrPercent(&unavailableValue, replicas, false)
 	Expect(err).NotTo(HaveOccurred())
-	if unavailable > 0 {
-		return surge, unavailable
+	if surge > 0 || unavailable > 0 {
+		return surge
 	}
-	if surge > 0 {
-		return surge, 0
-	}
-	return 1, 0
+	return 1
 }
 
 // getCurrentRolloutObservation returns both the issued Spec footprint and the
-// Ready capacity committed to that footprint. Ready is capped at Spec per LWS
-// so terminating replicas from an earlier scale-down are not counted twice.
+// Ready capacity committed to that footprint. Status can lag after a scale-down,
+// so replicas above Spec are reserved from Ready before Ready is capped at Spec.
 func getCurrentRolloutObservation(deploymentName, oldRevision string) (rolloutObservation, error) {
 	output, err := kubectl.LWS(deploymentName).
-		JSONPath(`{range .items[*]}{.metadata.labels.disaggregatedset\.x-k8s\.io/revision},{.metadata.labels.disaggregatedset\.x-k8s\.io/role},{.spec.replicas},{.status.readyReplicas}{"\n"}{end}`).
+		JSONPath(`{range .items[*]}{.metadata.labels.disaggregatedset\.x-k8s\.io/revision},{.metadata.labels.disaggregatedset\.x-k8s\.io/role},{.spec.replicas},{.status.replicas},{.status.readyReplicas}{"\n"}{end}`).
 		RunQuiet()
 	if err != nil {
 		return rolloutObservation{}, err
@@ -1260,21 +1261,29 @@ func getCurrentRolloutObservation(deploymentName, oldRevision string) (rolloutOb
 	observation := rolloutObservation{}
 	for _, line := range kubectl.GetNonEmptyLines(output) {
 		parts := strings.Split(line, ",")
-		if len(parts) != 4 {
+		if len(parts) != 5 {
 			return rolloutObservation{}, fmt.Errorf("unexpected rollout observation %q", line)
 		}
 		spec, err := strconv.Atoi(parts[2])
 		if err != nil {
 			return rolloutObservation{}, fmt.Errorf("parse spec in rollout observation %q: %w", line, err)
 		}
-		ready := 0
+		statusReplicas := 0
 		if parts[3] != "" && parts[3] != "<no value>" {
-			ready, err = strconv.Atoi(parts[3])
+			statusReplicas, err = strconv.Atoi(parts[3])
+			if err != nil {
+				return rolloutObservation{}, fmt.Errorf("parse status replicas in rollout observation %q: %w", line, err)
+			}
+		}
+		ready := 0
+		if parts[4] != "" && parts[4] != "<no value>" {
+			ready, err = strconv.Atoi(parts[4])
 			if err != nil {
 				return rolloutObservation{}, fmt.Errorf("parse ready count in rollout observation %q: %w", line, err)
 			}
 		}
-		ready = min(ready, spec)
+		pendingDrain := max(0, statusReplicas-spec)
+		ready = min(spec, max(0, ready-pendingDrain))
 
 		isOld := parts[0] == oldRevision
 		switch parts[1] {

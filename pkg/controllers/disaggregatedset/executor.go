@@ -199,9 +199,7 @@ func (executor *RollingUpdateExecutor) reconcileExistingRollout(
 			}
 			continue
 		}
-		selectedRevision = candidate
-		selectedState = state
-		selectedStep = step
+		selectedRevision, selectedState, selectedStep = candidate, state, step
 		break
 	}
 	if selectedStep == nil {

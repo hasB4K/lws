@@ -121,7 +121,7 @@ type rolloutSnapshot []roleRolloutSnapshot
 
 // ComputeNextStep returns the furthest executable targets in the intersection
 // of all rollout constraints. When that intersection contains no mutation, it
-// may return a marked bootstrap-surge step for a missing target role. If a
+// may return a marked bootstrap-surge step for a blocked target role. If a
 // target role is scheduler-unschedulable, it may instead return a marked drain
 // using one additional unavailable replica. Partial drains, whole-revision
 // retirement, and replacement growth are planner decisions; the executor does

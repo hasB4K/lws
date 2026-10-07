@@ -150,7 +150,8 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 	}
 	n := len(state.Config)
 	beforeServing, afterServing, beforeRole, afterRole := make([]int, n), make([]int, n), make([]int, n), make([]int, n)
-	for _, rev := range revisions {
+	parkedServing := make([]int, n)
+	for revisionIndex, rev := range revisions {
 		for phase := range 2 {
 			spec, ready := slices.Clone(rev.spec), slices.Clone(rev.ready)
 			if phase == 1 {
@@ -178,6 +179,9 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 				if serving && required {
 					if phase == 0 {
 						beforeServing[i] += ready[i]
+						if revisionIndex >= 2 {
+							parkedServing[i] += ready[i]
+						}
 					} else {
 						afterServing[i] += ready[i]
 					}
@@ -185,6 +189,21 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 			}
 		}
 	}
+	phaseTargets, growing, oldProgress, oldNext := make([]int, n), make([]int, n), make([]int, n), make([]int, n)
+	steps := 0
+	for i := range state.Config {
+		phaseTargets[i] = state.Target.DesiredReplicas[i] - parkedServing[i]
+		if state.Target.DesiredReplicas[i] > 0 {
+			phaseTargets[i] = max(1, phaseTargets[i])
+		}
+		phaseTargets[i] = max(state.Target.SpecReplicas[i], phaseTargets[i])
+		growing[i] = max(state.Target.SpecReplicas[i], step.New[i])
+		oldProgress[i] = state.ActiveOld.InitialReplicas[i] - state.ActiveOld.SpecReplicas[i]
+		oldNext[i] = state.ActiveOld.InitialReplicas[i] - step.Past[i]
+		steps = max(steps, state.ActiveOld.InitialReplicas[i], state.Target.DesiredReplicas[i])
+	}
+	assertMovingWindow(t, state.Target.SpecReplicas, phaseTargets, growing)
+	assertMovingWindow(t, oldProgress, state.ActiveOld.InitialReplicas, oldNext)
 	for i, config := range state.Config {
 		floor := max(0, state.Target.DesiredReplicas[i]-config.MaxUnavailable)
 		if step.UsesUnavailableFallback && floor > 1 {
@@ -202,10 +221,38 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 		}
 		if step.New[i] > state.Target.SpecReplicas[i] {
 			ceiling := state.Target.DesiredReplicas[i] + config.MaxSurge
+			budget := config.MaxSurge + config.MaxUnavailable
 			if step.UsesBootstrapSurge {
 				ceiling = max(ceiling+1, old+1)
+				budget = max(config.MaxSurge+1, old-state.Target.DesiredReplicas[i]+1) + config.MaxUnavailable
 			}
 			require.LessOrEqual(t, old+step.New[i], ceiling)
+			if old > 0 {
+				count := max(state.ActiveOld.InitialReplicas[i], state.Target.DesiredReplicas[i])
+				allowance := (count*budget + steps - 1) / steps
+				require.LessOrEqual(t, step.New[i], state.Target.ReadyReplicas[i]+allowance)
+			}
+		}
+	}
+}
+
+// Independent fractional oracle: an existing skew is tolerated, but a role
+// that advances may not pass the slowest proposed fraction plus one slot of
+// the smallest positive role. Floating point is exact enough for these tiny
+// test states, and intentionally differs from production integer arithmetic.
+func assertMovingWindow(t *testing.T, current, counts, proposed []int) {
+	t.Helper()
+	least, width := 1.0, 0.0
+	for i, count := range counts {
+		if count > 0 {
+			least = min(least, float64(proposed[i])/float64(count))
+			width = max(width, 1.0/float64(count))
+		}
+	}
+	for i, count := range counts {
+		if count > 0 && proposed[i] > current[i] {
+			require.LessOrEqual(t, float64(proposed[i])/float64(count), least+width+1e-9,
+				"coordination current=%v counts=%v proposed=%v", current, counts, proposed)
 		}
 	}
 }

@@ -347,9 +347,42 @@ func TestScaleRejectsConcurrentReplicaChange(t *testing.T) {
 		},
 	})
 	ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{})
-	err := NewLeaderWorkerSetManager(c).Scale(t.Context(), ds, lws.Name, 2)
+	err := NewLeaderWorkerSetManager(c).Scale(t.Context(), ds, lws, 2)
 	require.True(t, apierrors.IsConflict(err), "stale scale write must conflict: %v", err)
 	assert.EqualValues(t, 3, getTestLWSReplicas(base, testNamespace, lws.Name))
+}
+
+func TestScaleRequiresObservedIdentityAndSpec(t *testing.T) {
+	for _, change := range []string{"smaller Spec", "larger Spec", "generation", "replacement", "deleting", "status only"} {
+		t.Run(change, func(t *testing.T) {
+			observed := revisionLWS("A", testRolePrefill, 4, 4, time.Now(), 4)
+			live := observed.DeepCopy()
+			switch change {
+			case "smaller Spec":
+				live.Spec.Replicas = ptr.To[int32](1)
+			case "larger Spec":
+				live.Spec.Replicas = ptr.To[int32](6)
+			case "generation":
+				live.Generation++
+			case "replacement":
+				live.UID = "replacement"
+			case "deleting":
+				live.DeletionTimestamp, live.Finalizers = ptr.To(metav1.Now()), []string{"test/hold"}
+			case "status only":
+				live.Status.ReadyReplicas = 3
+			}
+			c := newTestClient(live)
+			ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{})
+			err := NewLeaderWorkerSetManager(c).Scale(t.Context(), ds, observed, 3)
+			if change == "status only" {
+				require.NoError(t, err)
+				assert.EqualValues(t, 3, getTestLWSReplicas(c, testNamespace, live.Name))
+			} else {
+				require.True(t, apierrors.IsConflict(err), "changed scale input must retry: %v", err)
+				assert.Equal(t, getLWSReplicas(live), getTestLWSReplicas(c, testNamespace, live.Name))
+			}
+		})
+	}
 }
 
 func TestScaleDoesNotMistakeStaleSpecForCompletedDrain(t *testing.T) {
@@ -365,7 +398,7 @@ func TestScaleDoesNotMistakeStaleSpecForCompletedDrain(t *testing.T) {
 	manager := NewLeaderWorkerSetManager(cached)
 	manager.apiReader = base
 	ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{})
-	require.NoError(t, manager.Scale(t.Context(), ds, lws.Name, 3))
+	require.NoError(t, manager.Scale(t.Context(), ds, lws, 3))
 	assert.EqualValues(t, 3, getTestLWSReplicas(base, testNamespace, lws.Name), "apply a drain before reusing its surge slot")
 }
 
@@ -384,7 +417,7 @@ func TestManagerScale(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		err := manager.Scale(context.Background(), ds, "test-lws", 5)
+		err := manager.Scale(context.Background(), ds, existingLWS, 5)
 
 		require.NoError(t, err)
 	})
@@ -398,7 +431,7 @@ func TestManagerScale(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		err := manager.Scale(context.Background(), ds, "test-lws", 5)
+		err := manager.Scale(context.Background(), ds, existingLWS, 5)
 
 		require.NoError(t, err)
 	})
@@ -409,7 +442,7 @@ func TestManagerScale(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		err := manager.Scale(context.Background(), ds, "nonexistent", 5)
+		err := manager.Scale(context.Background(), ds, buildOwnedManagerTestLWS("nonexistent", 1, ds), 5)
 
 		require.Error(t, err)
 	})
@@ -428,7 +461,7 @@ func TestManagerScale(t *testing.T) {
 			Build()
 
 		manager := NewLeaderWorkerSetManager(fakeClient)
-		err := manager.Scale(context.Background(), ds, "test-lws", 5)
+		err := manager.Scale(context.Background(), ds, foreignLWS, 5)
 		require.Error(t, err, "scaling a foreign-owned LWS must be refused")
 
 		var got leaderworkersetv1.LeaderWorkerSet

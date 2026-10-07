@@ -91,7 +91,7 @@ var _ = Describe("Scaling During a Rolling Update", func() {
 			g.Expect(obs.Spec.OldPrefill).To(BeNumerically("<", raised.Spec.OldPrefill))
 			g.Expect(obs.Spec.OldPrefill).To(BeNumerically(">", 0))
 			g.Expect(obs.NewReadyPrefill + obs.NewReadyDecode).To(BeZero())
-			g.Expect(obs.OldReadyPrefill).To(BeNumerically(">=", 3)) // ceil(25% of 5)=2 unavailable.
+			g.Expect(obs.OldReadyPrefill).To(BeNumerically(">=", 4)) // floor(25% of 5)=1 unavailable.
 		}, 3*time.Minute, time.Second).Should(Succeed())
 
 		By("releasing readiness, including later batches, and reaching the exact latest target")

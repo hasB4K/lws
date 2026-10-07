@@ -18,6 +18,7 @@ package disaggregatedset
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"slices"
 	"testing"
@@ -25,7 +26,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
+	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	disaggregatedsetutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 )
 
@@ -322,4 +327,58 @@ func TestScalingDuringRolloutPrefersAnyOldDrainOverTargetShrink(t *testing.T) {
 	assertRevisionReplicas(t, c, "hashA", [2]int32{2, 2})
 	assertRevisionReplicas(t, c, "hashB", [2]int32{})
 	assertRevisionReplicas(t, c, "hashC", [2]int32{3, 3})
+}
+
+func TestScalingDuringRolloutExposesLatestExternalTarget(t *testing.T) {
+	ds := newTwoRoleTestDisaggregatedSet([2]int32{2, 2}, [2]int{1, 1}, [2]int{})
+	ds.Spec.Roles[0].Scaling = &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal}
+	old := disaggregatedsetutils.RevisionRolesList{{Revision: "old", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+		testRolePrefill: revisionLWS("old", testRolePrefill, 2, 2, time.Now(), 2),
+	}}}
+	target := disaggregatedsetutils.RevisionRoles{Revision: "target", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{
+		testRolePrefill: revisionLWS("target", testRolePrefill, 5, 0, time.Now(), 5),
+	}}
+	readTarget := func() []int {
+		return rolloutTargetReplicas(ds, []string{testRolePrefill}, sets.New(testRolePrefill), old, target, map[string]int{testRolePrefill: 2})
+	}
+	assert.Equal(t, []int{5}, readTarget(), "default keeps the in-flight External target")
+	ds.Spec.ScalingPolicy = &disaggregatedsetv1.DisaggregatedSetScalingPolicy{DuringRollout: disaggregatedsetv1.ScalingDuringRolloutPolicyAdvanceRollout}
+	assert.Equal(t, []int{2}, readTarget(), "opt-in exposes the actual RoleScaler target")
+}
+
+func TestScalingDuringRolloutAppliesTargetDrainBeforeGrowth(t *testing.T) {
+	for _, failDrain := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail-drain=%v", failDrain), func(t *testing.T) {
+			objects := revisionLWSObjects("target", [2]int32{4, 8}, [2]int32{4, 8}, [2]int32{4, 8}, time.Now())
+			c := newTestClient(objects...)
+			var writes []string
+			observed := interceptor.NewClient(c, interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				lws := obj.(*leaderworkersetv1.LeaderWorkerSet)
+				writes = append(writes, fmt.Sprintf("%s=%d", lws.Labels[disaggregatedsetv1.RoleLabelKey], getLWSReplicas(lws)))
+				if failDrain {
+					return fmt.Errorf("injected drain failure")
+				}
+				return c.Patch(ctx, obj, patch, opts...)
+			}})
+			ds := newTwoRoleTestDisaggregatedSet([2]int32{8, 4}, [2]int{1, 1}, [2]int{})
+			executor := newTestExecutor(observed)
+			_, target, err := executor.LWSManager.GetRevisionRolesList(context.Background(), ds, 0, "target")
+			require.NoError(t, err)
+			require.NotNil(t, target)
+			state := rolloutState([]int{0, 0}, []int{0, 0}, []int{0, 0}, nil, nil,
+				[]int{4, 8}, []int{4, 8}, []int{8, 4}, configs([]int{1, 1}, []int{0, 0}))
+			state.ScaleDuringRollout = true
+			inputs := rolloutInputs{allRoleNames: testRoleNames(), targetRoleNames: testRoleNames(), scaleDuringRollout: true}
+			err = executor.applyRolloutStep(context.Background(), ds, *target, inputs, disaggregatedsetutils.RevisionRoles{}, state, ComputeNextStep(state))
+			if failDrain {
+				require.ErrorContains(t, err, "injected drain failure")
+				assert.Equal(t, []string{"decode=4"}, writes, "do not issue growth after a failed reduction")
+				assertRevisionReplicas(t, c, "target", [2]int32{4, 8})
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"decode=4", "prefill=8"}, writes)
+				assertRevisionReplicas(t, c, "target", [2]int32{8, 4})
+			}
+		})
+	}
 }

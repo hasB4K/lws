@@ -132,6 +132,23 @@ func TestTargetDrainUsesRetainedNotRawReadiness(t *testing.T) {
 	require.Error(t, validateUpdateStep(state, step), "the executor independently rejects opt-out target shrink")
 }
 
+func TestMovingTargetUnschedulableFallbackUsesLatestSurgeCeiling(t *testing.T) {
+	state := rolloutState([]int{8, 8}, []int{4, 4}, []int{3, 3}, nil, nil,
+		[]int{1, 1}, []int{0, 0}, []int{3, 3}, configs([]int{1, 1}, []int{0, 0}))
+	state.ScaleDuringRollout = true
+	require.Nil(t, ComputeNextStep(state), "wait for the issued target group rather than stacking emergency slots")
+	// Old+target Spec is 5: above the latest ceiling 3+1, but below
+	// the historical ceiling 8+1. Only scheduler rejection permits a fallback.
+	state.Target.UnschedulableRoles = []bool{true, false}
+	step := ComputeNextStep(state)
+	require.NotNil(t, step)
+	assert.True(t, step.UsesUnavailableFallback)
+	assert.Equal(t, []int{3, 3}, step.Past)
+	assert.Equal(t, []int{1, 1}, step.New)
+	require.NoError(t, validateUpdateStep(state, step))
+	assertScalingSafety(t, state, step)
+}
+
 // This oracle does not call the production availability or validator helpers.
 // Treat every newly deleted replica as Ready, remove unusable revisions, then
 // check serving capacity and each structurally complete role independently.

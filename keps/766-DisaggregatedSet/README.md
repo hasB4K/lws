@@ -174,7 +174,7 @@ If an old LWS does not have a valid `initial-replicas` annotation, the controlle
 
 Suppose a rollout from revision A to revision B is interrupted by revision C. Both A and B are now old. The controller processes only one of them at a time. Revisions with no Ready replicas are preferred. The remaining candidates are ordered newest first. The controller asks the planner about candidates in that order and selects the first candidate with a safe executable action. A blocked B therefore does not prevent a movable A from making progress.
 
-While B is active, A is parked and remains unchanged. Fractional planning uses B's own `initial-replicas` value as `initialOld` and B's current Spec as `activeOldSpec`. Ready replicas in A reduce how much of C is needed during this phase. After B reaches zero, A becomes active and the controller plans the A to C phase. The controller never combines the `initial-replicas` values from A and B.
+While B is active, A is parked and remains unchanged. Fractional planning uses B's own `initial-replicas` value as `initialOld` and B's current Spec as `activeOldSpec`. Ready replicas in A reduce how much of C is needed during this phase. After B reaches zero, A becomes active and the controller plans the A to C phase. The controller never sums the `initial-replicas` values from A and B. For availability only, it takes their per-role maximum so selecting a smaller drain candidate cannot weaken `maxUnavailable`.
 
 Parking does not remove A from safety accounting. The planner includes the Spec of every old revision when enforcing surge. It includes a revision's Ready replicas in available capacity only when every role required by that revision has at least one Ready replica.
 
@@ -214,15 +214,21 @@ The controller distinguishes LWS `Spec` replicas (work already issued, including
 
 Spec drives the planner's progress calculation. Re-planning from Ready would request the same work again on every reconcile while a pod is starting. Ready instead controls how much additional work may be in flight, whether an old replica can be removed safely, and whether the rollout is complete.
 
-Status can temporarily remain higher than Spec after a scale-down. The controller does not know which replicas the LWS controller will delete. It reserves every replica above Spec before counting committed availability:
+Status counters can lag a scale-down or report terminating groups as Ready.
+The controller uses `replicagroups.Observe` with an uncached API reader and
+`Snapshot.Availability()` to obtain raw whole-group Ready capacity and retained
+Ready credit. Only retained credit can authorize another drain; raw readiness
+remains visible to protect the no-worsening floor.
 
-```
-pendingDrain   = max(0, status.replicas - spec.replicas)
-committedReady = min(spec.replicas,
-                     max(0, status.readyReplicas - pendingDrain))
-```
+The shared helper checks ownership and native acknowledgements, excludes
+terminating groups from retained credit, and accounts for outstanding removals
+for both Ordinal and Hash identity. Increasing Spec on rollback does not restore
+credit to terminating Pods. Safe growth need not wait for every deletion to finish.
 
-This prevents a replica already committed to deletion from authorizing another drain. The controller guarantees that a drain is safe for the snapshot it observed. It cannot prevent an unrelated pod from losing readiness after that observation.
+If the LWS disappears, is replaced, starts deleting, or changes generation between
+discovery and observation, the executor retries without planning: unknown is not
+zero readiness. No downscale marker or availability summary is persisted. These
+ordered reads are not an atomic snapshot or a reservation against later failures.
 
 Readiness is also revision-aware. A revision contributes its committed Ready counts only when every required role has at least one; otherwise it contributes zero for every role.
 
@@ -233,14 +239,19 @@ For example, a target revision with `0P/2D` Ready contributes `0P/0D` usable cap
 `MaxSurge` and `MaxUnavailable` are the per-role limits for ordinary rollout steps. The two bounded deadlock fallbacks are described below. For each role the ordinary planner enforces:
 
 ```
-roleReplicaCount  = max(initialOld, target)
-surgeCeiling      = roleReplicaCount + MaxSurge
-availabilityFloor = max(0, min(initialOld, target) - MaxUnavailable)
+roleReplicaCount    = max(initialOld, target)
+availabilityBaseline = max(initial-replicas across non-drained old revisions)
+surgeCeiling        = roleReplicaCount + MaxSurge
+availabilityFloor   = max(0, min(availabilityBaseline, target) - MaxUnavailable)
 
 oldSpec + newSpec <= surgeCeiling
 ```
 
 `oldSpec` includes active and parked old revisions. Existing out-of-bound Spec is never increased.
+
+The availability baseline follows the **current set of non-drained old revisions**; it is not a fixed promise captured at the start of an interrupted rollout. A revision participates while at least one of its role Specs is non-zero. Every candidate considered from the same observation uses the same per-role maximum, so merely switching the active candidate cannot lower the floor. Once all of an old revision's role Specs reach zero, it stops contributing to that maximum, whether or not its LWS objects have been deleted. If it carried the largest baseline, the next phase's availability floor may therefore decrease. No separate rollout-wide baseline is persisted; `initial-replicas` remains the per-revision baseline used for fractional coordination.
+
+For example, consider A → B → C with `initial-replicas=1` for A, `initial-replicas=2` for B, a target of 2 for C, `maxSurge=1`, and `maxUnavailable=0`, identically for each role. If A, B, and C each have one Spec and one Ready replica per role, B can retire while A+C retain two Ready replicas. The next A → C phase uses A's baseline of one. A can then retire while C grows from one to two Spec replicas, even if C still has only one Ready replica. This is ordinary phase-local progress, not an emergency-unavailability fallback. Thus `maxUnavailable=0` protects the current phase's floor; it does **not** guarantee a fixed Ready count throughout an A → B → C rollout. Completion still requires C to reach its full target in both Spec and Ready replicas.
 
 For target growth, complete parked revisions reduce the capacity needed during the current active-revision phase. However, each role required by the final target keeps a phase target of at least one replica. This lets the target revision form a complete same-revision unit instead of depending on a counterpart from a parked revision: `phaseTarget = max(currentNewSpec, target - parkedUsableReady, 1)` for required roles.
 
@@ -256,7 +267,12 @@ This bounded window is what permits pipelining across slow pod starts. It does n
 
 The target revision does not need to be complete for its committed Ready count to limit pending work. However, it must be complete before that Ready count can authorize an old drain. The pending-readiness bound applies while any old Spec for that role overlaps the target. Once all old Spec for the role is zero, withholding target replicas cannot protect old availability. The controller may issue the rest of that role's target Spec and then waits for it to become Ready.
 
-For an old drain, the planner assumes every removed Spec replica could have been Ready. If any surviving required role could lose its last Ready replica, the entire active revision becomes unusable for every role. Raw Ready capacity determines how much currently serving capacity must be preserved, capped at the availability floor. The proposed post-drain state is checked with committed Ready capacity, so replicas already pending deletion cannot be counted as survivors. This also prevents an interrupted revision from being retired while its still-running replicas are needed to hold the floor; the controller waits for pending deletions to settle or for another revision to replace that capacity.
+For an old drain, the planner assumes every removed Spec replica could have been Ready. If any surviving required role is absent or could lose its last Ready replica, the entire active revision becomes unusable for every role. Raw Ready capacity determines how much currently serving capacity must be preserved, capped at the current phase's shared availability floor. The proposed post-drain state is checked with committed Ready capacity, so replicas already pending deletion cannot be counted as survivors. This also prevents an interrupted revision from being retired while its still-running replicas are needed to hold the floor; the controller waits for pending deletions to settle or for another revision to replace that capacity.
+
+Per-role readiness is protected separately across all structurally complete
+revisions. A revision with an unready role cannot serve, but its other Ready
+roles may still satisfy their own availability floors while that revision is
+retired as one unit.
 
 Revision completeness is a separate hard constraint. For required roles that are still present in the active old revision, either every role remains at one or more Spec replicas, or every role reaches zero in the same plan. This allows ordinary partial drains and coordinated retirement without a fallback that leaves only part of a revision running.
 

@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -331,6 +332,41 @@ func TestCleanupDrainedLWSRetainsAtMostOneMarker(t *testing.T) {
 			assert.ElementsMatch(t, tc.remainingRevisions, revisions)
 		})
 	}
+}
+
+func TestScaleRejectsConcurrentReplicaChange(t *testing.T) {
+	lws := revisionLWS("A", testRolePrefill, 4, 4, time.Now(), 4)
+	base := newTestClient(lws)
+	c := interceptor.NewClient(base, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			current := &leaderworkersetv1.LeaderWorkerSet{}
+			require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(obj), current))
+			current.Spec.Replicas = ptr.To[int32](3)
+			require.NoError(t, c.Update(ctx, current))
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{})
+	err := NewLeaderWorkerSetManager(c).Scale(t.Context(), ds, lws.Name, 2)
+	require.True(t, apierrors.IsConflict(err), "stale scale write must conflict: %v", err)
+	assert.EqualValues(t, 3, getTestLWSReplicas(base, testNamespace, lws.Name))
+}
+
+func TestScaleDoesNotMistakeStaleSpecForCompletedDrain(t *testing.T) {
+	lws := revisionLWS("A", testRolePrefill, 4, 4, time.Now(), 4)
+	base := newTestClient(lws)
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			require.NoError(t, c.Get(ctx, key, obj, opts...))
+			obj.(*leaderworkersetv1.LeaderWorkerSet).Spec.Replicas = ptr.To[int32](3)
+			return nil
+		},
+	})
+	manager := NewLeaderWorkerSetManager(cached)
+	manager.apiReader = base
+	ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{})
+	require.NoError(t, manager.Scale(t.Context(), ds, lws.Name, 3))
+	assert.EqualValues(t, 3, getTestLWSReplicas(base, testNamespace, lws.Name), "apply a drain before reusing its surge slot")
 }
 
 // TestManagerScale tests the manager's Scale method.

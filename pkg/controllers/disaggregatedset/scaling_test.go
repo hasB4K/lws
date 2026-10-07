@@ -149,6 +149,32 @@ func TestMovingTargetUnschedulableFallbackUsesLatestSurgeCeiling(t *testing.T) {
 	assertScalingSafety(t, state, step)
 }
 
+func TestMovingTargetCoordinationBootstrapDoesNotStack(t *testing.T) {
+	state := rolloutState([]int{2, 3}, []int{2, 2}, []int{2, 2}, nil, nil,
+		[]int{4, 2}, []int{4, 2}, []int{6, 4}, configs([]int{2, 0}, []int{0, 2}))
+	state.ScaleDuringRollout = true
+	step := ComputeNextStep(state)
+	require.NotNil(t, step)
+	require.True(t, step.UsesBootstrapSurge)
+	require.Equal(t, []int{6, 3}, step.New)
+
+	// The decode role is now one above its ceiling. Neither repeated
+	// reconciliations nor its new Pod becoming Ready grant a second slot.
+	state.Target.SpecReplicas = slices.Clone(step.New)
+	for _, ready := range [][]int{{4, 2}, {4, 3}} {
+		state.Target.ReadyReplicas = ready
+		state.Target.RawReadyReplicas = slices.Clone(ready)
+		require.Nil(t, ComputeNextStep(state), "ready=%v", ready)
+	}
+	// Once the other role catches up, ordinary retirement releases capacity.
+	state.Target.ReadyReplicas, state.Target.RawReadyReplicas = []int{6, 3}, []int{6, 3}
+	step = ComputeNextStep(state)
+	require.NotNil(t, step)
+	require.False(t, step.UsesBootstrapSurge)
+	require.Equal(t, []int{0, 0}, step.Past)
+	assertScalingSafety(t, state, step)
+}
+
 // This oracle does not call the production availability or validator helpers.
 // Treat every newly deleted replica as Ready, remove unusable revisions, then
 // check serving capacity and each structurally complete role independently.

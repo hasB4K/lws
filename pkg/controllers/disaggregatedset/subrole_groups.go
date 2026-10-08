@@ -151,48 +151,63 @@ func retainedSubRoleEligible(group replicagroups.Group) bool {
 func allocateSubRoleReadiness(groups []replicagroups.Group, counts, readyFloor map[string]int) map[types.UID]string {
 	remaining := maps.Clone(counts)
 	assigned := map[types.UID]string{}
-	keys := slices.Sorted(maps.Keys(remaining))
-	// Reserve Ready floors first, then fill count-only slots. Within either
-	// phase keep existing labels before assigning groups to another child.
-	for _, readyOnly := range []bool{true, false} {
-		need := remaining
-		if readyOnly {
-			need = maps.Clone(readyFloor)
-		}
-		for _, keepLabel := range []bool{true, false} {
-			for _, group := range groups {
-				if _, found := assigned[group.Leader.UID]; found || readyOnly && !retainedSubRoleEligible(group) {
-					continue
-				}
-				choices := keys
-				if keepLabel {
-					choices = []string{group.Leader.Labels[disaggv1.SubRoleLabelKey]}
-				}
-				for _, name := range choices {
-					if need[name] > 0 && remaining[name] > 0 {
-						assigned[group.Leader.UID] = name
-						remaining[name]--
-						if readyOnly {
-							need[name]--
-						}
-						break
-					}
-				}
-			}
-		}
-		if readyOnly {
-			for _, n := range need {
-				if n > 0 {
-					return nil
-				}
-			}
+	readyNeeded := maps.Clone(readyFloor)
+	for name, needed := range readyNeeded {
+		if needed > remaining[name] {
+			return nil
 		}
 	}
+	var readyGroups []replicagroups.Group
+	for _, group := range groups {
+		if retainedSubRoleEligible(group) {
+			readyGroups = append(readyGroups, group)
+		}
+	}
+	// Ready reservations take priority over every count-only assignment.
+	keepSubRoleLabels(readyGroups, readyNeeded, assigned)
+	fillSubRoleAssignments(readyGroups, readyNeeded, assigned)
+	for _, needed := range readyNeeded {
+		if needed > 0 {
+			return nil
+		}
+	}
+	for _, name := range assigned {
+		remaining[name]--
+	}
+	// Fill the remaining count-only slots, again preserving labels first.
+	keepSubRoleLabels(groups, remaining, assigned)
+	fillSubRoleAssignments(groups, remaining, assigned)
 	return assigned
 }
 
-func newSubRolePlan(snapshot *replicagroups.Snapshot, counts map[string]int) *subRolePlan {
-	current, _ := subRoleCounts(snapshot.LWS, subRoleReplicasAnnotation)
+func keepSubRoleLabels(groups []replicagroups.Group, remaining map[string]int, assigned map[types.UID]string) {
+	for _, group := range groups {
+		uid := group.Leader.UID
+		name := group.Leader.Labels[disaggv1.SubRoleLabelKey]
+		if _, found := assigned[uid]; !found && remaining[name] > 0 {
+			assigned[uid] = name
+			remaining[name]--
+		}
+	}
+}
+
+func fillSubRoleAssignments(groups []replicagroups.Group, remaining map[string]int, assigned map[types.UID]string) {
+	keys := slices.Sorted(maps.Keys(remaining))
+	for _, group := range groups {
+		if _, found := assigned[group.Leader.UID]; found {
+			continue
+		}
+		for _, name := range keys {
+			if remaining[name] > 0 {
+				assigned[group.Leader.UID] = name
+				remaining[name]--
+				break
+			}
+		}
+	}
+}
+
+func newSubRolePlan(snapshot *replicagroups.Snapshot, current, counts map[string]int) *subRolePlan {
 	floor := map[string]int{}
 	for _, group := range snapshot.Groups {
 		name, coherent := groupSubRole(group)
@@ -266,21 +281,62 @@ func (m *LeaderWorkerSetManager) patchSubRoleGroup(ctx context.Context, group re
 
 // reconcileSubRolePlan first prepares retained groups, then atomically publishes
 // physical and logical Specs. Native StatefulSet downscale removes the suffix.
-func (m *LeaderWorkerSetManager) reconcileSubRolePlan(ctx context.Context, s *replicagroups.Snapshot, plan *subRolePlan) (bool, error) {
-	lws := s.LWS
-	target := countSubRoles(plan.Counts)
-	armed := plan.Armed
-	groups := s.Groups
-	if !armed && !subRoleNativeSettled(s) {
-		return false, nil
+func (m *LeaderWorkerSetManager) reconcileSubRolePlan(ctx context.Context, s *replicagroups.Snapshot, plan *subRolePlan) error {
+	if !plan.Armed {
+		return m.prepareSubRolePlan(ctx, s, plan)
 	}
-	if armed && int(getLWSReplicas(lws)) != target {
-		return false, fmt.Errorf("LWS %s Spec changed during a sub-role transaction", lws.Name)
+	return m.convergeSubRolePlan(ctx, s, plan)
+}
+
+// Preparation may reassign the retained prefix, but cannot publish its new
+// physical and logical Specs until a fresh observation sees every Pod patch.
+func (m *LeaderWorkerSetManager) prepareSubRolePlan(ctx context.Context, s *replicagroups.Snapshot, plan *subRolePlan) error {
+	if !subRoleNativeSettled(s) {
+		return nil
 	}
 	assignments := subRolePlanAssignments(s, plan)
 	if assignments == nil {
-		return false, nil
+		return nil
 	}
+	if changed, err := m.repairSubRoleAssignments(ctx, s.Groups, assignments); changed || err != nil {
+		return err
+	}
+	target := countSubRoles(plan.Counts)
+	if len(assignments) != min(len(s.Groups), target) {
+		return nil
+	}
+	// Non-nil unarmed assignments already satisfy every Ready floor.
+	return m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) {
+		l.Spec.Replicas = ptr.To(int32(target))
+		setSubRoleJSON(l, subRoleReplicasAnnotation, plan.Counts)
+		plan.Armed = true
+		setSubRoleJSON(l, subRolePlanAnnotation, plan)
+	})
+}
+
+// An armed plan repairs replacement labels before waiting for native
+// acknowledgement. Replacement readiness must never block completion.
+func (m *LeaderWorkerSetManager) convergeSubRolePlan(ctx context.Context, s *replicagroups.Snapshot, plan *subRolePlan) error {
+	target := countSubRoles(plan.Counts)
+	if int(getLWSReplicas(s.LWS)) != target {
+		return fmt.Errorf("LWS %s Spec changed during a sub-role transaction", s.LWS.Name)
+	}
+	assignments := subRolePlanAssignments(s, plan)
+	if assignments == nil {
+		return nil
+	}
+	if changed, err := m.repairSubRoleAssignments(ctx, s.Groups, assignments); changed || err != nil {
+		return err
+	}
+	if len(s.Groups) != target || len(assignments) != target || !subRoleNativeSettled(s) {
+		return nil
+	}
+	return m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) {
+		delete(l.Annotations, subRolePlanAnnotation)
+	})
+}
+
+func (m *LeaderWorkerSetManager) repairSubRoleAssignments(ctx context.Context, groups []replicagroups.Group, assignments map[types.UID]string) (bool, error) {
 	changed := false
 	for _, group := range groups {
 		assignment, retained := assignments[group.Leader.UID]
@@ -289,31 +345,11 @@ func (m *LeaderWorkerSetManager) reconcileSubRolePlan(ctx context.Context, s *re
 		}
 		patched, err := m.patchSubRoleGroup(ctx, group, assignment)
 		if err != nil {
-			return false, err
+			return changed, err
 		}
 		changed = changed || patched
 	}
-	if changed {
-		return false, nil
-	}
-	if !armed {
-		if len(assignments) != min(len(groups), target) {
-			return false, nil
-		}
-		// Non-nil unarmed assignments already satisfy every Ready floor.
-		return false, m.patchSubRoleLWS(ctx, lws, func(l *leaderv1.LeaderWorkerSet) {
-			l.Spec.Replicas = ptr.To(int32(target))
-			setSubRoleJSON(l, subRoleReplicasAnnotation, plan.Counts)
-			plan.Armed = true
-			setSubRoleJSON(l, subRolePlanAnnotation, plan)
-		})
-	}
-	if len(groups) != target || len(assignments) != target || !subRoleNativeSettled(s) {
-		return false, nil
-	}
-	return true, m.patchSubRoleLWS(ctx, lws, func(l *leaderv1.LeaderWorkerSet) {
-		delete(l.Annotations, subRolePlanAnnotation)
-	})
+	return changed, nil
 }
 
 func readSubRolePlan(lws *leaderv1.LeaderWorkerSet) (*subRolePlan, error) {
@@ -358,8 +394,7 @@ func (m *LeaderWorkerSetManager) syncSubRoleGroups(ctx context.Context, lws *lea
 		return nil, false, err
 	}
 	if plan != nil {
-		_, err = m.reconcileSubRolePlan(ctx, s, plan)
-		return s, false, err
+		return s, false, m.reconcileSubRolePlan(ctx, s, plan)
 	}
 	counts, err := subRoleCounts(s.LWS, subRoleReplicasAnnotation)
 	if err != nil || len(counts) == 0 {
@@ -417,8 +452,8 @@ func (m *LeaderWorkerSetManager) scaleSubRoles(ctx context.Context, ds *disaggv1
 	if !metav1.IsControlledBy(s.LWS, ds) || getLWSReplicas(lws) != getLWSReplicas(s.LWS) || !maps.Equal(observedCounts, current) {
 		return errReplicaGroupsPending
 	}
-	if err != nil || maps.Equal(current, counts) {
-		return err
+	if maps.Equal(current, counts) {
+		return nil
 	}
 	// Removing routing is metadata-only. Persist cleanup intent so partial
 	// group patches/restarts cannot restore labels from the previous counts.
@@ -445,7 +480,7 @@ func (m *LeaderWorkerSetManager) scaleSubRoles(ctx context.Context, ds *disaggv1
 	if !subRoleNativeSettled(s) {
 		return errReplicaGroupsPending
 	}
-	plan := newSubRolePlan(s, counts)
+	plan := newSubRolePlan(s, current, counts)
 	if plan == nil {
 		return errReplicaGroupsPending
 	}

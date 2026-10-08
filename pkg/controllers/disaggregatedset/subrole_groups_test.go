@@ -128,11 +128,79 @@ func (f *subRoleFixture) native() {
 	require.NoError(f.t, f.manager.client.Status().Update(ctx, s.LeaderStatefulSet))
 }
 
+func TestSubRoleAllocationPassOrder(t *testing.T) {
+	type group struct {
+		child string
+		ready bool
+	}
+	for _, tc := range []struct {
+		name          string
+		groups        []group
+		counts, floor map[string]int
+		want          map[types.UID]string
+	}{
+		{
+			name:   "Ready labels are kept before filling Ready slots",
+			groups: []group{{"", true}, {"a", true}, {"b", true}},
+			counts: map[string]int{"a": 1, "b": 1}, floor: map[string]int{"a": 1, "b": 1},
+			want: map[types.UID]string{"1": "a", "2": "b"},
+		},
+		{
+			name:   "Ready reservation takes priority over count-only stickiness",
+			groups: []group{{"a", false}, {"b", true}, {"b", true}},
+			counts: map[string]int{"a": 1, "b": 1}, floor: map[string]int{"a": 1, "b": 1},
+			want: map[types.UID]string{"1": "b", "2": "a"},
+		},
+		{
+			name:   "count-only labels are kept before new assignments",
+			groups: []group{{"", false}, {"b", false}},
+			counts: map[string]int{"a": 1, "b": 1},
+			want:   map[types.UID]string{"0": "a", "1": "b"},
+		},
+		{
+			name:   "Ready reservations consume their share of the total count",
+			groups: []group{{"b", true}, {"b", false}, {"a", true}},
+			counts: map[string]int{"a": 2, "b": 1}, floor: map[string]int{"a": 2},
+			want: map[types.UID]string{"0": "a", "1": "b", "2": "a"},
+		},
+		{
+			name:   "an unmet Ready floor is infeasible",
+			groups: []group{{"a", false}, {"b", true}},
+			counts: map[string]int{"a": 1, "b": 1}, floor: map[string]int{"a": 1, "b": 1},
+		},
+		{
+			name:   "a Ready floor cannot exceed the child count",
+			groups: []group{{"a", true}, {"a", true}},
+			counts: map[string]int{"a": 1}, floor: map[string]int{"a": 2},
+		},
+		{
+			name:   "zero target has an empty valid assignment",
+			groups: []group{{"a", true}}, counts: map[string]int{"a": 0},
+			want: map[types.UID]string{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var groups []replicagroups.Group
+			for i, input := range tc.groups {
+				leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					UID: types.UID(fmt.Sprint(i)), Labels: map[string]string{disaggv1.SubRoleLabelKey: input.child},
+				}}
+				groups = append(groups, replicagroups.Group{Leader: leader, Ready: input.ready})
+			}
+			counts, floor := maps.Clone(tc.counts), maps.Clone(tc.floor)
+			require.Equal(t, tc.want, allocateSubRoleReadiness(groups, counts, floor))
+			require.Equal(t, tc.counts, counts, "allocation must not mutate accepted counts")
+			require.Equal(t, tc.floor, floor, "allocation must not mutate the persisted Ready floor")
+		})
+	}
+}
+
 func TestSubRoleOrdinalKeepsChildReadyOnActualRetainedPrefix(t *testing.T) {
 	f := newSubRoleFixture(t, leaderv1.GroupIdentityOrdinal, "a", "a", "a", "a", "a", "b")
 	s := f.observe()
 	s.Groups[0].Ready = false
-	plan := newSubRolePlan(s, map[string]int{"a": 4, "b": 1})
+	current := map[string]int{"a": 5, "b": 1}
+	plan := newSubRolePlan(s, current, map[string]int{"a": 4, "b": 1})
 	require.NotNil(t, plan)
 	require.Equal(t, map[string]int{"a": 3, "b": 1}, plan.ReadyFloor)
 	assignments := subRolePlanAssignments(s, plan)
@@ -155,7 +223,7 @@ func TestSubRoleOrdinalKeepsChildReadyOnActualRetainedPrefix(t *testing.T) {
 		s = f.observe()
 		s.Groups[0].Ready = false
 		change(&s.Groups[1])
-		require.Nil(t, newSubRolePlan(s, map[string]int{"a": 4, "b": 1}), "three eligible Ready retained groups cannot preserve the four-Ready floor")
+		require.Nil(t, newSubRolePlan(s, current, map[string]int{"a": 4, "b": 1}), "three eligible Ready retained groups cannot preserve the four-Ready floor")
 	}
 }
 
@@ -173,7 +241,7 @@ func TestSubRoleOrdinalOccupiedSlotsDoNotSupplyReadyCredit(t *testing.T) {
 			counts := map[string]int{"cold": 1, "hot": 0}
 			if failedOrdinal == 0 {
 				counts = map[string]int{"cold": 0, "hot": 1}
-				require.Nil(t, newSubRolePlan(s, counts), "the doomed retained prefix cannot replace the Ready high suffix")
+				require.Nil(t, newSubRolePlan(s, map[string]int{"cold": 1, "hot": 1}, counts), "the doomed retained prefix cannot replace the Ready high suffix")
 				return
 			}
 			require.ErrorIs(t, f.manager.scaleSubRoles(ctx, f.ds, s.LWS, counts), errReplicaGroupsPending)
@@ -194,13 +262,13 @@ func TestSubRoleOrdinalOnlyRequiresItsRetainedPrefix(t *testing.T) {
 	// Only ordinal 0 will survive this drain; an unrelated high Pod cannot
 	// invalidate its known Ready floor or force us to await a new ordinal 1.
 	s.Groups[1].Ordinal = 2
-	plan := newSubRolePlan(s, map[string]int{"cold": 1, "hot": 0})
+	current := map[string]int{"cold": 1, "hot": 1}
+	plan := newSubRolePlan(s, current, map[string]int{"cold": 1, "hot": 0})
 	require.NotNil(t, plan)
-	_, err := f.manager.reconcileSubRolePlan(t.Context(), s, plan)
-	require.NoError(t, err)
+	require.NoError(t, f.manager.reconcileSubRolePlan(t.Context(), s, plan))
 	require.EqualValues(t, 1, getLWSReplicas(f.observe().LWS))
 	s.Groups = s.Groups[1:]
-	require.Nil(t, newSubRolePlan(s, map[string]int{"cold": 0, "hot": 1}), "an actual retained-prefix hole cannot meet its child's Ready floor")
+	require.Nil(t, newSubRolePlan(s, current, map[string]int{"cold": 0, "hot": 1}), "an actual retained-prefix hole cannot meet its child's Ready floor")
 }
 
 func TestSubRoleTransactionsAndRemoval(t *testing.T) {
@@ -225,11 +293,7 @@ func TestSubRoleTransactionsAndRemoval(t *testing.T) {
 				require.NoError(t, f.manager.client.Status().Update(ctx, f.lws))
 			}
 			err := request()
-			if removing {
-				require.NoError(t, err)
-			} else {
-				require.ErrorIs(t, err, errReplicaGroupsPending)
-			}
+			require.ErrorIs(t, err, errReplicaGroupsPending, "initial writes must be observed before preparation is settled")
 			accepted, err := readSubRolePlan(f.observe().LWS)
 			require.NoError(t, err)
 			require.Equal(t, !removing, accepted != nil, "metadata cleanup needs no scaling plan")
@@ -258,7 +322,7 @@ func TestSubRoleTransactionsAndRemoval(t *testing.T) {
 				require.Equal(t, []string{"test/retain-terminated-group"}, s.Groups[2].Leader.Finalizers)
 				require.Empty(t, s.LWS.Annotations[subRoleReplicasAnnotation])
 				require.Empty(t, s.LWS.Annotations[disaggv1.InitialSubRoleReplicasAnnotationKey])
-				changed, err := f.manager.initializeSubRoles(ctx, s.LWS, map[string]int{"a": 1, "b": 2}, true)
+				changed, err := f.manager.initializeSubRoles(ctx, s.LWS, map[string]int{"a": 1, "b": 2})
 				require.NoError(t, err)
 				require.True(t, changed)
 				for range 3 {

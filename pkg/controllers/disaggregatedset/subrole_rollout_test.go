@@ -34,7 +34,7 @@ import (
 	disaggutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 )
 
-func virtualRevision(t *testing.T, s *replicagroups.Snapshot) (disaggutils.RevisionRoles, rolloutReadiness) {
+func virtualRevision(t *testing.T, s *replicagroups.Snapshot) (rolloutRevision, rolloutReadiness) {
 	t.Helper()
 	ready := rolloutReadiness{}
 	revision, err := expandSubRoleRevision(disaggutils.RevisionRoles{Revision: "a", Roles: map[string]*leaderv1.LeaderWorkerSet{"model": s.LWS}}, map[string]*replicagroups.Snapshot{s.LWS.Name: s}, ready)
@@ -57,36 +57,26 @@ func TestSubRoleAdapterRequiresCoherentOwnedGroups(t *testing.T) {
 	s = f.observe()
 	require.Len(t, s.Groups, 3)
 	expanded, ready := virtualRevision(t, s)
-	require.Equal(t, replicaReadiness{raw: 1, committed: 1}, ready[expanded.Roles["model/a"].Name])
-	require.Equal(t, replicaReadiness{raw: 1, committed: 1}, ready[expanded.Roles["model/b"].Name])
+	require.Equal(t, replicaReadiness{raw: 1, committed: 1}, ready[expanded.Roles["model/a"].readinessKey()])
+	require.Equal(t, replicaReadiness{raw: 1, committed: 1}, ready[expanded.Roles["model/b"].readinessKey()])
 	require.NotContains(t, expanded.Roles, "model", "the shared physical parent is not an extra planner role")
-	require.Equal(t, f.lws.Name, physicalSubRoleLWS(expanded.Roles["model/a"]).Name)
-	require.EqualValues(t, 3, getLWSReplicas(physicalSubRoleLWS(expanded.Roles["model/a"])))
+	require.Same(t, s.LWS, expanded.Roles["model/a"].LWS)
+	require.Same(t, s.LWS, expanded.Roles["model/b"].LWS)
+	require.EqualValues(t, 3, getLWSReplicas(expanded.Roles["model/a"].LWS))
 
-	// Every positive child is an ordinary required role. A child cannot supply
-	// usable capacity while another required child or ordinary role is absent.
-	expanded.Roles["router"] = &leaderv1.LeaderWorkerSet{}
-	expanded.Roles["router"].Name = "router"
-	expanded.Roles["router"].Spec.Replicas = ptr.To[int32](1)
+	// Every positive child is an ordinary required role, alongside real roles.
+	expanded.Roles["router"] = &rolloutRole{LWS: &leaderv1.LeaderWorkerSet{ObjectMeta: metav1.ObjectMeta{Name: "router"}}, Replicas: 1}
 	names := []string{"model/a", "model/b", "router"}
-	state := rolloutStateForRevision(names, disaggutils.RevisionRolesList{expanded}, expanded, disaggutils.RevisionRoles{}, []int{2, 1, 1}, make([]RollingUpdateConfig, 3), ready)
+	state := rolloutStateForRevision(names, rolloutRevisionList{expanded}, expanded, rolloutRevision{}, []int{2, 1, 1}, make([]RollingUpdateConfig, 3), ready)
 	require.Equal(t, []bool{true, true, true}, state.ActiveOld.RequiredRoles)
-	snapshot := snapshotForRolloutState(state)
-	for _, role := range snapshot {
-		require.Zero(t, role.ActiveOldUsableReadyReplicas)
-	}
-	ready["router"] = replicaReadiness{raw: 1, committed: 1}
-	state = rolloutStateForRevision(names, disaggutils.RevisionRolesList{expanded}, expanded, disaggutils.RevisionRoles{}, []int{2, 1, 1}, make([]RollingUpdateConfig, 3), ready)
-	require.Equal(t, 1, snapshotForRolloutState(state)[0].ActiveOldUsableReadyReplicas)
-	ready[expanded.Roles["model/b"].Name] = replicaReadiness{}
-	state = rolloutStateForRevision(names, disaggutils.RevisionRolesList{expanded}, expanded, disaggutils.RevisionRoles{}, []int{2, 1, 1}, make([]RollingUpdateConfig, 3), ready)
-	require.Zero(t, snapshotForRolloutState(state)[0].ActiveOldUsableReadyReplicas)
+	require.Equal(t, RoleReplicaState{2, 1, 1}, state.ActiveOld.SpecReplicas)
+	require.Equal(t, RoleReplicaState{1, 1, 0}, state.ActiveOld.ReadyReplicas)
 }
 
 func TestSubRoleInitializerAddsZeroDimensionAndRemovalDuringRollout(t *testing.T) {
 	f := newSubRoleFixture(t, leaderv1.GroupIdentityOrdinal, "a", "a", "b")
 	ctx := context.Background()
-	changed, err := f.manager.initializeSubRoles(ctx, f.observe().LWS, map[string]int{"a": 2, "b": 1, "new": 1}, true)
+	changed, err := f.manager.initializeSubRoles(ctx, f.observe().LWS, map[string]int{"a": 2, "b": 1, "new": 1})
 	require.NoError(t, err)
 	require.True(t, changed)
 	s := f.observe()
@@ -95,7 +85,7 @@ func TestSubRoleInitializerAddsZeroDimensionAndRemovalDuringRollout(t *testing.T
 	require.Equal(t, map[string]int{"a": 2, "b": 1, "new": 0}, counts)
 	expanded, _ := virtualRevision(t, s)
 	require.NotNil(t, expanded.Roles["model/new"])
-	require.Zero(t, getLWSReplicas(expanded.Roles["model/new"]))
+	require.Zero(t, expanded.Roles["model/new"].Replicas)
 	// Disabling virtual roles while an old revision exists strips routing
 	// metadata in place, without interpreting parent desired=3 as child total=0.
 	f.ds.Spec.Roles = []disaggv1.DisaggregatedRoleSpec{{Name: "model"}}
@@ -147,7 +137,7 @@ func TestSubRoleInitializerWaitsForRemovalBeforeReenable(t *testing.T) {
 	require.NoError(t, f.manager.patchSubRoleLWS(ctx, f.observe().LWS, func(lws *leaderv1.LeaderWorkerSet) {
 		setSubRoleJSON(lws, subRoleReplicasAnnotation, map[string]int{"": 3})
 	}))
-	changed, err := f.manager.initializeSubRoles(ctx, f.observe().LWS, map[string]int{"new": 3}, true)
+	changed, err := f.manager.initializeSubRoles(ctx, f.observe().LWS, map[string]int{"new": 3})
 	require.NoError(t, err)
 	require.False(t, changed)
 	counts, err := subRoleCounts(f.observe().LWS, subRoleReplicasAnnotation)
@@ -200,18 +190,14 @@ func TestSubRoleTargetOnlyRemovedChildRemainsVisible(t *testing.T) {
 		t.Run(string(policy), func(t *testing.T) {
 			f := newSubRoleFixture(t, leaderv1.GroupIdentityOrdinal, "a", "b")
 			target, ready := virtualRevision(t, f.observe())
-			old := disaggutils.RevisionRoles{Revision: "old", Roles: map[string]*leaderv1.LeaderWorkerSet{}}
+			old := rolloutRevision{Revision: "old", Roles: map[string]*rolloutRole{}}
 			// Old predates child b. The current target added and issued b, then
 			// the user removed b without creating a new template revision.
-			for _, name := range []string{"model/a"} {
-				old.Roles[name] = target.Roles[name].DeepCopy()
-				old.Roles[name].Name = "old-" + old.Roles[name].Name
-				old.Roles[name].Spec.Replicas = ptr.To[int32](2)
-			}
+			old.Roles["model/a"] = &rolloutRole{LWS: target.Roles["model/a"].LWS, SubRole: "a", Replicas: 2, InitialReplicas: 2}
 			f.ds.Spec.Roles = []disaggv1.DisaggregatedRoleSpec{{Name: "model", SubRoles: []disaggv1.DisaggregatedSubRoleSpec{{Name: "a", Replicas: ptr.To[int32](1)}}}}
 			f.ds.Spec.ScalingPolicy = &disaggv1.DisaggregatedSetScalingPolicy{DuringRollout: policy}
 			desired := map[string]int{"model": 1, "model/a": 1}
-			inputs := buildRolloutInputs(expandSubRoleSpec(f.ds, desired), disaggutils.RevisionRolesList{old}, target, desired)
+			inputs := buildRolloutInputs(expandSubRoleSpec(f.ds, desired), rolloutRevisionList{old}, target, desired)
 			require.Equal(t, []string{"model/a", "model/b"}, inputs.allRoleNames)
 			require.Equal(t, RoleReplicaState{1, 0}, inputs.targetReplicas)
 			complete, _ := rolloutCompletionStatus(nil, target, inputs.allRoleNames, inputs.targetReplicas, ready, policy == disaggv1.ScalingDuringRolloutPolicyAdvanceRollout)
@@ -258,13 +244,13 @@ func TestSubRoleFormerSharedCeilingStallConverges(t *testing.T) {
 			f.ds.Spec.ScalingPolicy = &disaggv1.DisaggregatedSetScalingPolicy{DuringRollout: disaggv1.ScalingDuringRolloutPolicyAdvanceRollout}
 		}
 		old, ready := virtualRevision(t, f.observe())
-		old.Roles["router"] = revisionLWS("old", "router", 5, 5, time.Time{}, 5)
-		ready[old.Roles["router"].Name] = replicaReadiness{raw: 5, committed: 5}
-		target := disaggutils.RevisionRoles{Revision: "new", Roles: map[string]*leaderv1.LeaderWorkerSet{}}
-		for name, lws := range old.Roles {
-			target.Roles[name] = lws.DeepCopy()
-			target.Roles[name].Name += "-target"
-			target.Roles[name].Spec.Replicas = ptr.To[int32](0)
+		old.Roles["router"] = &rolloutRole{LWS: revisionLWS("old", "router", 5, 5, time.Time{}, 5), Replicas: 5, InitialReplicas: 5}
+		ready[old.Roles["router"].readinessKey()] = replicaReadiness{raw: 5, committed: 5}
+		target := rolloutRevision{Revision: "new", Roles: map[string]*rolloutRole{}}
+		for name, binding := range old.Roles {
+			lws := binding.LWS.DeepCopy()
+			lws.Name += "-target"
+			target.Roles[name] = &rolloutRole{LWS: lws, SubRole: binding.SubRole}
 		}
 		var inputs rolloutInputs
 		for tick := range 40 {
@@ -277,18 +263,18 @@ func TestSubRoleFormerSharedCeilingStallConverges(t *testing.T) {
 			}
 			f.ds.Spec.Roles = []disaggv1.DisaggregatedRoleSpec{{Name: "model", SubRoles: children}, {Name: "router"}}
 			desired := map[string]int{"model": edit[0] + edit[1], "model/a": edit[0], "model/b": edit[1], "router": 5}
-			inputs = buildRolloutInputs(expandSubRoleSpec(f.ds, desired), disaggutils.RevisionRolesList{old}, target, desired)
+			inputs = buildRolloutInputs(expandSubRoleSpec(f.ds, desired), rolloutRevisionList{old}, target, desired)
 			require.Len(t, inputs.allRoleNames, 3, "only leaves, including removed children; no parent dimension")
 			if tick%3 == 2 {
 				// Native writes/readiness are simulated after the initial real
 				// observer snapshot; this is an adapter replay, not a live test.
-				for _, revision := range []disaggutils.RevisionRoles{old, target} {
-					for _, lws := range revision.Roles {
-						ready[lws.Name] = replicaReadiness{raw: int(getLWSReplicas(lws)), committed: int(getLWSReplicas(lws))}
+				for _, revision := range []rolloutRevision{old, target} {
+					for _, binding := range revision.Roles {
+						ready[binding.readinessKey()] = replicaReadiness{raw: binding.Replicas, committed: binding.Replicas}
 					}
 				}
 			}
-			state := rolloutStateForRevision(inputs.allRoleNames, disaggutils.RevisionRolesList{old}, old, target, inputs.targetReplicas, inputs.config, ready)
+			state := rolloutStateForRevision(inputs.allRoleNames, rolloutRevisionList{old}, old, target, inputs.targetReplicas, inputs.config, ready)
 			state.ScaleDuringRollout = inputs.scaleDuringRollout
 			for i, name := range inputs.allRoleNames {
 				require.True(t, state.ActiveOld.RequiredRoles[i], "old membership must retain %s", name)
@@ -299,18 +285,18 @@ func TestSubRoleFormerSharedCeilingStallConverges(t *testing.T) {
 				continue
 			}
 			require.NoError(t, validateUpdateStep(state, step))
-			for r, revision := range []disaggutils.RevisionRoles{old, target} {
+			for r, revision := range []rolloutRevision{old, target} {
 				counts := [][]int{step.Past, step.New}[r]
 				for i, name := range inputs.allRoleNames {
-					lws := revision.Roles[name]
-					availability := ready[lws.Name]
-					availability.committed = max(0, availability.committed-max(0, int(getLWSReplicas(lws))-counts[i]))
-					ready[lws.Name] = availability
-					lws.Spec.Replicas = ptr.To(int32(counts[i]))
+					binding := revision.Roles[name]
+					availability := ready[binding.readinessKey()]
+					availability.committed = max(0, availability.committed-max(0, binding.Replicas-counts[i]))
+					ready[binding.readinessKey()] = availability
+					binding.Replicas = counts[i]
 				}
 			}
 		}
-		complete, targetReady := rolloutCompletionStatus(disaggutils.RevisionRolesList{old}, target, inputs.allRoleNames, inputs.targetReplicas, ready, advance)
+		complete, targetReady := rolloutCompletionStatus(rolloutRevisionList{old}, target, inputs.allRoleNames, inputs.targetReplicas, ready, advance)
 		require.True(t, complete, "advance=%v", advance)
 		require.True(t, targetReady)
 	}

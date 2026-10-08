@@ -65,10 +65,16 @@ func (manager *LeaderWorkerSetManager) observeRolloutReadiness(
 	ctx context.Context,
 	old disaggregatedsetutils.RevisionRolesList,
 	target disaggregatedsetutils.RevisionRoles,
+	subRoleSnapshots map[string]*replicagroups.Snapshot,
 ) (rolloutReadiness, error) {
 	result := make(rolloutReadiness)
 	for _, revision := range append(slices.Clone(old), target) {
 		for _, lws := range revision.Roles {
+			// Partitioned roles use the fresh snapshot collected while preparing
+			// their assignments. Expansion derives each child's readiness from it.
+			if subRoleSnapshots[lws.Name] != nil {
+				continue
+			}
 			observed, err := manager.observeReadiness(ctx, lws)
 			if err != nil {
 				return nil, fmt.Errorf("observing readiness of LeaderWorkerSet %s: %w", lws.Name, err)

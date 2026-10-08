@@ -18,11 +18,39 @@ package disaggregatedset
 
 import (
 	"context"
+	"fmt"
 
 	disaggv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/pkg/replicagroups"
 )
+
+// subRoleStatusObservation is shared read-only by the two status writers. It is
+// collected after workload reconciliation, never reused for mutation decisions.
+type subRoleStatusObservation struct {
+	children []disaggv1.SubRoleStatus
+	assigned bool
+}
+
+func (m *LeaderWorkerSetManager) observeSubRoleStatuses(ctx context.Context, ds *disaggv1.DisaggregatedSet, workloads []*leaderv1.LeaderWorkerSet, revision string) (map[string]subRoleStatusObservation, error) {
+	byRole := make(map[string][]*leaderv1.LeaderWorkerSet)
+	for _, lws := range workloads {
+		role := lws.Labels[disaggv1.RoleLabelKey]
+		byRole[role] = append(byRole[role], lws)
+	}
+	observed := make(map[string]subRoleStatusObservation)
+	for _, role := range ds.Spec.Roles {
+		if len(role.SubRoles) == 0 {
+			continue
+		}
+		children, assigned, err := m.subRoleStatus(ctx, &role, byRole[role.Name], revision)
+		if err != nil {
+			return nil, fmt.Errorf("observing sub-role status for role %s: %w", role.Name, err)
+		}
+		observed[role.Name] = subRoleStatusObservation{children: children, assigned: assigned}
+	}
+	return observed, nil
+}
 
 func (m *LeaderWorkerSetManager) subRoleStatus(ctx context.Context, role *disaggv1.DisaggregatedRoleSpec, workloads []*leaderv1.LeaderWorkerSet, revision string) ([]disaggv1.SubRoleStatus, bool, error) {
 	statuses := make([]disaggv1.SubRoleStatus, len(role.SubRoles))

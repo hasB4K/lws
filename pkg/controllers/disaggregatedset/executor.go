@@ -17,6 +17,7 @@ limitations under the License.
 package disaggregatedset
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -156,8 +157,8 @@ func (executor *RollingUpdateExecutor) ensureDesiredRevision(
 }
 
 // reconcileExistingRollout executes one step of an in-progress rolling update:
-//  1. Refresh the current revision's initial replica values.
-//  2. Build a snapshot of issued and Ready replicas for every role.
+//  1. Finish accepted work and bind observed workloads to logical roles.
+//  2. Resolve effective targets and persist the current revision's baselines.
 //  3. Ask the planner about old revisions in preference order.
 //  4. Apply the first executable plan without changing its meaning.
 //
@@ -167,45 +168,17 @@ func (executor *RollingUpdateExecutor) ensureDesiredRevision(
 func (executor *RollingUpdateExecutor) reconcileExistingRollout(
 	ctx context.Context,
 	disaggregatedSet *disaggregatedsetv1.DisaggregatedSet,
-	oldRevisions disaggregatedsetutils.RevisionRolesList,
-	targetRevision disaggregatedsetutils.RevisionRoles,
+	oldPhysical disaggregatedsetutils.RevisionRolesList,
+	targetPhysical disaggregatedsetutils.RevisionRoles,
 	desiredReplicasByRole map[string]int,
 ) (ctrl.Result, bool, error) {
 	log := logf.FromContext(ctx)
-	inputs := buildRolloutInputs(disaggregatedSet, oldRevisions, targetRevision, desiredReplicasByRole)
-	if err := executor.syncTargetInitialReplicas(ctx, disaggregatedSet, inputs.allRoleNames, targetRevision, inputs.targetReplicas); err != nil {
-		return ctrl.Result{}, false, err
-	}
-	var err error
-	inputs.readiness, err = executor.LWSManager.observeRolloutReadiness(ctx, oldRevisions, targetRevision)
+	oldRevisions, targetRevision, inputs, err := executor.prepareRolloutInputs(ctx, disaggregatedSet, oldPhysical, targetPhysical, desiredReplicasByRole)
 	if errors.Is(err, errReplicaGroupsPending) {
 		return ctrl.Result{RequeueAfter: time.Second}, false, nil
 	}
 	if err != nil {
 		return ctrl.Result{}, false, err
-	}
-	snapshots, settled, err := executor.LWSManager.prepareSubRoleRevisions(ctx, disaggregatedSet, oldRevisions, targetRevision, desiredReplicasByRole)
-	if err != nil {
-		return ctrl.Result{}, false, err
-	}
-	if !settled {
-		return ctrl.Result{RequeueAfter: time.Second}, false, nil
-	}
-	if len(snapshots) > 0 {
-		disaggregatedSet = expandSubRoleSpec(disaggregatedSet, desiredReplicasByRole)
-		for i := range oldRevisions {
-			oldRevisions[i], err = expandSubRoleRevision(oldRevisions[i], snapshots, inputs.readiness)
-			if err != nil {
-				return ctrl.Result{}, false, err
-			}
-		}
-		targetRevision, err = expandSubRoleRevision(targetRevision, snapshots, inputs.readiness)
-		if err != nil {
-			return ctrl.Result{}, false, err
-		}
-		readiness := inputs.readiness
-		inputs = buildRolloutInputs(disaggregatedSet, oldRevisions, targetRevision, desiredReplicasByRole)
-		inputs.readiness = readiness
 	}
 
 	specComplete, targetReady := rolloutCompletionStatus(oldRevisions, targetRevision, inputs.allRoleNames, inputs.targetReplicas, inputs.readiness, inputs.scaleDuringRollout)
@@ -223,10 +196,10 @@ func (executor *RollingUpdateExecutor) reconcileExistingRollout(
 		if inputs.scaleDuringRollout {
 			// Drained objects may still exist. The target must converge exactly,
 			// using the same retained-readiness bounds as any other reduction.
-			state := rolloutStateForRevision(inputs.allRoleNames, oldRevisions, disaggregatedsetutils.RevisionRoles{}, targetRevision, inputs.targetReplicas, inputs.config, inputs.readiness)
+			state := rolloutStateForRevision(inputs.allRoleNames, oldRevisions, rolloutRevision{}, targetRevision, inputs.targetReplicas, inputs.config, inputs.readiness)
 			state.ScaleDuringRollout = true
 			if step := ComputeNextStep(state); step != nil {
-				if err := executor.applyRolloutStep(ctx, disaggregatedSet, targetRevision, inputs, disaggregatedsetutils.RevisionRoles{}, state, step); err != nil {
+				if err := executor.applyRolloutStep(ctx, disaggregatedSet, targetRevision, inputs, rolloutRevision{}, state, step); err != nil {
 					return ctrl.Result{}, false, err
 				}
 			}
@@ -259,10 +232,50 @@ func (executor *RollingUpdateExecutor) reconcileExistingRollout(
 	return ctrl.Result{RequeueAfter: time.Second}, false, nil
 }
 
+// prepareRolloutInputs resolves policy exactly once, after logical expansion.
+// Persisting its effective targets before planning makes the next interruption
+// freeze the same baselines for ordinary roles and children alike.
+func (executor *RollingUpdateExecutor) prepareRolloutInputs(
+	ctx context.Context,
+	ds *disaggregatedsetv1.DisaggregatedSet,
+	oldPhysical disaggregatedsetutils.RevisionRolesList,
+	targetPhysical disaggregatedsetutils.RevisionRoles,
+	desired map[string]int,
+) (rolloutRevisionList, rolloutRevision, rolloutInputs, error) {
+	snapshots, settled, err := executor.LWSManager.prepareSubRoleRevisions(ctx, ds, oldPhysical, targetPhysical, desired)
+	if err != nil {
+		return nil, rolloutRevision{}, rolloutInputs{}, err
+	}
+	if !settled {
+		return nil, rolloutRevision{}, rolloutInputs{}, errReplicaGroupsPending
+	}
+	readiness, err := executor.LWSManager.observeRolloutReadiness(ctx, oldPhysical, targetPhysical, snapshots)
+	if err != nil {
+		return nil, rolloutRevision{}, rolloutInputs{}, err
+	}
+	old := make(rolloutRevisionList, len(oldPhysical))
+	for i, revision := range oldPhysical {
+		old[i], err = expandSubRoleRevision(revision, snapshots, readiness)
+		if err != nil {
+			return nil, rolloutRevision{}, rolloutInputs{}, err
+		}
+	}
+	target, err := expandSubRoleRevision(targetPhysical, snapshots, readiness)
+	if err != nil {
+		return nil, rolloutRevision{}, rolloutInputs{}, err
+	}
+	inputs := buildRolloutInputs(expandSubRoleSpec(ds, desired), old, target, desired)
+	inputs.readiness = readiness
+	if err := executor.syncTargetInitialReplicas(ctx, ds, inputs.allRoleNames, target, inputs.targetReplicas); err != nil {
+		return nil, rolloutRevision{}, rolloutInputs{}, err
+	}
+	return old, target, inputs, nil
+}
+
 func buildRolloutInputs(
 	disaggregatedSet *disaggregatedsetv1.DisaggregatedSet,
-	oldRevisions disaggregatedsetutils.RevisionRolesList,
-	targetRevision disaggregatedsetutils.RevisionRoles,
+	oldRevisions rolloutRevisionList,
+	targetRevision rolloutRevision,
 	desiredReplicasByRole map[string]int,
 ) rolloutInputs {
 	targetRoleNames := disaggregatedsetutils.GetRoleNames(disaggregatedSet)
@@ -297,12 +310,12 @@ func scalingDuringRolloutEnabled(ds *disaggregatedsetv1.DisaggregatedSet) bool {
 // when neither ordinary nor bootstrap progress is available.
 func (executor *RollingUpdateExecutor) selectNextRolloutStep(
 	ctx context.Context,
-	candidates disaggregatedsetutils.RevisionRolesList,
-	oldRevisions disaggregatedsetutils.RevisionRolesList,
-	targetRevision disaggregatedsetutils.RevisionRoles,
+	candidates rolloutRevisionList,
+	oldRevisions rolloutRevisionList,
+	targetRevision rolloutRevision,
 	inputs rolloutInputs,
-) (disaggregatedsetutils.RevisionRoles, RolloutState, *UpdateStep, error) {
-	var selectedRevision disaggregatedsetutils.RevisionRoles
+) (rolloutRevision, RolloutState, *UpdateStep, error) {
+	var selectedRevision rolloutRevision
 	var selectedState RolloutState
 	var selectedStep *UpdateStep
 	candidateStates := make([]RolloutState, len(candidates))
@@ -371,9 +384,9 @@ func targetRevisionScalesDown(state RolloutState, step *UpdateStep) bool {
 func (executor *RollingUpdateExecutor) applyRolloutStep(
 	ctx context.Context,
 	disaggregatedSet *disaggregatedsetv1.DisaggregatedSet,
-	targetRevision disaggregatedsetutils.RevisionRoles,
+	targetRevision rolloutRevision,
 	inputs rolloutInputs,
-	selectedRevision disaggregatedsetutils.RevisionRoles,
+	selectedRevision rolloutRevision,
 	selectedState RolloutState,
 	selectedStep *UpdateStep,
 ) error {
@@ -414,28 +427,28 @@ func (executor *RollingUpdateExecutor) applyRolloutStep(
 // image pulls, and Pending Pods without this scheduler condition do not qualify.
 func (executor *RollingUpdateExecutor) targetUnschedulableRoles(
 	ctx context.Context,
-	target disaggregatedsetutils.RevisionRoles,
+	target rolloutRevision,
 	roleNames []string,
 	readiness rolloutReadiness,
 ) ([]bool, error) {
 	result := make([]bool, len(roleNames))
 	now := time.Now()
 	for i, roleName := range roleNames {
-		lws := target.Roles[roleName]
-		if lws == nil {
+		binding := target.Roles[roleName]
+		if binding == nil {
 			continue
 		}
 		// Every issued replica is accounted for as Ready, so this role cannot
 		// need scheduler-capacity recovery.
-		if int(getLWSReplicas(lws)) <= readiness[lws.Name].committed {
+		if binding.Replicas <= readiness[binding.readinessKey()].committed {
 			continue
 		}
-		pods, err := executor.LWSManager.listPods(ctx, physicalSubRoleLWS(lws))
+		pods, err := executor.LWSManager.listPods(ctx, binding.LWS)
 		if err != nil {
 			return nil, err
 		}
 		for j := range pods {
-			_, child := roleParts(roleName)
+			child := binding.SubRole
 			if child != "" && pods[j].Labels[disaggregatedsetv1.SubRoleLabelKey] != child {
 				continue
 			}
@@ -461,7 +474,7 @@ func podIsPersistentlyUnschedulable(pod *corev1.Pod, now time.Time) bool {
 
 // --- Helpers ---
 
-func collectDesiredAndOldRoles(specRoleNames []string, oldRevisions disaggregatedsetutils.RevisionRolesList) (desiredRoles, oldRoles sets.Set[string]) {
+func collectDesiredAndOldRoles(specRoleNames []string, oldRevisions rolloutRevisionList) (desiredRoles, oldRoles sets.Set[string]) {
 	desiredRoles = sets.New(specRoleNames...)
 	oldRoles = sets.New[string]()
 	for _, wl := range oldRevisions {
@@ -476,13 +489,17 @@ func collectDesiredAndOldRoles(specRoleNames []string, oldRevisions disaggregate
 // preference order. Fully unready revisions come first. Each group is newest
 // first. A preference is not a decision: the executor continues when a
 // candidate-specific plan is blocked.
-func orderedRevisionCandidates(oldRevisions disaggregatedsetutils.RevisionRolesList, readiness rolloutReadiness) disaggregatedsetutils.RevisionRolesList {
-	fullyUnready := make(disaggregatedsetutils.RevisionRolesList, 0, len(oldRevisions))
-	others := make(disaggregatedsetutils.RevisionRolesList, 0, len(oldRevisions))
-	for _, revision := range oldRevisions.SortedByNewestTimestamp() {
+func orderedRevisionCandidates(oldRevisions rolloutRevisionList, readiness rolloutReadiness) rolloutRevisionList {
+	fullyUnready := make(rolloutRevisionList, 0, len(oldRevisions))
+	others := make(rolloutRevisionList, 0, len(oldRevisions))
+	sorted := slices.Clone(oldRevisions)
+	slices.SortFunc(sorted, func(a, b rolloutRevision) int {
+		return cmp.Or(b.createdAt.Compare(a.createdAt), cmp.Compare(a.Revision, b.Revision))
+	})
+	for _, revision := range sorted {
 		replicas := 0
-		for _, lws := range revision.Roles {
-			replicas += int(getLWSReplicas(lws))
+		for _, binding := range revision.Roles {
+			replicas += binding.Replicas
 		}
 		if replicas == 0 {
 			continue
@@ -499,9 +516,9 @@ func orderedRevisionCandidates(oldRevisions disaggregatedsetutils.RevisionRolesL
 // revisionIsFullyUnready reports whether the revision has no Ready replicas.
 // This intentionally uses observed readiness rather than committed readiness:
 // replicas reserved by an in-flight drain are still Ready replicas.
-func revisionIsFullyUnready(revision disaggregatedsetutils.RevisionRoles, readiness rolloutReadiness) bool {
-	for _, lws := range revision.Roles {
-		if readiness[lws.Name].raw > 0 {
+func revisionIsFullyUnready(revision rolloutRevision, readiness rolloutReadiness) bool {
+	for _, binding := range revision.Roles {
+		if readiness[binding.readinessKey()].raw > 0 {
 			return false
 		}
 	}
@@ -513,9 +530,9 @@ func revisionIsFullyUnready(revision disaggregatedsetutils.RevisionRoles, readin
 // capacity only when every required role in that revision is Ready.
 func rolloutStateForRevision(
 	roleNames []string,
-	oldRevisions disaggregatedsetutils.RevisionRolesList,
-	active disaggregatedsetutils.RevisionRoles,
-	target disaggregatedsetutils.RevisionRoles,
+	oldRevisions rolloutRevisionList,
+	active rolloutRevision,
+	target rolloutRevision,
 	targetReplicas RoleReplicaState,
 	config []RollingUpdateConfig,
 	readiness rolloutReadiness,
@@ -557,18 +574,18 @@ func rolloutStateForRevision(
 	}
 	for i, roleName := range roleNames {
 		state.Target.RequiredRoles[i] = targetReplicas[i] > 0
-		lws := target.Roles[roleName]
-		if lws != nil {
-			state.Target.SpecReplicas[i] = int(getLWSReplicas(lws))
-			state.Target.RawReadyReplicas[i] = readiness[lws.Name].raw
-			state.Target.ReadyReplicas[i] = readiness[lws.Name].committed
+		binding := target.Roles[roleName]
+		if binding != nil {
+			state.Target.SpecReplicas[i] = binding.Replicas
+			state.Target.RawReadyReplicas[i] = readiness[binding.readinessKey()].raw
+			state.Target.ReadyReplicas[i] = readiness[binding.readinessKey()].committed
 		}
 	}
 	return state
 }
 
 func observeOldRevision(
-	revision disaggregatedsetutils.RevisionRoles,
+	revision rolloutRevision,
 	roleNames []string,
 	readiness rolloutReadiness,
 ) (RoleReplicaState, ParkedRevisionState) {
@@ -580,17 +597,17 @@ func observeOldRevision(
 		ReadyReplicas:    make(RoleReplicaState, len(roleNames)),
 	}
 	for i, roleName := range roleNames {
-		lws := revision.Roles[roleName]
-		if lws == nil {
+		binding := revision.Roles[roleName]
+		if binding == nil {
 			continue
 		}
-		state.SpecReplicas[i] = int(getLWSReplicas(lws))
+		state.SpecReplicas[i] = binding.Replicas
 		// Spec may exceed a stale annotation after an External scale-down or a
 		// manual edit. Never describe live replicas as outside the old baseline.
-		initial[i] = max(revision.GetInitialReplicasPerRole(roleName), state.SpecReplicas[i])
+		initial[i] = max(binding.InitialReplicas, state.SpecReplicas[i])
 		state.RequiredRoles[i] = initial[i] > 0
-		state.RawReadyReplicas[i] = readiness[lws.Name].raw
-		state.ReadyReplicas[i] = readiness[lws.Name].committed
+		state.RawReadyReplicas[i] = readiness[binding.readinessKey()].raw
+		state.ReadyReplicas[i] = readiness[binding.readinessKey()].committed
 	}
 	return initial, state
 }
@@ -599,8 +616,8 @@ func rolloutTargetReplicas(
 	ds *disaggregatedsetv1.DisaggregatedSet,
 	allRoleNames []string,
 	desiredRoles sets.Set[string],
-	oldRevisions disaggregatedsetutils.RevisionRolesList,
-	newRevision disaggregatedsetutils.RevisionRoles,
+	oldRevisions rolloutRevisionList,
+	newRevision rolloutRevision,
 	desiredReplicasByRole map[string]int,
 ) RoleReplicaState {
 	targets := make(RoleReplicaState, len(allRoleNames))
@@ -609,12 +626,12 @@ func rolloutTargetReplicas(
 			continue
 		}
 		targets[i] = desiredReplicasByRole[roleName]
-		lws := newRevision.Roles[roleName]
+		binding := newRevision.Roles[roleName]
 		// Keep an External target from shrinking only while old capacity for
 		// this role still overlaps it. Drained old objects or another role's
 		// old replicas must not keep this target artificially high.
-		if !scalingDuringRolloutEnabled(ds) && isExternal(ds, roleName) && oldRevisions.GetTotalReplicasPerRole(roleName) > 0 && lws != nil {
-			targets[i] = max(targets[i], int(getLWSReplicas(lws)))
+		if !scalingDuringRolloutEnabled(ds) && isExternal(ds, roleName) && oldRevisions.totalReplicas(roleName) > 0 && binding != nil {
+			targets[i] = max(targets[i], binding.Replicas)
 		}
 	}
 	return targets
@@ -670,8 +687,8 @@ func buildStepLogArgs(roleNames []string, step *UpdateStep) []interface{} {
 }
 
 func rolloutCompletionStatus(
-	oldRevisions disaggregatedsetutils.RevisionRolesList,
-	targetRevision disaggregatedsetutils.RevisionRoles,
+	oldRevisions rolloutRevisionList,
+	targetRevision rolloutRevision,
 	roleNames []string,
 	targetReplicas RoleReplicaState,
 	readiness rolloutReadiness,
@@ -679,20 +696,20 @@ func rolloutCompletionStatus(
 ) (specComplete, targetReady bool) {
 	targetReady = true
 	for i, roleName := range roleNames {
-		if oldRevisions.GetTotalReplicasPerRole(roleName) != 0 {
+		if oldRevisions.totalReplicas(roleName) != 0 {
 			return false, false
 		}
 
 		target := targetReplicas[i]
-		lws := targetRevision.Roles[roleName]
+		binding := targetRevision.Roles[roleName]
 		currentSpec := 0
-		if lws != nil {
-			currentSpec = int(getLWSReplicas(lws))
+		if binding != nil {
+			currentSpec = binding.Replicas
 		}
 		if requireExactSpec && currentSpec != target || currentSpec < target {
 			return false, false
 		}
-		if target > 0 && (lws == nil || readiness[lws.Name].committed < target) {
+		if target > 0 && (binding == nil || readiness[binding.readinessKey()].committed < target) {
 			targetReady = false
 		}
 	}
@@ -706,7 +723,7 @@ func rolloutCompletionStatus(
 func (executor *RollingUpdateExecutor) scaleRevision(
 	ctx context.Context,
 	ds *disaggregatedsetv1.DisaggregatedSet,
-	revision disaggregatedsetutils.RevisionRoles,
+	revision rolloutRevision,
 	roleNames []string,
 	targets RoleReplicaState,
 	direction scaleDirection,
@@ -720,42 +737,13 @@ func (executor *RollingUpdateExecutor) scaleRevision(
 	action := "Scaling " + string(direction)
 
 	log := logf.FromContext(ctx)
-	virtualDone := sets.New[string]()
 	for i, name := range roleNames {
-		lws := revision.Roles[name]
-		if lws == nil {
+		binding := revision.Roles[name]
+		if binding == nil || binding.SubRole != "" {
 			continue
 		}
-		if physicalName := lws.Annotations[physicalLWSAnnotation]; physicalName != "" {
-			if virtualDone.Has(physicalName) {
-				continue
-			}
-			virtualDone.Insert(physicalName)
-			counts, err := subRoleCounts(lws, subRoleReplicasAnnotation)
-			if err != nil {
-				return err
-			}
-			for j, logicalName := range roleNames {
-				logical := revision.Roles[logicalName]
-				if logical == nil || logical.Annotations[physicalLWSAnnotation] != physicalName {
-					continue
-				}
-				_, child := roleParts(logicalName)
-				if child == "" {
-					continue
-				}
-				if direction == scaleDown {
-					counts[child] = min(counts[child], targets[j])
-				} else {
-					counts[child] = max(counts[child], targets[j])
-				}
-			}
-			if err := executor.LWSManager.scaleSubRoles(ctx, ds, physicalSubRoleLWS(lws), counts); err != nil {
-				return err
-			}
-			continue
-		}
-		currentSpec := int(getLWSReplicas(lws))
+		lws := binding.LWS
+		currentSpec := binding.Replicas
 		desiredSpec := targets[i]
 		if direction == scaleUp && currentSpec >= desiredSpec {
 			continue
@@ -770,6 +758,22 @@ func (executor *RollingUpdateExecutor) scaleRevision(
 		}
 		executor.Record.Eventf(ds, nil, corev1.EventTypeNormal, eventReason,
 			"Update", "%s %s LWS %s from %d to %d replicas", action, name, lws.Name, currentSpec, desiredSpec)
+	}
+	for lws, targets := range subRoleTargets(revision, roleNames, targets) {
+		counts, err := subRoleCounts(lws, subRoleReplicasAnnotation)
+		if err != nil {
+			return err
+		}
+		for child, target := range targets {
+			if direction == scaleDown {
+				counts[child] = min(counts[child], target)
+			} else {
+				counts[child] = max(counts[child], target)
+			}
+		}
+		if err := executor.LWSManager.scaleSubRoles(ctx, ds, lws, counts); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -993,14 +997,15 @@ func (executor *RollingUpdateExecutor) syncTargetInitialReplicas(
 	ctx context.Context,
 	ds *disaggregatedsetv1.DisaggregatedSet,
 	roleNames []string,
-	newRevision disaggregatedsetutils.RevisionRoles,
+	newRevision rolloutRevision,
 	targetReplicas RoleReplicaState,
 ) error {
 	for i, roleName := range roleNames {
-		lws := newRevision.Roles[roleName]
-		if lws == nil {
+		binding := newRevision.Roles[roleName]
+		if binding == nil || binding.SubRole != "" {
 			continue
 		}
+		lws := binding.LWS
 		initial := targetReplicas[i]
 		current, ok := disaggregatedsetutils.GetInitialReplicas(lws)
 		if ok && int(current) == initial {
@@ -1008,6 +1013,11 @@ func (executor *RollingUpdateExecutor) syncTargetInitialReplicas(
 		}
 		if err := executor.LWSManager.UpdateInitialReplicas(ctx, ds, lws, initial); err != nil {
 			return fmt.Errorf("failed to update initial replicas on %s: %w", lws.Name, err)
+		}
+	}
+	for lws, counts := range subRoleTargets(newRevision, roleNames, targetReplicas) {
+		if err := executor.LWSManager.syncSubRoleBaseline(ctx, lws, counts); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -87,6 +87,24 @@ func newTestExecutor(fakeClient client.Client) *RollingUpdateExecutor {
 	}
 }
 
+// Ordinary-role tests keep physical fixtures and cross the same typed adapter
+// boundary as reconciliation before calling planner/execution helpers.
+func rolloutRevisionForTest(t *testing.T, physical disaggregatedsetutils.RevisionRoles) rolloutRevision {
+	t.Helper()
+	view, err := expandSubRoleRevision(physical, nil, nil)
+	require.NoError(t, err)
+	return view
+}
+
+func rolloutRevisionsForTest(t *testing.T, physical disaggregatedsetutils.RevisionRolesList) rolloutRevisionList {
+	t.Helper()
+	views := make(rolloutRevisionList, len(physical))
+	for i, revision := range physical {
+		views[i] = rolloutRevisionForTest(t, revision)
+	}
+	return views
+}
+
 // Ordinary executor fixtures model settled observations. Pending-work tests
 // supply explicit raw/committed counts; adapter tests use the real observer.
 func newTestLWSManager(c client.Client) *LeaderWorkerSetManager {
@@ -901,13 +919,13 @@ func TestOrderedRevisionCandidatesPreferUnreadyThenNewest(t *testing.T) {
 	}}
 
 	readiness := rolloutReadiness{"B": {raw: 1, committed: 1}}
-	candidates := orderedRevisionCandidates(disaggregatedsetutils.RevisionRolesList{oldestUnready, newestReady}, readiness)
+	candidates := orderedRevisionCandidates(rolloutRevisionsForTest(t, disaggregatedsetutils.RevisionRolesList{oldestUnready, newestReady}), readiness)
 	require.Len(t, candidates, 2)
 	assert.Equal(t, []string{"A", "B"}, []string{candidates[0].Revision, candidates[1].Revision})
 
 	oldestUnready.Roles[testRolePrefill].Status.ReadyReplicas = 1
 	readiness["A"] = replicaReadiness{raw: 1, committed: 1}
-	candidates = orderedRevisionCandidates(disaggregatedsetutils.RevisionRolesList{oldestUnready, newestReady}, readiness)
+	candidates = orderedRevisionCandidates(rolloutRevisionsForTest(t, disaggregatedsetutils.RevisionRolesList{oldestUnready, newestReady}), readiness)
 	require.Len(t, candidates, 2)
 	assert.Equal(t, []string{"B", "A"}, []string{candidates[0].Revision, candidates[1].Revision})
 
@@ -916,7 +934,7 @@ func TestOrderedRevisionCandidatesPreferUnreadyThenNewest(t *testing.T) {
 	// that discards a fully unready revision.
 	oldestUnready.Roles[testRolePrefill].Status.Replicas = 2
 	readiness["A"] = replicaReadiness{raw: 1, committed: 0}
-	candidates = orderedRevisionCandidates(disaggregatedsetutils.RevisionRolesList{oldestUnready, newestReady}, readiness)
+	candidates = orderedRevisionCandidates(rolloutRevisionsForTest(t, disaggregatedsetutils.RevisionRolesList{oldestUnready, newestReady}), readiness)
 	require.Len(t, candidates, 2)
 	assert.Equal(t, []string{"B", "A"}, []string{candidates[0].Revision, candidates[1].Revision})
 }
@@ -1100,7 +1118,7 @@ func TestTargetUnschedulableRolesSkipsReadyRoles(t *testing.T) {
 		testRoleDecode:  pending,
 	}}
 
-	roles, err := executor.targetUnschedulableRoles(context.Background(), target, testRoleNames(), rolloutReadiness{
+	roles, err := executor.targetUnschedulableRoles(context.Background(), rolloutRevisionForTest(t, target), testRoleNames(), rolloutReadiness{
 		ready.Name: {raw: 1, committed: 1},
 	})
 	require.NoError(t, err)
@@ -1353,7 +1371,7 @@ func TestScaleRevisionDownUsesPlannerTargetsVerbatim(t *testing.T) {
 		},
 	}
 	require.NoError(t, executor.scaleRevision(
-		ctx, ds, active, testRoleNames(), RoleReplicaState{1, 1}, scaleDown,
+		ctx, ds, rolloutRevisionForTest(t, active), testRoleNames(), RoleReplicaState{1, 1}, scaleDown,
 	))
 	assert.EqualValues(t, 1, getTestLWSReplicas(fakeClient, testNamespace, oldPrefill.Name))
 	assert.EqualValues(t, 1, getTestLWSReplicas(fakeClient, testNamespace, oldDecode.Name))
@@ -1428,7 +1446,7 @@ func TestScaleRevisionUp(t *testing.T) {
 			}
 
 			targets := RoleReplicaState{tc.targetPrefill, tc.targetDecode}
-			err := executor.scaleRevision(context.TODO(), ds, targetRevision, roleNames, targets, scaleUp)
+			err := executor.scaleRevision(context.TODO(), ds, rolloutRevisionForTest(t, targetRevision), roleNames, targets, scaleUp)
 			require.NoError(t, err)
 
 			assert.Equal(t, tc.expectedPrefill, getTestLWSReplicas(fakeClient, namespace, "test-0-newhash-prefill"))
@@ -1517,7 +1535,7 @@ func TestTargetInitialReplicasFollowResolvedRolloutTarget(t *testing.T) {
 	}}
 
 	require.NoError(t, executor.syncTargetInitialReplicas(
-		ctx, ds, []string{testRolePrefill}, current, RoleReplicaState{6},
+		ctx, ds, []string{testRolePrefill}, rolloutRevisionForTest(t, current), RoleReplicaState{6},
 	))
 	stored, err := executor.LWSManager.Get(ctx, ds, lws.Name)
 	require.NoError(t, err)
@@ -1529,20 +1547,20 @@ func TestTargetInitialReplicasFollowResolvedRolloutTarget(t *testing.T) {
 
 	stored.Status.ReadyReplicas = 1
 	targets := rolloutTargetReplicas(ds, []string{testRolePrefill}, sets.New(testRolePrefill),
-		disaggregatedsetutils.RevisionRolesList{{Revision: "old"}},
-		disaggregatedsetutils.RevisionRoles{Revision: "hashB", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{testRolePrefill: stored}},
+		rolloutRevisionList{{Revision: "old"}},
+		rolloutRevisionForTest(t, disaggregatedsetutils.RevisionRoles{Revision: "hashB", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{testRolePrefill: stored}}),
 		map[string]int{testRolePrefill: 1})
 	assert.Equal(t, RoleReplicaState{1}, targets, "a drained old object must not keep the external target high")
 
 	old := makeLWS(withReplicas(1), withReadyReplicas(1))
 	targets = rolloutTargetReplicas(ds, []string{testRolePrefill}, sets.New(testRolePrefill),
-		disaggregatedsetutils.RevisionRolesList{{Revision: "old", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{testRolePrefill: old}}},
-		disaggregatedsetutils.RevisionRoles{Revision: "hashB", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{testRolePrefill: stored}},
+		rolloutRevisionsForTest(t, disaggregatedsetutils.RevisionRolesList{{Revision: "old", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{testRolePrefill: old}}}),
+		rolloutRevisionForTest(t, disaggregatedsetutils.RevisionRoles{Revision: "hashB", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{testRolePrefill: stored}}),
 		map[string]int{testRolePrefill: 1})
 	assert.Equal(t, RoleReplicaState{2}, targets, "non-zero old capacity for the same role keeps the in-flight target from shrinking")
 
 	require.NoError(t, executor.syncTargetInitialReplicas(
-		ctx, ds, []string{testRolePrefill}, current, targets,
+		ctx, ds, []string{testRolePrefill}, rolloutRevisionForTest(t, current), targets,
 	))
 	stored, err = executor.LWSManager.Get(ctx, ds, lws.Name)
 	require.NoError(t, err)
@@ -1597,7 +1615,7 @@ func TestObserveOldRevisionNeverUsesBaselineBelowSpec(t *testing.T) {
 				Roles:    map[string]*leaderworkersetv1.LeaderWorkerSet{testRolePrefill: lws},
 			}
 
-			initial, observed := observeOldRevision(revision, []string{testRolePrefill}, nil)
+			initial, observed := observeOldRevision(rolloutRevisionForTest(t, revision), []string{testRolePrefill}, nil)
 
 			assert.Equal(t, RoleReplicaState{3}, initial)
 			assert.Equal(t, RoleReplicaState{3}, observed.SpecReplicas)
@@ -1823,16 +1841,18 @@ func TestDrainedRevisionDoesNotInflateBaselineOrThrottleColdStart(t *testing.T) 
 	require.NoError(t, err)
 	require.NotNil(t, targetRevision)
 
-	readiness, err := executor.LWSManager.observeRolloutReadiness(ctx, oldRevisions, *targetRevision)
+	readiness, err := executor.LWSManager.observeRolloutReadiness(ctx, oldRevisions, *targetRevision, nil)
 	require.NoError(t, err)
-	candidates := orderedRevisionCandidates(oldRevisions, readiness)
+	oldViews := rolloutRevisionsForTest(t, oldRevisions)
+	targetView := rolloutRevisionForTest(t, *targetRevision)
+	candidates := orderedRevisionCandidates(oldViews, readiness)
 	require.NotEmpty(t, candidates)
 	activeRevision := candidates[0]
 	assert.Equal(t, "hashA", activeRevision.Revision, "the drained hashB revision must not become the planning baseline")
 	roleNames := testRoleNames()
 	config := extractRollingUpdateConfig(ds, roleNames, desiredReplicasByRole)
-	targets := rolloutTargetReplicas(ds, roleNames, sets.New(roleNames...), oldRevisions, *targetRevision, desiredReplicasByRole)
-	state := rolloutStateForRevision(roleNames, oldRevisions, activeRevision, *targetRevision, targets, config, readiness)
+	targets := rolloutTargetReplicas(ds, roleNames, sets.New(roleNames...), oldViews, targetView, desiredReplicasByRole)
+	state := rolloutStateForRevision(roleNames, oldViews, activeRevision, targetView, targets, config, readiness)
 	assert.Equal(t, RoleReplicaState{2, 2}, state.ActiveOld.InitialReplicas)
 	assert.Equal(t, RoleReplicaState{2, 2}, state.AvailabilityBaseline)
 	assert.Equal(t, RoleReplicaState{2, 2}, state.ActiveOld.SpecReplicas)
@@ -1841,7 +1861,7 @@ func TestDrainedRevisionDoesNotInflateBaselineOrThrottleColdStart(t *testing.T) 
 	assert.Equal(t, RoleReplicaState{0, 0}, state.ParkedOld[0].ReadyReplicas)
 
 	for _, roleName := range roleNames {
-		require.NoError(t, executor.LWSManager.Scale(ctx, ds, activeRevision.Roles[roleName], 0))
+		require.NoError(t, executor.LWSManager.Scale(ctx, ds, activeRevision.Roles[roleName].LWS, 0))
 	}
 	result, complete := reconcileExistingForTest(t, executor, ds, "hashC")
 	assert.False(t, complete)
@@ -1881,9 +1901,9 @@ func TestRolloutStateSeparatesRawAndCommittedReadiness(t *testing.T) {
 
 	state := rolloutStateForRevision(
 		testRoleNames(),
-		disaggregatedsetutils.RevisionRolesList{parked, active},
-		active,
-		target,
+		rolloutRevisionsForTest(t, disaggregatedsetutils.RevisionRolesList{parked, active}),
+		rolloutRevisionForTest(t, active),
+		rolloutRevisionForTest(t, target),
 		RoleReplicaState{50, 25},
 		configs([]int{5, 5}, []int{5, 5}),
 		rolloutReadiness{

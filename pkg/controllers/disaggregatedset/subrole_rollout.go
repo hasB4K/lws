@@ -22,6 +22,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"time"
 
 	"k8s.io/utils/ptr"
 
@@ -31,7 +32,55 @@ import (
 	disaggutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 )
 
-const physicalLWSAnnotation = "internal/physical-lws" // In-memory planner views only; never persisted.
+// rolloutRole binds one planner dimension to its physical workload. Siblings
+// share LWS; their counts are values, never synthetic Kubernetes objects.
+type rolloutRole struct {
+	LWS             *leaderv1.LeaderWorkerSet
+	SubRole         string
+	Replicas        int
+	InitialReplicas int
+}
+
+func (r *rolloutRole) readinessKey() string {
+	if r.SubRole != "" {
+		return r.LWS.Name + "/" + r.SubRole
+	}
+	return r.LWS.Name
+}
+
+type rolloutRevision struct {
+	Revision  string
+	Roles     map[string]*rolloutRole
+	createdAt time.Time
+}
+
+type rolloutRevisionList []rolloutRevision
+
+func (revisions rolloutRevisionList) totalReplicas(role string) int {
+	total := 0
+	for _, revision := range revisions {
+		if binding := revision.Roles[role]; binding != nil {
+			total += binding.Replicas
+		}
+	}
+	return total
+}
+
+// subRoleTargets groups logical decisions by their real Kubernetes write target.
+func subRoleTargets(revision rolloutRevision, names []string, targets RoleReplicaState) map[*leaderv1.LeaderWorkerSet]map[string]int {
+	grouped := map[*leaderv1.LeaderWorkerSet]map[string]int{}
+	for i, name := range names {
+		binding := revision.Roles[name]
+		if binding == nil || binding.SubRole == "" {
+			continue
+		}
+		if grouped[binding.LWS] == nil {
+			grouped[binding.LWS] = map[string]int{}
+		}
+		grouped[binding.LWS][binding.SubRole] = targets[i]
+	}
+	return grouped
+}
 
 func desiredSubRoles(role *disaggv1.DisaggregatedRoleSpec, desired map[string]int) map[string]int {
 	counts := map[string]int{}
@@ -41,7 +90,7 @@ func desiredSubRoles(role *disaggv1.DisaggregatedRoleSpec, desired map[string]in
 	return counts
 }
 
-func (m *LeaderWorkerSetManager) initializeSubRoles(ctx context.Context, lws *leaderv1.LeaderWorkerSet, counts map[string]int, target bool) (bool, error) {
+func (m *LeaderWorkerSetManager) initializeSubRoles(ctx context.Context, lws *leaderv1.LeaderWorkerSet, counts map[string]int) (bool, error) {
 	if _, removing := counts[""]; removing {
 		return false, nil
 	}
@@ -59,36 +108,53 @@ func (m *LeaderWorkerSetManager) initializeSubRoles(ctx context.Context, lws *le
 	if len(current) == 0 && len(counts) == 0 {
 		return false, nil
 	}
-	if len(current) == 0 {
+	currentChanged := len(current) == 0
+	if currentChanged {
 		current = fitSubRoles(counts, int(getLWSReplicas(lws)))
 	}
-	currentChanged := false
 	for child := range counts {
 		if _, found := current[child]; !found {
 			current[child] = 0
 			currentChanged = true
 		}
 	}
-	if len(initial) == 0 {
+	initialChanged := len(initial) == 0
+	if initialChanged {
 		total, _ := disaggutils.GetInitialReplicas(lws)
 		initial = fitSubRoles(current, max(int(total), int(getLWSReplicas(lws))))
 	}
-	if target && len(counts) > 0 {
-		initial = maps.Clone(counts)
-	}
-	if value := lws.Annotations[subRoleReplicasAnnotation]; value != "" {
-		oldInitial, _ := subRoleCounts(lws, disaggv1.InitialSubRoleReplicasAnnotationKey)
-		if maps.Equal(initial, oldInitial) && !currentChanged {
-			return false, nil
-		}
+	if !currentChanged && !initialChanged {
+		return false, nil
 	}
 	return true, m.patchSubRoleLWS(ctx, lws, func(l *leaderv1.LeaderWorkerSet) {
 		setSubRoleJSON(l, subRoleReplicasAnnotation, current)
 		setSubRoleJSON(l, disaggv1.InitialSubRoleReplicasAnnotationKey, initial)
-		if target {
-			l.Annotations[disaggv1.InitialReplicasAnnotationKey] = strconv.Itoa(countSubRoles(initial))
-		}
 	})
+}
+
+// prepareSubRoles owns the lifecycle order for both steady state and rollout:
+// finish accepted work, initialize/remove routing, then observe coherent groups.
+// No desired baseline is written here: the rollout first resolves effective
+// logical targets (including External clamping), then persists those targets.
+func (m *LeaderWorkerSetManager) prepareSubRoles(ctx context.Context, ds *disaggv1.DisaggregatedSet, lws *leaderv1.LeaderWorkerSet, counts map[string]int) (*replicagroups.Snapshot, bool, error) {
+	if len(counts) == 0 && lws.Annotations[subRoleReplicasAnnotation] == "" && lws.Annotations[subRolePlanAnnotation] == "" {
+		return nil, true, nil
+	}
+	if lws.Annotations[subRolePlanAnnotation] == "" {
+		if len(counts) == 0 {
+			// Removing routing preserves physical Spec until cleanup is observed.
+			err := m.scaleSubRoles(ctx, ds, lws, map[string]int{"": int(getLWSReplicas(lws))})
+			if errors.Is(err, errReplicaGroupsPending) {
+				err = nil
+			}
+			return nil, false, err
+		}
+		changed, err := m.initializeSubRoles(ctx, lws, counts)
+		if err != nil || changed {
+			return nil, false, err
+		}
+	}
+	return m.syncSubRoleGroups(ctx, lws)
 }
 
 // prepareSubRoleRevisions resumes every accepted transaction before expanding
@@ -104,32 +170,7 @@ func (m *LeaderWorkerSetManager) prepareSubRoleRevisions(ctx context.Context, ds
 			if role := configs[name]; role != nil {
 				counts = desiredSubRoles(role, desired)
 			}
-			if len(counts) == 0 && lws.Annotations[subRoleReplicasAnnotation] == "" && lws.Annotations[subRolePlanAnnotation] == "" {
-				continue
-			}
-			// Finish a pending plan before changing even its initial baseline.
-			if lws.Annotations[subRolePlanAnnotation] == "" {
-				if len(counts) == 0 {
-					// Removing routing partitions does not remove physical groups.
-					// Finish unlabeling/unprotecting before returning to an ordinary
-					// parent-only planner layout, including during a template rollout.
-					err := m.scaleSubRoles(ctx, ds, lws, map[string]int{"": int(getLWSReplicas(lws))})
-					if err != nil && !errors.Is(err, errReplicaGroupsPending) {
-						return nil, false, err
-					}
-					settled = false
-					continue
-				}
-				changed, err := m.initializeSubRoles(ctx, lws, counts, revision.Revision == target.Revision)
-				if err != nil {
-					return nil, false, err
-				}
-				if changed {
-					settled = false
-					continue
-				}
-			}
-			s, ready, err := m.syncSubRoleGroups(ctx, lws)
+			s, ready, err := m.prepareSubRoles(ctx, ds, lws, counts)
 			if err != nil {
 				return nil, false, err
 			}
@@ -150,9 +191,8 @@ func groupSubRole(group replicagroups.Group) (string, bool) {
 	return name, true
 }
 
-func expandSubRoleRevision(revision disaggutils.RevisionRoles, snapshots map[string]*replicagroups.Snapshot, readiness rolloutReadiness) (disaggutils.RevisionRoles, error) {
-	expanded := revision
-	expanded.Roles = map[string]*leaderv1.LeaderWorkerSet{}
+func expandSubRoleRevision(revision disaggutils.RevisionRoles, snapshots map[string]*replicagroups.Snapshot, readiness rolloutReadiness) (rolloutRevision, error) {
+	expanded := rolloutRevision{Revision: revision.Revision, createdAt: revision.LatestCreationTime(), Roles: map[string]*rolloutRole{}}
 	for name, lws := range revision.Roles {
 		if snapshot := snapshots[lws.Name]; snapshot != nil {
 			lws = snapshot.LWS
@@ -162,7 +202,7 @@ func expandSubRoleRevision(revision disaggutils.RevisionRoles, snapshots map[str
 			return expanded, err
 		}
 		if len(counts) == 0 {
-			expanded.Roles[name] = lws
+			expanded.Roles[name] = &rolloutRole{LWS: lws, Replicas: int(getLWSReplicas(lws)), InitialReplicas: revision.GetInitialReplicasPerRole(name)}
 			continue
 		}
 		// Each child is an ordinary planner role. The physical LWS is only
@@ -180,11 +220,7 @@ func expandSubRoleRevision(revision disaggutils.RevisionRoles, snapshots map[str
 		}
 		for child, count := range counts {
 			key := childRoleKey(name, child)
-			logical := lws.DeepCopy()
-			logical.Name = lws.Name + "/" + child
-			logical.Spec.Replicas = ptr.To(int32(count))
-			logical.Annotations[physicalLWSAnnotation] = lws.Name
-			logical.Annotations[disaggv1.InitialReplicasAnnotationKey] = strconv.Itoa(initial[child])
+			logical := &rolloutRole{LWS: lws, SubRole: child, Replicas: count, InitialReplicas: initial[child]}
 			expanded.Roles[key] = logical
 			// Keep every leader in the snapshot so a native pending deletion is
 			// reserved against this child too; filter only readiness, not victims.
@@ -195,7 +231,7 @@ func expandSubRoleRevision(revision disaggutils.RevisionRoles, snapshots map[str
 				view.Groups[i].Ready = group.Ready && coherent && assigned == child
 			}
 			availability := view.Availability()
-			readiness[logical.Name] = replicaReadiness{raw: int(availability.ReadyReplicas), committed: int(availability.RetainedReadyReplicas)}
+			readiness[logical.readinessKey()] = replicaReadiness{raw: int(availability.ReadyReplicas), committed: int(availability.RetainedReadyReplicas)}
 		}
 	}
 	return expanded, nil
@@ -223,15 +259,22 @@ func expandSubRoleSpec(ds *disaggv1.DisaggregatedSet, desired map[string]int) *d
 	return expanded
 }
 
-func physicalSubRoleLWS(logical *leaderv1.LeaderWorkerSet) *leaderv1.LeaderWorkerSet {
-	name := logical.Annotations[physicalLWSAnnotation]
-	if name == "" {
-		return logical
+// syncSubRoleBaseline records the same resolved targets the ordinary planner
+// consumes, in one physical write. A revision's child vector freezes once old.
+func (m *LeaderWorkerSetManager) syncSubRoleBaseline(ctx context.Context, lws *leaderv1.LeaderWorkerSet, initial map[string]int) error {
+	if err := validateSubRoleCounts(initial); err != nil {
+		return err
 	}
-	physical := logical.DeepCopy()
-	physical.Name = name
-	counts, _ := subRoleCounts(physical, subRoleReplicasAnnotation)
-	physical.Spec.Replicas = ptr.To(int32(countSubRoles(counts)))
-	delete(physical.Annotations, physicalLWSAnnotation)
-	return physical
+	current, err := subRoleCounts(lws, disaggv1.InitialSubRoleReplicasAnnotationKey)
+	if err != nil {
+		return err
+	}
+	total := strconv.Itoa(countSubRoles(initial))
+	if maps.Equal(current, initial) && lws.Annotations[disaggv1.InitialReplicasAnnotationKey] == total {
+		return nil
+	}
+	return m.patchSubRoleLWS(ctx, lws, func(l *leaderv1.LeaderWorkerSet) {
+		setSubRoleJSON(l, disaggv1.InitialSubRoleReplicasAnnotationKey, initial)
+		l.Annotations[disaggv1.InitialReplicasAnnotationKey] = total
+	})
 }

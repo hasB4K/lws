@@ -184,6 +184,29 @@ func (executor *RollingUpdateExecutor) reconcileExistingRollout(
 	if err != nil {
 		return ctrl.Result{}, false, err
 	}
+	snapshots, settled, err := executor.LWSManager.prepareSubRoleRevisions(ctx, disaggregatedSet, oldRevisions, targetRevision, desiredReplicasByRole)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if !settled {
+		return ctrl.Result{RequeueAfter: time.Second}, false, nil
+	}
+	if len(snapshots) > 0 {
+		disaggregatedSet = expandSubRoleSpec(disaggregatedSet, desiredReplicasByRole)
+		for i := range oldRevisions {
+			oldRevisions[i], err = expandSubRoleRevision(oldRevisions[i], snapshots, inputs.readiness)
+			if err != nil {
+				return ctrl.Result{}, false, err
+			}
+		}
+		targetRevision, err = expandSubRoleRevision(targetRevision, snapshots, inputs.readiness)
+		if err != nil {
+			return ctrl.Result{}, false, err
+		}
+		readiness := inputs.readiness
+		inputs = buildRolloutInputs(disaggregatedSet, oldRevisions, targetRevision, desiredReplicasByRole)
+		inputs.readiness = readiness
+	}
 
 	specComplete, targetReady := rolloutCompletionStatus(oldRevisions, targetRevision, inputs.allRoleNames, inputs.targetReplicas, inputs.readiness, inputs.scaleDuringRollout)
 	if specComplete {
@@ -207,7 +230,7 @@ func (executor *RollingUpdateExecutor) reconcileExistingRollout(
 					return ctrl.Result{}, false, err
 				}
 			}
-		} else if err := executor.scaleRevision(ctx, disaggregatedSet, targetRevision, inputs.targetRoleNames, inputs.targetReplicas, scaleUp); err != nil {
+		} else if err := executor.scaleRevision(ctx, disaggregatedSet, targetRevision, inputs.allRoleNames, inputs.targetReplicas, scaleUp); err != nil {
 			return ctrl.Result{}, false, err
 		}
 		return ctrl.Result{RequeueAfter: time.Second}, false, nil
@@ -225,6 +248,9 @@ func (executor *RollingUpdateExecutor) reconcileExistingRollout(
 	}
 
 	if err := executor.applyRolloutStep(ctx, disaggregatedSet, targetRevision, inputs, selectedRevision, selectedState, selectedStep); err != nil {
+		if errors.Is(err, errReplicaGroupsPending) {
+			return ctrl.Result{RequeueAfter: time.Second}, false, nil
+		}
 		return ctrl.Result{}, false, err
 	}
 
@@ -241,6 +267,12 @@ func buildRolloutInputs(
 ) rolloutInputs {
 	targetRoleNames := disaggregatedsetutils.GetRoleNames(disaggregatedSet)
 	desiredRoles, oldRoles := collectDesiredAndOldRoles(targetRoleNames, oldRevisions)
+	// Virtual membership does not create a revision. A child issued only in
+	// the current target can disappear from the desired spec while old physical
+	// parents still exist; keep its logical Spec visible until it reaches zero.
+	for name := range targetRevision.Roles {
+		oldRoles.Insert(name)
+	}
 	removedRoleNames := sets.List(oldRoles.Difference(desiredRoles))
 	allRoleNames := append(slices.Clone(targetRoleNames), removedRoleNames...)
 	return rolloutInputs{
@@ -357,11 +389,11 @@ func (executor *RollingUpdateExecutor) applyRolloutStep(
 		return err
 	}
 	if inputs.scaleDuringRollout {
-		if err := executor.scaleRevision(ctx, disaggregatedSet, targetRevision, inputs.targetRoleNames, selectedStep.New, scaleDown); err != nil {
+		if err := executor.scaleRevision(ctx, disaggregatedSet, targetRevision, inputs.allRoleNames, selectedStep.New, scaleDown); err != nil {
 			return err
 		}
 	}
-	if err := executor.scaleRevision(ctx, disaggregatedSet, targetRevision, inputs.targetRoleNames, selectedStep.New, scaleUp); err != nil {
+	if err := executor.scaleRevision(ctx, disaggregatedSet, targetRevision, inputs.allRoleNames, selectedStep.New, scaleUp); err != nil {
 		return err
 	}
 	if selectedStep.UsesBootstrapSurge {
@@ -398,11 +430,15 @@ func (executor *RollingUpdateExecutor) targetUnschedulableRoles(
 		if int(getLWSReplicas(lws)) <= readiness[lws.Name].committed {
 			continue
 		}
-		pods, err := executor.LWSManager.listPods(ctx, lws)
+		pods, err := executor.LWSManager.listPods(ctx, physicalSubRoleLWS(lws))
 		if err != nil {
 			return nil, err
 		}
 		for j := range pods {
+			_, child := roleParts(roleName)
+			if child != "" && pods[j].Labels[disaggregatedsetv1.SubRoleLabelKey] != child {
+				continue
+			}
 			if podIsPersistentlyUnschedulable(&pods[j], now) {
 				result[i] = true
 				break
@@ -684,9 +720,39 @@ func (executor *RollingUpdateExecutor) scaleRevision(
 	action := "Scaling " + string(direction)
 
 	log := logf.FromContext(ctx)
+	virtualDone := sets.New[string]()
 	for i, name := range roleNames {
 		lws := revision.Roles[name]
 		if lws == nil {
+			continue
+		}
+		if physicalName := lws.Annotations[physicalLWSAnnotation]; physicalName != "" {
+			if virtualDone.Has(physicalName) {
+				continue
+			}
+			virtualDone.Insert(physicalName)
+			counts, err := subRoleCounts(lws, subRoleReplicasAnnotation)
+			if err != nil {
+				return err
+			}
+			for j, logicalName := range roleNames {
+				logical := revision.Roles[logicalName]
+				if logical == nil || logical.Annotations[physicalLWSAnnotation] != physicalName {
+					continue
+				}
+				_, child := roleParts(logicalName)
+				if child == "" {
+					continue
+				}
+				if direction == scaleDown {
+					counts[child] = min(counts[child], targets[j])
+				} else {
+					counts[child] = max(counts[child], targets[j])
+				}
+			}
+			if err := executor.LWSManager.scaleSubRoles(ctx, ds, physicalSubRoleLWS(lws), counts); err != nil {
+				return err
+			}
 			continue
 		}
 		currentSpec := int(getLWSReplicas(lws))

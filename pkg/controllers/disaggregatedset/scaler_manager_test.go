@@ -18,11 +18,13 @@ package disaggregatedset
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
@@ -30,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
+	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/test/wrappers"
 )
 
@@ -186,4 +189,90 @@ func TestScalerManagerWriteStatus(t *testing.T) {
 // for one call in tests.
 func apierrorsIsNotFound(err error) bool {
 	return err != nil && client.IgnoreNotFound(err) == nil
+}
+
+func TestResolveSubRoleTargets(t *testing.T) {
+	parent := staticRole("pool")
+	parent.Spec.Replicas = ptr.To[int32](99) // Ignored for partitioned roles.
+	parent.SubRoles = []disaggregatedsetv1.DisaggregatedSubRoleSpec{
+		{Name: "default"}, {Name: "paused", Replicas: ptr.To[int32](0)},
+		{Name: "external", Scaling: &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal}},
+	}
+	for _, tc := range []struct {
+		name     string
+		external *int32
+		want     map[string]int
+	}{
+		{"missing child", nil, map[string]int{"pool/default": 1, "pool/paused": 0}},
+		{"known zero child", ptr.To[int32](0), map[string]int{"pool/default": 1, "pool/paused": 0, "pool/external": 0, "pool": 1}},
+		{"known positive child", ptr.To[int32](3), map[string]int{"pool/default": 1, "pool/paused": 0, "pool/external": 3, "pool": 4}},
+		{"overflow omits parent", ptr.To[int32](math.MaxInt32), map[string]int{"pool/default": 1, "pool/paused": 0, "pool/external": math.MaxInt32}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scalers := map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler{}
+			if tc.external != nil {
+				scalers["pool/external"] = &disaggregatedsetv1.DisaggregatedSetRoleScaler{Spec: disaggregatedsetv1.DisaggregatedSetRoleScalerSpec{Replicas: *tc.external}}
+			}
+			assert.Equal(t, tc.want, resolveDesiredReplicasByRole(newDSWithRoles("d", parent), scalers))
+		})
+	}
+}
+
+func TestSubRoleScalerLifecycleAndSelector(t *testing.T) {
+	parent := staticRole("pool")
+	parent.SubRoles = []disaggregatedsetv1.DisaggregatedSubRoleSpec{
+		{Name: "hot", Scaling: &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal}},
+		{Name: "cold", Replicas: ptr.To[int32](0)},
+	}
+	ds := newDSWithRoles("d", parent)
+	c := fake.NewClientBuilder().WithScheme(wrappers.DisaggregatedSetTestScheme()).WithObjects(ds).
+		WithStatusSubresource(&disaggregatedsetv1.DisaggregatedSetRoleScaler{}).Build()
+	m := NewScalerManager(c, events.NewFakeRecorder(10))
+	scalers, err := m.Reconcile(t.Context(), ds, func(key string) int32 {
+		require.Equal(t, "pool/hot", key)
+		return 3
+	})
+	require.NoError(t, err)
+	require.Len(t, scalers, 1)
+	scaler := scalers["pool/hot"]
+	require.NotNil(t, scaler)
+	assert.Equal(t, "d-pool-hot", scaler.Name)
+	assert.EqualValues(t, 3, scaler.Spec.Replicas)
+	assert.Equal(t, "pool", scaler.Labels[disaggregatedsetv1.RoleLabelKey])
+	assert.Equal(t, "hot", scaler.Labels[disaggregatedsetv1.SubRoleLabelKey])
+	require.NoError(t, m.WriteStatus(t.Context(), ds, scalers, map[string]int32{"pool/hot": 2}))
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(scaler), scaler))
+	assert.EqualValues(t, 2, scaler.Status.Replicas)
+	selector, err := labels.Parse(scaler.Status.Selector)
+	require.NoError(t, err)
+	podLabels := labels.Set{disaggregatedsetv1.SetNameLabelKey: ds.Name, disaggregatedsetv1.RoleLabelKey: "pool", disaggregatedsetv1.SubRoleLabelKey: "hot", leaderworkersetv1.WorkerIndexLabelKey: "0"}
+	assert.True(t, selector.Matches(podLabels))
+	podLabels[leaderworkersetv1.WorkerIndexLabelKey] = "1"
+	assert.False(t, selector.Matches(podLabels), "workers must not enter HPA's group denominator")
+	podLabels[leaderworkersetv1.WorkerIndexLabelKey], podLabels[disaggregatedsetv1.SubRoleLabelKey] = "0", "cold"
+	assert.False(t, selector.Matches(podLabels), "sibling pool must not enter the selector")
+	ds.Spec.Roles[0].SubRoles[0].Scaling = nil
+	scalers, err = m.Reconcile(t.Context(), ds, nil)
+	require.NoError(t, err)
+	assert.Empty(t, scalers)
+	assert.True(t, apierrorsIsNotFound(c.Get(t.Context(), client.ObjectKeyFromObject(scaler), scaler)))
+}
+
+func TestSubRoleScalerDoesNotAdoptDeletingParentNameCollision(t *testing.T) {
+	ds := newDSWithRoles("d", externalRole("pool-hot"))
+	c := fake.NewClientBuilder().WithScheme(wrappers.DisaggregatedSetTestScheme()).WithObjects(ds).Build()
+	m := NewScalerManager(c, events.NewFakeRecorder(10))
+	scalers, err := m.Reconcile(t.Context(), ds, func(string) int32 { return 9 })
+	require.NoError(t, err)
+	old := scalers["pool-hot"]
+	old.Finalizers = []string{"test/hold"}
+	require.NoError(t, c.Update(t.Context(), old))
+	// These two topologies are individually valid but reuse one DNS name.
+	ds.Spec.Roles = []disaggregatedsetv1.DisaggregatedRoleSpec{{Name: "pool", SubRoles: []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Name: "hot", Scaling: externalRole("").Scaling}}}}
+	scalers, err = m.Reconcile(t.Context(), ds, func(string) int32 { return 2 })
+	require.NoError(t, err)
+	assert.Empty(t, scalers, "new child's target remains unresolved until the old scaler is gone")
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(old), old))
+	assert.False(t, old.DeletionTimestamp.IsZero())
+	assert.EqualValues(t, 9, old.Spec.Replicas, "old parent target must not seed the new child")
 }

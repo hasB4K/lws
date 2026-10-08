@@ -20,18 +20,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
@@ -55,7 +57,7 @@ type DisaggregatedSetReconciler struct {
 // +kubebuilder:rbac:groups=disaggregatedset.x-k8s.io,resources=disaggregatedsetrolescalers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=leaderworkerset.x-k8s.io,resources=leaderworkersets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=leaderworkerset.x-k8s.io,resources=leaderworkersets/status,verbs=get
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=list
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -211,6 +213,8 @@ func (r *DisaggregatedSetReconciler) resolveRevision(
 // even while its old LWS objects are still draining down to 0 (see RoleStatuses doc).
 func (r *DisaggregatedSetReconciler) updateStatus(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, roleNames []string, revision string, desiredReplicasByRole map[string]int) error {
 	roleStatuses := make([]disaggregatedsetv1.RoleStatus, 0, len(roleNames))
+	roleConfigs := disaggregatedsetutils.GetRoleConfigs(disaggregatedSet)
+	subRolesAssigned, hasSubRoles := true, false
 	sliceCount := disaggregatedsetutils.GetSlices(disaggregatedSet)
 	unresolvedRoles := unresolvedReplicaTargetRoles(roleNames, desiredReplicasByRole)
 	available := true
@@ -231,6 +235,26 @@ func (r *DisaggregatedSetReconciler) updateStatus(ctx context.Context, disaggreg
 				roleStatus.UpdatedReplicas += lws.Status.UpdatedReplicas
 			}
 		}
+		if config := roleConfigs[role]; config != nil && len(config.SubRoles) > 0 {
+			hasSubRoles = true
+			children, assigned, err := r.LWSManager.subRoleStatus(ctx, config, lwsList, revision)
+			if err != nil {
+				return err
+			}
+			subRolesAssigned = subRolesAssigned && assigned
+			roleStatus.SubRoleStatuses = children
+			roleStatus.Replicas, roleStatus.ReadyReplicas, roleStatus.UpdatedReplicas = 0, 0, 0
+			for _, child := range children {
+				roleStatus.Replicas += child.Replicas
+				roleStatus.ReadyReplicas += child.ReadyReplicas
+				roleStatus.UpdatedReplicas += child.UpdatedReplicas
+				desired := int32(desiredReplicasByRole[childRoleKey(role, child.Name)]) * sliceCount
+				if child.Replicas != desired || child.ReadyReplicas != desired || child.UpdatedReplicas != desired {
+					available = false
+				}
+			}
+			available = available && assigned
+		}
 		roleStatuses = append(roleStatuses, roleStatus)
 
 		// An External role with no resolved target (e.g. its generated scaler name
@@ -250,6 +274,18 @@ func (r *DisaggregatedSetReconciler) updateStatus(ctx context.Context, disaggreg
 	}
 
 	changed := setRoleStatuses(disaggregatedSet, roleStatuses)
+	if hasSubRoles {
+		condition := metav1.Condition{Type: string(disaggregatedsetv1.DisaggregatedSetSubRolesAssigned), Status: metav1.ConditionTrue, Reason: "Assigned", Message: "Every replica group has a coherent sub-role assignment", ObservedGeneration: disaggregatedSet.Generation}
+		if !subRolesAssigned {
+			condition.Status = metav1.ConditionFalse
+			condition.Reason = "AssignmentPending"
+			condition.Message = "Waiting for group sub-role assignments"
+		}
+		changed = setDisaggregatedSetCondition(disaggregatedSet, condition) || changed
+	} else if meta.FindStatusCondition(disaggregatedSet.Status.Conditions, string(disaggregatedsetv1.DisaggregatedSetSubRolesAssigned)) != nil {
+		meta.RemoveStatusCondition(&disaggregatedSet.Status.Conditions, string(disaggregatedsetv1.DisaggregatedSetSubRolesAssigned))
+		changed = true
+	}
 	if setDisaggregatedSetCondition(disaggregatedSet, disaggregatedSetCondition(disaggregatedSet, available, unresolvedRoles)) {
 		changed = true
 	}
@@ -268,7 +304,7 @@ func (r *DisaggregatedSetReconciler) updateStatus(ctx context.Context, disaggreg
 }
 
 func setRoleStatuses(disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, roleStatuses []disaggregatedsetv1.RoleStatus) bool {
-	if slices.Equal(disaggregatedSet.Status.RoleStatuses, roleStatuses) {
+	if equality.Semantic.DeepEqual(disaggregatedSet.Status.RoleStatuses, roleStatuses) {
 		return false
 	}
 	disaggregatedSet.Status.RoleStatuses = roleStatuses
@@ -392,6 +428,32 @@ func (r *DisaggregatedSetReconciler) seedForRole(ctx context.Context, ds *disagg
 		} else {
 			sums[role]++
 		}
+		counts, err := subRoleCounts(lws, subRoleReplicasAnnotation)
+		if err != nil {
+			return nil, err
+		}
+		if len(counts) == 0 {
+			for _, config := range ds.Spec.Roles {
+				if config.Name != role || len(config.SubRoles) == 0 {
+					continue
+				}
+				defaults := map[string]int{}
+				for _, child := range config.SubRoles {
+					defaults[child.Name] = 1
+					if child.Replicas != nil {
+						defaults[child.Name] = int(*child.Replicas)
+					}
+				}
+				counts = fitSubRoles(defaults, int(getLWSReplicas(lws)))
+			}
+		}
+		for child, count := range counts {
+			key := childRoleKey(role, child)
+			seen[key] = true
+			if key != role {
+				sums[key] += int32(count)
+			}
+		}
 	}
 	return func(role string) int32 {
 		if !seen[role] {
@@ -420,10 +482,21 @@ func (r *DisaggregatedSetReconciler) updateScalerStatus(
 	observed := make(map[string]int32, len(scalers))
 	for _, lws := range all {
 		role := lws.Labels[disaggregatedsetv1.RoleLabelKey]
-		if _, ok := scalers[role]; !ok {
-			continue
+		if _, ok := scalers[role]; ok {
+			observed[role] += lws.Status.Replicas
 		}
-		observed[role] += lws.Status.Replicas
+		for _, config := range ds.Spec.Roles {
+			if config.Name != role || len(config.SubRoles) == 0 {
+				continue
+			}
+			children, _, err := r.LWSManager.subRoleStatus(ctx, &config, []*leaderworkersetv1.LeaderWorkerSet{lws}, "")
+			if err != nil {
+				return err
+			}
+			for _, child := range children {
+				observed[childRoleKey(role, child.Name)] += child.Replicas
+			}
+		}
 	}
 	return r.ScalerManager.WriteStatus(ctx, ds, scalers, observed)
 }
@@ -508,17 +581,21 @@ func (r *DisaggregatedSetReconciler) createRollingUpdateExecutor() *RollingUpdat
 	}
 }
 
-//nolint:unparam // Result is always empty but signature matches controller-runtime pattern
 func (r *DisaggregatedSetReconciler) reconcileCurrentRevision(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, revision string, desiredReplicasByRole map[string]int) (ctrl.Result, error) {
 	roleConfigs := disaggregatedsetutils.GetRoleConfigs(disaggregatedSet)
+	result := ctrl.Result{}
 
 	for role, config := range roleConfigs {
 		if err := r.reconcileCurrentRevisionRole(ctx, disaggregatedSet, slice, role, config, revision, desiredReplicasByRole); err != nil {
+			if errors.Is(err, errReplicaGroupsPending) {
+				result.RequeueAfter = time.Second
+				continue
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile %s role: %w", role, err)
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
 func (r *DisaggregatedSetReconciler) reconcileCurrentRevisionRole(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, role string, config *disaggregatedsetv1.DisaggregatedRoleSpec, revision string, desiredReplicasByRole map[string]int) error {
@@ -535,6 +612,32 @@ func (r *DisaggregatedSetReconciler) reconcileCurrentRevisionRole(ctx context.Co
 	// desired size; no rolling update is needed.
 	if existing == nil {
 		return r.LWSManager.Create(ctx, disaggregatedSet, config, slice, revision, int(desiredReplicas), int(desiredReplicas))
+	}
+	if len(config.SubRoles) > 0 || existing.Annotations[subRoleReplicasAnnotation] != "" {
+		counts := desiredSubRoles(config, desiredReplicasByRole)
+		if len(counts) == 0 {
+			// First remove routing at the current physical size. The ordinary
+			// role path applies any simultaneous replica change after cleanup.
+			return r.LWSManager.scaleSubRoles(ctx, disaggregatedSet, existing, map[string]int{"": int(getLWSReplicas(existing))})
+		}
+		if existing.Annotations[subRolePlanAnnotation] != "" {
+			_, _, err := r.LWSManager.syncSubRoleGroups(ctx, existing)
+			if err != nil {
+				return err
+			}
+			return errReplicaGroupsPending
+		}
+		changed, err := r.LWSManager.initializeSubRoles(ctx, existing, counts, true)
+		if err != nil {
+			return err
+		}
+		if changed {
+			return errReplicaGroupsPending
+		}
+		if err := r.LWSManager.scaleSubRoles(ctx, disaggregatedSet, existing, counts); err != nil {
+			return err
+		}
+		return nil // LWS and Pod watches resume settled virtual-role reconciliation.
 	}
 
 	// This revision remains the current target outside a revision transition, so
@@ -668,6 +771,13 @@ func (r *DisaggregatedSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&disaggregatedsetv1.DisaggregatedSet{}).
 		Owns(&leaderworkersetv1.LeaderWorkerSet{}).
 		Owns(&disaggregatedsetv1.DisaggregatedSetRoleScaler{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, pod client.Object) []ctrl.Request {
+			name := pod.GetLabels()[disaggregatedsetv1.SetNameLabelKey]
+			if name == "" {
+				return nil
+			}
+			return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: pod.GetNamespace(), Name: name}}}
+		})).
 		Named("disaggregatedset").
 		Complete(r)
 }

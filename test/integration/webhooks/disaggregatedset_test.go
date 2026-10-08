@@ -202,4 +202,46 @@ var _ = ginkgo.Describe("disaggregatedset group identity", func() {
 		disagg.Spec.Roles[0].Spec.LeaderWorkerTemplate.MaxGroupRestarts = ptr.To(int32(1))
 		gomega.Expect(k8sClient.Create(ctx, disagg)).To(gomega.Succeed())
 	})
+
+	ginkgo.DescribeTable("virtual role schema",
+		func(identity leaderworkerset.GroupIdentityType, invalid string) {
+			ds := buildDisaggregatedSet("virtual-schema").Obj()
+			ds.Spec.Roles = ds.Spec.Roles[:1] // One physical role is enough.
+			role := &ds.Spec.Roles[0]
+			role.Spec.GroupIdentity = identity
+			role.SubRoles = []disaggregatedset.DisaggregatedSubRoleSpec{{Name: "hot"}, {Name: "cold", Replicas: ptr.To[int32](0)}}
+			switch invalid {
+			case "duplicate":
+				role.SubRoles[1].Name = "hot"
+			case "negative":
+				role.SubRoles[0].Replicas = ptr.To[int32](-1)
+			case "external replicas":
+				role.SubRoles[0].Scaling = &disaggregatedset.RoleScaling{Mode: disaggregatedset.RoleScalingExternal}
+				role.SubRoles[0].Replicas = ptr.To[int32](0)
+			case "invalid child name":
+				role.SubRoles[0].Name = "parent/child"
+			}
+			err := k8sClient.Create(ctx, ds)
+			if invalid == "Hash subroles" {
+				gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("subRoles requires Ordinal group identity")))
+				return
+			}
+			if invalid != "" {
+				gomega.Expect(err).To(gomega.HaveOccurred())
+				return
+			}
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			stored := &disaggregatedset.DisaggregatedSet{}
+			gomega.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ds.Name, Namespace: ds.Namespace}, stored)).To(gomega.Succeed())
+			gomega.Expect(stored.Spec.Roles).To(gomega.HaveLen(1))
+			gomega.Expect(stored.Spec.Roles[0].SubRoles).To(gomega.Equal(role.SubRoles))
+			gomega.Expect(stored.Spec.Roles[0].Spec.GroupIdentity).To(gomega.Equal(identity))
+		},
+		ginkgo.Entry("persists Ordinal pools and independent zero", leaderworkerset.GroupIdentityOrdinal, ""),
+		ginkgo.Entry("rejects Hash pools until the follow-up", leaderworkerset.GroupIdentityHash, "Hash subroles"),
+		ginkgo.Entry("rejects duplicate child keys", leaderworkerset.GroupIdentityOrdinal, "duplicate"),
+		ginkgo.Entry("rejects negative targets", leaderworkerset.GroupIdentityOrdinal, "negative"),
+		ginkgo.Entry("rejects External replicas", leaderworkerset.GroupIdentityOrdinal, "external replicas"),
+		ginkgo.Entry("rejects slash in child name", leaderworkerset.GroupIdentityOrdinal, "invalid child name"),
+	)
 })

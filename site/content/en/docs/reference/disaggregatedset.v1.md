@@ -76,6 +76,15 @@ RolloutStrategy.RollingUpdateConfiguration.Partition must not be set).</p>
    <p>Name is the unique identifier for this role.</p>
 </td>
 </tr>
+<tr><td><code>subRoles</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-DisaggregatedSubRoleSpec"><code>[]DisaggregatedSubRoleSpec</code></a>
+</td>
+<td>
+   <p>SubRoles partitions configuration-identical groups into routing pools.
+The parent replica target is their sum; parent scaling must be omitted
+and parent spec.replicas is ignored. Requires Ordinal group identity.</p>
+</td>
+</tr>
 <tr><td><code>scaling</code><br/>
 <a href="#disaggregatedset-x-k8s-io-v1-RoleScaling"><code>RoleScaling</code></a>
 </td>
@@ -265,9 +274,9 @@ AdvanceRollout opts into scaling during the rollout.</p>
 
 <p>DisaggregatedSetSpec defines the desired state of DisaggregatedSet.</p>
 <p>The all-or-nothing replicas rule (either every role has replicas &gt; 0, or
-every role has replicas == 0) applies only to non-External roles. External
-roles are exempt because their effective replicas live outside the DS spec —
-they are driven via DisaggregatedSetRoleScaler.spec.replicas.</p>
+every role has replicas == 0) applies only to non-External, unpartitioned
+roles. External targets come from scalers; sub-roles may independently scale
+to zero without pausing sibling routing pools.</p>
 
 
 <table class="table">
@@ -279,7 +288,7 @@ they are driven via DisaggregatedSetRoleScaler.spec.replicas.</p>
 <a href="#disaggregatedset-x-k8s-io-v1-DisaggregatedRoleSpec"><code>[]DisaggregatedRoleSpec</code></a>
 </td>
 <td>
-   <p>Roles defines the list of roles (at least 2 required).
+   <p>Roles defines the list of roles (at least 1 required).
 Each role has a unique name and its own configuration.</p>
 </td>
 </tr>
@@ -363,6 +372,48 @@ Each condition has a unique type and reflects the status of a specific aspect of
 </tbody>
 </table>
 
+## `DisaggregatedSubRoleSpec`     {#disaggregatedset-x-k8s-io-v1-DisaggregatedSubRoleSpec}
+
+
+**Appears in:**
+
+- [DisaggregatedRoleSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedRoleSpec)
+
+
+<p>DisaggregatedSubRoleSpec defines an independently scalable routing pool
+whose groups share their parent role's pod templates.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+
+
+<tr><td><code>name</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>Name is unique within the parent role.</p>
+</td>
+</tr>
+<tr><td><code>replicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>Replicas counts assigned LWS groups. Static or omitted scaling defaults
+this value to one; External scaling requires it to be omitted.</p>
+</td>
+</tr>
+<tr><td><code>scaling</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-RoleScaling"><code>RoleScaling</code></a>
+</td>
+<td>
+   <p>Scaling selects the source of this sub-role's replica target.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
 ## `PlacementPolicy`     {#disaggregatedset-x-k8s-io-v1-PlacementPolicy}
     
 
@@ -417,6 +468,8 @@ topologyKey. Required when Type is not None.</p>
 **Appears in:**
 
 - [DisaggregatedRoleSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedRoleSpec)
+
+- [DisaggregatedSubRoleSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedSubRoleSpec)
 
 
 <p>RoleScaling configures how replicas are determined for a role. Sub-struct
@@ -498,6 +551,13 @@ inline spec.replicas; External uses the auto-created scaler CR.</p>
    <p>UpdatedReplicas is the number of replicas updated to the latest revision.</p>
 </td>
 </tr>
+<tr><td><code>subRoleStatuses</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-SubRoleStatus"><code>[]SubRoleStatus</code></a>
+</td>
+<td>
+   <p>SubRoleStatuses contains observed counts for this role's routing pools.</p>
+</td>
+</tr>
 </tbody>
 </table>
 
@@ -512,3 +572,51 @@ inline spec.replicas; External uses the auto-created scaler CR.</p>
 
 <p>ScalingDuringRolloutPolicy controls how replica target changes interact with
 an active revision transition.</p>
+
+## `SubRoleStatus`     {#disaggregatedset-x-k8s-io-v1-SubRoleStatus}
+
+
+**Appears in:**
+
+- [RoleStatus](#disaggregatedset-x-k8s-io-v1-RoleStatus)
+
+
+<p>SubRoleStatus defines the observed state of one routing pool.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+
+
+<tr><td><code>name</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>Name matches a sub-role within its parent role.</p>
+</td>
+</tr>
+<tr><td><code>replicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>Replicas is the number of assigned LWS groups.</p>
+</td>
+</tr>
+<tr><td><code>readyReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>ReadyReplicas counts whole ready groups with a consistent assignment
+on every member, not just ready leaders.</p>
+</td>
+</tr>
+<tr><td><code>updatedReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>UpdatedReplicas counts assigned groups on the current revision.</p>
+</td>
+</tr>
+</tbody>
+</table>

@@ -18,6 +18,7 @@ package disaggregatedset
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 
@@ -30,6 +31,73 @@ import (
 	disaggv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
+
+func TestValidateSubRoles(t *testing.T) {
+	external := &disaggv1.RoleScaling{Mode: disaggv1.RoleScalingExternal}
+	for _, tc := range []struct {
+		name      string
+		change    func(*disaggv1.DisaggregatedSet)
+		wantError string
+	}{
+		{"default Ordinal", func(*disaggv1.DisaggregatedSet) {}, ""},
+		{"explicit Ordinal", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].Spec.GroupIdentity = leaderworkerset.GroupIdentityOrdinal
+		}, ""},
+		{"Hash subroles deferred", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].Spec.GroupIdentity = leaderworkerset.GroupIdentityHash
+		}, "spec.roles[0].spec.groupIdentity: Forbidden: subRoles requires Ordinal group identity"},
+		{"unpartitioned Hash unchanged", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].Spec.GroupIdentity = leaderworkerset.GroupIdentityHash
+			ds.Spec.Roles[0].SubRoles = nil
+		}, ""},
+		{"static slices", func(ds *disaggv1.DisaggregatedSet) { ds.Spec.Slices = ptr.To[int32](2) }, ""},
+		{"independent zero", func(ds *disaggv1.DisaggregatedSet) { ds.Spec.Roles[0].SubRoles[0].Replicas = ptr.To[int32](0) }, ""},
+		{"parent scaling", func(ds *disaggv1.DisaggregatedSet) { ds.Spec.Roles[0].Scaling = external }, "parent scaling must be omitted"},
+		{"external child replicas", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].SubRoles[0].Scaling, ds.Spec.Roles[0].SubRoles[0].Replicas = external, ptr.To[int32](0)
+		}, "replicas must be omitted"},
+		{"external child slices", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].SubRoles[0].Scaling, ds.Spec.Slices = external, ptr.To[int32](2)
+		}, "spec.slices > 1"},
+		{"overflowing children", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].SubRoles[0].Replicas = ptr.To[int32](math.MaxInt32)
+		}, "maximum LWS replica count"},
+		{"worker label", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].Spec.LeaderWorkerTemplate.WorkerTemplate.Labels = map[string]string{disaggv1.SubRoleLabelKey: "hot"}
+		}, "reserved"},
+		{"leader label", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].Spec.LeaderWorkerTemplate.LeaderTemplate = &corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{disaggv1.SubRoleLabelKey: "hot"}}}
+		}, "reserved"},
+		{"role label", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].Labels = map[string]string{disaggv1.SubRoleLabelKey: "hot"}
+		}, "reserved"},
+		{"parent child scaler collision", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].SubRoles[0].Scaling = external
+			ds.Spec.Roles = append(ds.Spec.Roles, disaggv1.DisaggregatedRoleSpec{Name: "pool-hot", Scaling: external})
+		}, "scaler name collides"},
+		{"ignored parent zero cannot bypass rollout validation", func(ds *disaggv1.DisaggregatedSet) {
+			ds.Spec.Roles[0].Spec.Replicas = ptr.To[int32](0)
+			ds.Spec.Roles[0].Spec.RolloutStrategy.RollingUpdateConfiguration = &leaderworkerset.RollingUpdateConfiguration{MaxSurge: intstr.FromInt(0), MaxUnavailable: intstr.FromInt(0)}
+		}, "must not be 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ds := &disaggv1.DisaggregatedSet{ObjectMeta: metav1.ObjectMeta{Name: "ds"}, Spec: disaggv1.DisaggregatedSetSpec{
+				Roles: []disaggv1.DisaggregatedRoleSpec{{Name: "pool", SubRoles: []disaggv1.DisaggregatedSubRoleSpec{{Name: "hot"}, {Name: "cold"}}}},
+			}}
+			tc.change(ds)
+			webhook := &DisaggregatedSetWebhook{}
+			_, createErr := webhook.ValidateCreate(t.Context(), ds)
+			_, updateErr := webhook.ValidateUpdate(t.Context(), ds.DeepCopy(), ds)
+			for _, err := range []error{createErr, updateErr} {
+				if tc.wantError == "" {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, tc.wantError)
+				}
+			}
+		})
+	}
+}
 
 func TestValidateCreate(t *testing.T) {
 	webhook := &DisaggregatedSetWebhook{}

@@ -83,6 +83,15 @@ same retained-readiness checks. Old and target revisions never spend the same
 Ready credit in one decision. Completion requires exact target Spec and Ready,
 including when the desired replica count is zero.
 
+Scale changes can leave a role above its latest surge ceiling while historical
+old-role fractions block its reduction. Under `AdvanceRollout`, an old drain
+may bypass that fraction window only to release existing excess:
+`max(0, totalOldSpec + targetSpec - desired - maxSurge)`. The exception cannot
+drain below the ceiling, bypass availability or split required old roles.
+Ordinary retirement keeps its historical fraction window; pending-work budgets
+keep their original size baseline. This is an opt-in scale correction, not an
+extra growth allowance.
+
 The existing bounded emergency behavior remains: an unavailable target role
 can need one bootstrap surge slot; with a moving target, a Ready role blocked
 by fractional coordination at its new ceiling can also need one slot. Slots

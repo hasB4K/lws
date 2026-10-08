@@ -110,7 +110,7 @@ type roleRolloutSnapshot struct {
 	NewUsableReadyReplicas          int                 // Target Ready replicas, or zero when a required role is not Ready.
 	NewTargetReplicas               int                 // Desired target-revision replicas after rollout.
 	SurgeBaselineReplicas           int                 // Replica baseline to which MaxSurge is added.
-	AllowCoordinationBootstrap      bool                // Permit one emergency slot for a lagging existing target role.
+	ScaleDuringRollout              bool                // Permit bounded scale corrections and one coordination bootstrap slot.
 	Config                          RollingUpdateConfig // Surge and availability limits configured for this role.
 }
 
@@ -357,7 +357,7 @@ func snapshotForRolloutState(state RolloutState) rolloutSnapshot {
 			NewUsableReadyReplicas:          targetUsableReady[i],
 			NewTargetReplicas:               state.Target.DesiredReplicas[i],
 			SurgeBaselineReplicas:           surgeBaseline,
-			AllowCoordinationBootstrap:      state.ScaleDuringRollout,
+			ScaleDuringRollout:              state.ScaleDuringRollout,
 			Config:                          state.Config[i],
 		}
 	}
@@ -483,9 +483,9 @@ func furthestOldTargets(snapshot rolloutSnapshot, requiredRoles []bool) RoleRepl
 		initial[i] = role.InitialOldReplicas
 	}
 	targets := minimumAvailableTargets(snapshot, requiredRoles)
-	targets = boundDrainingRoleTargetsToWindow(current, initial, targets)
+	targets = boundDrainingSnapshotTargets(snapshot, current, initial, targets)
 	targets = boundOldTargetsByRevisionCompleteness(current, targets, requiredRoles)
-	targets = boundDrainingRoleTargetsToWindow(current, initial, targets)
+	targets = boundDrainingSnapshotTargets(snapshot, current, initial, targets)
 	// The shared floor may cover a role that this candidate never contained.
 	// In that case the candidate cannot make an unrelated partial drain safe.
 	if !availabilityPreserved(snapshot, targets, requiredRoles) {
@@ -642,7 +642,7 @@ func snapshotWithBootstrapSurge(
 	needed := false
 	for i, role := range snapshot {
 		atSurgeCeiling := role.OldSpecReplicas+role.NewSpecReplicas == role.SurgeBaselineReplicas+role.Config.MaxSurge
-		coordinationBlocked := role.AllowCoordinationBootstrap && atSurgeCeiling && role.NewCommittedReadyReplicas >= role.NewSpecReplicas
+		coordinationBlocked := role.ScaleDuringRollout && atSurgeCeiling && role.NewCommittedReadyReplicas >= role.NewSpecReplicas
 		if role.Config.MaxSurge+role.Config.MaxUnavailable > 0 &&
 			phaseTargets[i] > role.NewSpecReplicas && normalLimits[i] == role.NewSpecReplicas &&
 			(role.NewSpecReplicas == 0 || coordinationBlocked) {
@@ -769,6 +769,21 @@ func boundGrowingRoleTargetsToWindow(
 	for i, roleReplicaCount := range roleReplicaCounts {
 		windowLimit := window.maxProgressReplicasWithinWindow(roleReplicaCount)
 		bounded[i] = max(current[i], min(proposed[i], windowLimit))
+	}
+	return bounded
+}
+
+// boundDrainingSnapshotTargets preserves historical rollout coordination,
+// except that opt-in scaling may release existing physical excess. That
+// correction stops at the latest surge ceiling and still passes availability
+// and whole-revision completeness checks.
+func boundDrainingSnapshotTargets(snapshot rolloutSnapshot, current, reference, proposed RoleReplicaState) RoleReplicaState {
+	bounded := boundDrainingRoleTargetsToWindow(current, reference, proposed)
+	for i, role := range snapshot {
+		if role.ScaleDuringRollout {
+			excess := max(0, role.OldSpecReplicas+role.NewSpecReplicas-role.SurgeBaselineReplicas-role.Config.MaxSurge)
+			bounded[i] = min(bounded[i], max(proposed[i], current[i]-excess))
+		}
 	}
 	return bounded
 }

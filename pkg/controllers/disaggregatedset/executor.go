@@ -796,7 +796,7 @@ func validateReplicaTargets(
 	normalLimits RoleReplicaState,
 	newLimits RoleReplicaState,
 ) error {
-	if bounded := boundDrainingRoleTargetsToWindow(state.ActiveOld.SpecReplicas, state.ActiveOld.InitialReplicas, step.Past); !slices.Equal(bounded, step.Past) {
+	if bounded := boundDrainingSnapshotTargets(snapshot, state.ActiveOld.SpecReplicas, state.ActiveOld.InitialReplicas, step.Past); !slices.Equal(bounded, step.Past) {
 		return fmt.Errorf("old targets exceed the fractional coordination window")
 	}
 	growthTargets := slices.Clone(step.New)

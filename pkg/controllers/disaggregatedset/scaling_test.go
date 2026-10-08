@@ -159,12 +159,19 @@ func TestMovingTargetCoordinationBootstrapDoesNotStack(t *testing.T) {
 	require.Equal(t, []int{6, 3}, step.New)
 
 	// The decode role is now one above its ceiling. Neither repeated
-	// reconciliations nor its new Pod becoming Ready grant a second slot.
+	// reconciliations nor its new Pod becoming Ready grant a second slot;
+	// an availability-safe drain may release exactly the existing excess.
 	state.Target.SpecReplicas = slices.Clone(step.New)
 	for _, ready := range [][]int{{4, 2}, {4, 3}} {
 		state.Target.ReadyReplicas = ready
 		state.Target.RawReadyReplicas = slices.Clone(ready)
-		require.Nil(t, ComputeNextStep(state), "ready=%v", ready)
+		correction := ComputeNextStep(state)
+		require.NotNil(t, correction)
+		require.False(t, correction.UsesBootstrapSurge)
+		require.Equal(t, state.Target.SpecReplicas, correction.New)
+		require.Equal(t, []int{2, 1}, correction.Past, "release only the one excess old group")
+		require.NoError(t, validateUpdateStep(state, correction))
+		assertScalingSafety(t, state, correction)
 	}
 	// Once the other role catches up, ordinary retirement releases capacity.
 	state.Target.ReadyReplicas, state.Target.RawReadyReplicas = []int{6, 3}, []int{6, 3}
@@ -232,7 +239,8 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 			}
 		}
 	}
-	phaseTargets, growing, oldProgress, oldNext := make([]int, n), make([]int, n), make([]int, n), make([]int, n)
+	phaseTargets, growing, oldReference, oldProgress, oldNext := make([]int, n), make([]int, n), make([]int, n), make([]int, n), make([]int, n)
+	scaleCorrection := make([]bool, n)
 	steps := 0
 	for i := range state.Config {
 		phaseTargets[i] = state.Target.DesiredReplicas[i] - parkedServing[i]
@@ -241,12 +249,21 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 		}
 		phaseTargets[i] = max(state.Target.SpecReplicas[i], phaseTargets[i])
 		growing[i] = max(state.Target.SpecReplicas[i], step.New[i])
-		oldProgress[i] = state.ActiveOld.InitialReplicas[i] - state.ActiveOld.SpecReplicas[i]
-		oldNext[i] = state.ActiveOld.InitialReplicas[i] - step.Past[i]
+		oldReference[i] = state.ActiveOld.InitialReplicas[i]
+		if state.ScaleDuringRollout {
+			physical := state.ActiveOld.SpecReplicas[i] + state.Target.SpecReplicas[i]
+			for _, parked := range state.ParkedOld {
+				physical += parked.SpecReplicas[i]
+			}
+			excess := max(0, physical-state.Target.DesiredReplicas[i]-state.Config[i].MaxSurge)
+			scaleCorrection[i] = state.ActiveOld.SpecReplicas[i]-step.Past[i] <= excess
+		}
+		oldProgress[i] = oldReference[i] - state.ActiveOld.SpecReplicas[i]
+		oldNext[i] = oldReference[i] - step.Past[i]
 		steps = max(steps, state.ActiveOld.InitialReplicas[i], state.Target.DesiredReplicas[i])
 	}
-	assertMovingWindow(t, state.Target.SpecReplicas, phaseTargets, growing)
-	assertMovingWindow(t, oldProgress, state.ActiveOld.InitialReplicas, oldNext)
+	assertMovingWindow(t, state.Target.SpecReplicas, phaseTargets, growing, nil)
+	assertMovingWindow(t, oldProgress, oldReference, oldNext, scaleCorrection)
 	for i, config := range state.Config {
 		floor := max(0, state.Target.DesiredReplicas[i]-config.MaxUnavailable)
 		if step.UsesUnavailableFallback && floor > 1 {
@@ -283,7 +300,7 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 // that advances may not pass the slowest proposed fraction plus one slot of
 // the smallest positive role. Floating point is exact enough for these tiny
 // test states, and intentionally differs from production integer arithmetic.
-func assertMovingWindow(t *testing.T, current, counts, proposed []int) {
+func assertMovingWindow(t *testing.T, current, counts, proposed []int, scaleCorrection []bool) {
 	t.Helper()
 	least, width := 1.0, 0.0
 	for i, count := range counts {
@@ -293,7 +310,7 @@ func assertMovingWindow(t *testing.T, current, counts, proposed []int) {
 		}
 	}
 	for i, count := range counts {
-		if count > 0 && proposed[i] > current[i] {
+		if count > 0 && proposed[i] > current[i] && (scaleCorrection == nil || !scaleCorrection[i]) {
 			require.LessOrEqual(t, float64(proposed[i])/float64(count), least+width+1e-9,
 				"coordination current=%v counts=%v proposed=%v", current, counts, proposed)
 		}
@@ -379,6 +396,112 @@ func TestScalingDuringRolloutDelayedConvergence(t *testing.T) {
 		require.Equal(t, []int{0, 0}, state.ActiveOld.SpecReplicas, "scenario %d state=%+v", scenario, state)
 		require.Empty(t, state.ParkedOld)
 		require.Equal(t, state.Target.DesiredReplicas, state.Target.SpecReplicas, "scenario %d state=%+v", scenario, state)
+	}
+}
+
+func TestScalingDuringRolloutPhysicalExcessDoesNotDeadlockFractions(t *testing.T) {
+	state := rolloutState([]int{9, 2}, []int{5, 2}, []int{5, 2}, nil, nil,
+		[]int{2, 5}, []int{2, 5}, []int{6, 10}, configs([]int{0, 1}, []int{1, 1}))
+	state.ScaleDuringRollout = true
+	step := ComputeNextStep(state)
+	require.NotNil(t, step, "latest-scale excess must not deadlock old and target fractional windows")
+	require.Equal(t, []int{4, 2}, step.Past, "only the one existing physical excess group may bypass coordination")
+	require.Equal(t, state.Target.SpecReplicas, step.New)
+	require.NoError(t, validateUpdateStep(state, step))
+	assertScalingSafety(t, state, step)
+	require.ErrorContains(t, validateUpdateStep(state, &UpdateStep{Past: []int{3, 2}, New: step.New}), "fractional coordination",
+		"availability would permit two deletions, but only one is excess")
+	state.ActiveOld.ReadyReplicas = []int{3, 2}
+	require.Nil(t, ComputeNextStep(state), "physical excess is not permission to spend already-reserved Ready capacity")
+	state.ActiveOld.ReadyReplicas = []int{5, 2}
+	state.ScaleDuringRollout = false
+	require.ErrorContains(t, validateUpdateStep(state, step), "fractional coordination", "RolloutCoupled retains its historical window")
+
+	state = rolloutState([]int{1, 2}, []int{1, 2}, []int{1, 2}, nil, nil,
+		[]int{3, 3}, []int{3, 3}, []int{2, 2}, configs([]int{0, 0}, []int{0, 0}))
+	state.ScaleDuringRollout = true
+	require.ErrorContains(t, validateUpdateStep(state, &UpdateStep{Past: []int{0, 1}, New: []int{3, 3}}), "required roles incomplete")
+}
+
+func TestScalingDuringRolloutFiveEditsReachPhysicalExcess(t *testing.T) {
+	state := rolloutState([]int{9, 2}, []int{9, 2}, []int{9, 2}, nil, nil,
+		[]int{0, 0}, []int{0, 0}, []int{9, 2}, configs([]int{0, 1}, []int{1, 1}))
+	state.ScaleDuringRollout = true
+	// Replay legal historical-window steps, proving the stalled snapshot is
+	// reachable from a complete old revision rather than an invented state.
+	for tick, change := range []struct{ desired, old, target []int }{
+		{[]int{4, 10}, []int{5, 2}, []int{0, 2}},
+		{[]int{8, 5}, []int{5, 2}, []int{1, 2}},
+		{[]int{4, 7}, []int{5, 2}, []int{1, 3}},
+		{[]int{7, 5}, []int{5, 2}, []int{2, 3}},
+		{[]int{6, 10}, []int{5, 2}, []int{2, 4}},
+		{[]int{6, 10}, []int{5, 2}, []int{2, 5}},
+	} {
+		state.Target.DesiredReplicas = change.desired
+		if tick%3 == 2 {
+			state.ActiveOld.RawReadyReplicas, state.ActiveOld.ReadyReplicas = slices.Clone(state.ActiveOld.SpecReplicas), slices.Clone(state.ActiveOld.SpecReplicas)
+			state.Target.RawReadyReplicas, state.Target.ReadyReplicas = slices.Clone(state.Target.SpecReplicas), slices.Clone(state.Target.SpecReplicas)
+		}
+		step := &UpdateStep{Past: change.old, New: change.target}
+		require.NoError(t, validateUpdateStep(state, step), "tick %d", tick)
+		oldProgress, oldNext := make([]int, 2), make([]int, 2)
+		for i := range 2 {
+			oldProgress[i] = state.ActiveOld.InitialReplicas[i] - state.ActiveOld.SpecReplicas[i]
+			oldNext[i] = state.ActiveOld.InitialReplicas[i] - change.old[i]
+		}
+		assertMovingWindow(t, oldProgress, state.ActiveOld.InitialReplicas, oldNext, nil)
+		assertScalingSafety(t, state, step)
+		for i := range 2 {
+			state.ActiveOld.ReadyReplicas[i] = min(state.ActiveOld.ReadyReplicas[i], change.old[i])
+		}
+		state.ActiveOld.SpecReplicas, state.Target.SpecReplicas = change.old, change.target
+	}
+	state.Target.RawReadyReplicas, state.Target.ReadyReplicas = slices.Clone(state.Target.SpecReplicas), slices.Clone(state.Target.SpecReplicas)
+	step := ComputeNextStep(state)
+	require.NotNil(t, step)
+	require.Equal(t, []int{4, 2}, step.Past)
+	require.Equal(t, []int{2, 5}, step.New)
+	require.NoError(t, validateUpdateStep(state, step))
+	assertScalingSafety(t, state, step)
+}
+
+func TestScalingDuringRolloutRepeatedEditsConverge(t *testing.T) {
+	for _, seed := range []int64{4041023, 9071105, 11371023} {
+		rng := rand.New(rand.NewSource(seed))
+		for trial := range 5000 {
+			initial := []int{1 + rng.Intn(10), 1 + rng.Intn(10)}
+			state := rolloutState(initial, initial, initial, nil, nil, []int{0, 0}, []int{0, 0}, initial,
+				configs([]int{0, 1}, []int{1, 1}))
+			state.ScaleDuringRollout = true
+			history := []string{fmt.Sprintf("initial=%v", initial)}
+			for tick := range 100 {
+				if tick < 5 {
+					state.Target.DesiredReplicas = []int{1 + rng.Intn(10), 1 + rng.Intn(10)}
+					state.Target.RequiredRoles = requiredRoles(state.Target.DesiredReplicas)
+				}
+				if tick%3 == 2 {
+					state.ActiveOld.RawReadyReplicas, state.ActiveOld.ReadyReplicas = slices.Clone(state.ActiveOld.SpecReplicas), slices.Clone(state.ActiveOld.SpecReplicas)
+					state.Target.RawReadyReplicas, state.Target.ReadyReplicas = slices.Clone(state.Target.SpecReplicas), slices.Clone(state.Target.SpecReplicas)
+				}
+				step := ComputeNextStep(state)
+				if tick < 15 {
+					history = append(history, fmt.Sprintf("tick=%d desired=%v old=%v oldReady=%v target=%v targetReady=%v step=%+v", tick,
+						state.Target.DesiredReplicas, state.ActiveOld.SpecReplicas, state.ActiveOld.ReadyReplicas, state.Target.SpecReplicas, state.Target.ReadyReplicas, step))
+				}
+				if step != nil {
+					require.NoError(t, validateUpdateStep(state, step))
+					assertScalingSafety(t, state, step)
+					for i := range 2 {
+						state.ActiveOld.ReadyReplicas[i] = max(0, state.ActiveOld.ReadyReplicas[i]-(state.ActiveOld.SpecReplicas[i]-step.Past[i]))
+						state.Target.ReadyReplicas[i] = max(0, state.Target.ReadyReplicas[i]-max(0, state.Target.SpecReplicas[i]-step.New[i]))
+					}
+					state.ActiveOld.SpecReplicas, state.Target.SpecReplicas = step.Past, step.New
+				}
+			}
+			if !slices.Equal(state.ActiveOld.SpecReplicas, []int{0, 0}) || !slices.Equal(state.Target.SpecReplicas, state.Target.DesiredReplicas) {
+				t.Fatalf("reachable stall seed=%d trial=%d history=%v", seed, trial, history)
+			}
+		}
 	}
 }
 

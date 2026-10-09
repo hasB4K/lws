@@ -23,6 +23,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,32 +34,30 @@ import (
 	disaggv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/pkg/replicagroups"
+	disaggutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 )
 
 const (
 	subRoleReplicasAnnotation = "disaggregatedset.x-k8s.io/subrole-replicas"
-	subRolePlanAnnotation     = "disaggregatedset.x-k8s.io/subrole-scale-plan"
+	subRolePlanAnnotation     = "disaggregatedset.x-k8s.io/subrole-plan"
 )
 
-// A plan survives partial Pod patches, controller restarts and target changes.
-// Until it completes no new planner decision spends the same availability.
-// Counts is the accepted logical Spec. The native StatefulSet chooses the
-// physical retained prefix; ReadyFloor constrains its coherent assignment.
-type subRolePlan struct {
-	Armed      bool           `json:"armed,omitempty"`
-	Counts     map[string]int `json:"counts"`
-	ReadyFloor map[string]int `json:"readyFloor"`
-}
-
-func subRoleCounts(lws *leaderv1.LeaderWorkerSet, annotation string) (map[string]int, error) {
-	counts := map[string]int{}
-	if value := lws.Annotations[annotation]; value != "" {
-		if err := json.Unmarshal([]byte(value), &counts); err != nil {
-			return nil, fmt.Errorf("LWS %s has invalid %s: %w", lws.Name, annotation, err)
-		}
+func subRoleCounts(lws *leaderv1.LeaderWorkerSet, key string) (map[string]int, error) {
+	if lws.Annotations[key] == "" {
+		return nil, nil
+	}
+	var counts map[string]int
+	if err := json.Unmarshal([]byte(lws.Annotations[key]), &counts); err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	if counts == nil {
+		return nil, fmt.Errorf("%s must contain a count map", key)
 	}
 	if err := validateSubRoleCounts(counts); err != nil {
-		return nil, fmt.Errorf("LWS %s has invalid %s: %w", lws.Name, annotation, err)
+		return nil, err
+	}
+	if key == subRoleReplicasAnnotation && countSubRoles(counts) != int(getLWSReplicas(lws)) {
+		return nil, fmt.Errorf("issued sub-role counts must sum to physical replicas")
 	}
 	return counts, nil
 }
@@ -66,8 +65,8 @@ func subRoleCounts(lws *leaderv1.LeaderWorkerSet, annotation string) (map[string
 func validateSubRoleCounts(counts map[string]int) error {
 	total := 0
 	for name, count := range counts {
-		if count < 0 || count > math.MaxInt32-total {
-			return fmt.Errorf("replica count for %q is outside the physical LWS range", name)
+		if count < 0 || count > math.MaxInt32-total || name == "" && len(counts) != 1 {
+			return fmt.Errorf("invalid sub-role replica counts %v", counts)
 		}
 		total += count
 	}
@@ -76,416 +75,328 @@ func validateSubRoleCounts(counts map[string]int) error {
 
 func countSubRoles(counts map[string]int) int {
 	total := 0
-	for _, n := range counts {
-		total += n
+	for _, count := range counts {
+		total += count
 	}
 	return total
 }
 
-func setSubRoleJSON(lws *leaderv1.LeaderWorkerSet, key string, value any) {
+func setSubRoleJSON(lws *leaderv1.LeaderWorkerSet, key string, counts map[string]int) {
 	if lws.Annotations == nil {
 		lws.Annotations = map[string]string{}
 	}
-	data, _ := json.Marshal(value) // Only string/int maps and subRolePlan are serialized.
-	lws.Annotations[key] = string(data)
+	value, _ := json.Marshal(counts)
+	lws.Annotations[key] = string(value)
 }
 
-// fitSubRoles distributes a physical prefix of the final vector deterministically.
-// It is used only to initialize state; normal assignment preserves existing labels.
-func fitSubRoles(final map[string]int, total int) map[string]int {
-	result := map[string]int{}
-	keys := slices.Sorted(maps.Keys(final))
-	remaining := total
-	for _, key := range keys {
-		result[key] = min(final[key], remaining)
-		remaining -= result[key]
+func fitSubRoles(counts map[string]int, total int) map[string]int {
+	result := maps.Clone(counts)
+	names := slices.Sorted(maps.Keys(counts))
+	for _, name := range names {
+		result[name] = min(counts[name], total)
+		total -= result[name]
 	}
-	if remaining > 0 && len(keys) > 0 {
-		result[keys[0]] += remaining
+	if len(names) > 0 {
+		result[names[0]] += total
 	}
 	return result
 }
 
-// Native counters acknowledge observation, never supply Ready credit. A
-// finalizer-retained failed Pod still occupies its ordinal until it disappears.
-// Health is not a completion condition: native replacement remains independent.
-func subRoleNativeSettled(s *replicagroups.Snapshot) bool {
-	if s == nil || s.LWS == nil || !s.LWS.DeletionTimestamp.IsZero() {
-		return false
-	}
-	replicas := ptr.Deref(s.LWS.Spec.Replicas, 1)
-	if s.LWS.Status.ObservedGeneration < s.LWS.Generation {
-		return false
-	}
-	sts := s.LeaderStatefulSet
-	return sts != nil && sts.DeletionTimestamp.IsZero() && ptr.Deref(sts.Spec.Replicas, 1) == replicas &&
-		sts.Status.ObservedGeneration >= sts.Generation && sts.Status.Replicas == replicas
-}
-
-func activeSubRoleGroups(snapshot *replicagroups.Snapshot) []replicagroups.Group {
-	var groups []replicagroups.Group
-	for _, group := range snapshot.Groups {
-		if group.Leader.DeletionTimestamp.IsZero() && group.Leader.Status.Phase != corev1.PodFailed && group.Leader.Status.Phase != corev1.PodSucceeded {
-			groups = append(groups, group)
+func groupSubRole(group replicagroups.Group) (string, bool) {
+	name := group.Leader.Labels[disaggv1.SubRoleLabelKey]
+	for _, pod := range group.Pods {
+		if pod.Labels[disaggv1.SubRoleLabelKey] != name {
+			return name, false
 		}
 	}
-	return groups
+	return name, true
 }
 
-func allocatedSubRoles(groups []replicagroups.Group, counts map[string]int) map[types.UID]string {
-	return allocateSubRoleReadiness(groups, counts, nil)
+func activeSubRoleGroups(s *replicagroups.Snapshot) []replicagroups.Group {
+	return slices.DeleteFunc(slices.Clone(s.Groups), func(group replicagroups.Group) bool {
+		leader := group.Leader
+		return !leader.DeletionTimestamp.IsZero() || leader.Status.Phase == corev1.PodFailed || leader.Status.Phase == corev1.PodSucceeded
+	})
 }
 
-// Raw Ready is not necessarily retained capacity: a failed group may have
-// exhausted recovery, or a worker update may not have been observed yet.
-func retainedSubRoleEligible(group replicagroups.Group) bool {
-	leader := group.Leader
-	return group.Ready && !group.Terminating &&
-		leader.Annotations[leaderv1.GroupRestartBudgetExhaustedAnnotationKey] != "true" &&
-		(group.WorkerStatefulSet == nil || group.WorkerStatefulSet.Status.ObservedGeneration >= group.WorkerStatefulSet.Generation)
-}
-
-// Reserve each child's required Ready survivors before filling count-only
-// slots. A low unready ordinal cannot silently replace a Ready high ordinal of
-// another child merely because their assignment counts happen to match.
-func allocateSubRoleReadiness(groups []replicagroups.Group, counts, readyFloor map[string]int) map[types.UID]string {
-	remaining := maps.Clone(counts)
-	assigned := map[types.UID]string{}
-	readyNeeded := maps.Clone(readyFloor)
-	for name, needed := range readyNeeded {
-		if needed > remaining[name] {
-			return nil
-		}
-	}
-	var readyGroups []replicagroups.Group
-	for _, group := range groups {
-		if retainedSubRoleEligible(group) {
-			readyGroups = append(readyGroups, group)
-		}
-	}
-	// Ready reservations take priority over every count-only assignment.
-	keepSubRoleLabels(readyGroups, readyNeeded, assigned)
-	fillSubRoleAssignments(readyGroups, readyNeeded, assigned)
-	for _, needed := range readyNeeded {
-		if needed > 0 {
-			return nil
-		}
-	}
-	for _, name := range assigned {
-		remaining[name]--
-	}
-	// Fill the remaining count-only slots, again preserving labels first.
-	keepSubRoleLabels(groups, remaining, assigned)
-	fillSubRoleAssignments(groups, remaining, assigned)
-	return assigned
-}
-
-func keepSubRoleLabels(groups []replicagroups.Group, remaining map[string]int, assigned map[types.UID]string) {
-	for _, group := range groups {
-		uid := group.Leader.UID
-		name := group.Leader.Labels[disaggv1.SubRoleLabelKey]
-		if _, found := assigned[uid]; !found && remaining[name] > 0 {
-			assigned[uid] = name
-			remaining[name]--
-		}
-	}
-}
-
-func fillSubRoleAssignments(groups []replicagroups.Group, remaining map[string]int, assigned map[types.UID]string) {
-	keys := slices.Sorted(maps.Keys(remaining))
-	for _, group := range groups {
-		if _, found := assigned[group.Leader.UID]; found {
-			continue
-		}
-		for _, name := range keys {
-			if remaining[name] > 0 {
-				assigned[group.Leader.UID] = name
-				remaining[name]--
-				break
-			}
-		}
-	}
-}
-
-func newSubRolePlan(snapshot *replicagroups.Snapshot, current, counts map[string]int) *subRolePlan {
-	floor := map[string]int{}
-	for _, group := range snapshot.Groups {
-		name, coherent := groupSubRole(group)
-		if coherent && group.Ready && group.Leader.DeletionTimestamp.IsZero() {
-			floor[name]++
-		}
-	}
-	for name, ready := range floor {
-		floor[name] = max(0, ready-max(0, current[name]-counts[name]))
-	}
-	plan := &subRolePlan{Counts: maps.Clone(counts), ReadyFloor: floor}
-	if subRolePlanAssignments(snapshot, plan) == nil {
-		return nil
-	}
-	return plan
-}
-
-// Only the native retained prefix can supply assignments. Occupied failed or
-// terminating slots may receive count-only assignments, never Ready credit.
-func subRolePlanAssignments(s *replicagroups.Snapshot, plan *subRolePlan) map[types.UID]string {
-	target := countSubRoles(plan.Counts)
-	var candidates []replicagroups.Group
+// Select actual ordinal slots: a hole never pulls a higher group into the prefix.
+func subRolePrefix(s *replicagroups.Snapshot, count int) (replicagroups.Snapshot, bool) {
 	start := 0
 	if sts := s.LeaderStatefulSet; sts != nil && sts.Spec.Ordinals != nil {
 		start = int(sts.Spec.Ordinals.Start)
 	}
+	prefix := *s
+	prefix.Groups = nil
+	complete := true
 	for _, group := range s.Groups {
-		if group.Ordinal < start || group.Ordinal >= start+target {
-			continue
+		if group.Ordinal >= start && group.Ordinal < start+count {
+			complete = complete && group.Ordinal == start+len(prefix.Groups)
+			prefix.Groups = append(prefix.Groups, group)
 		}
-		candidates = append(candidates, group)
 	}
-	floor := plan.ReadyFloor
-	if plan.Armed {
-		floor = nil
-	} // Failed survivors must be able to undergo native replacement.
-	return allocateSubRoleReadiness(candidates, plan.Counts, floor)
+	return prefix, complete && len(prefix.Groups) == count
 }
 
-func (m *LeaderWorkerSetManager) patchSubRoleLWS(ctx context.Context, observed *leaderv1.LeaderWorkerSet, mutate func(*leaderv1.LeaderWorkerSet)) error {
-	desired := observed.DeepCopy()
-	mutate(desired)
-	return m.client.Patch(ctx, desired, client.MergeFromWithOptions(observed, client.MergeFromWithOptimisticLock{}))
-}
-
-// patchSubRoleGroup commits the leader label last. A partially patched group is
-// not Ready for either child in the planner adapter. Every write is UID/RV-bound.
-func (m *LeaderWorkerSetManager) patchSubRoleGroup(ctx context.Context, group replicagroups.Group, assignment string) (bool, error) {
-	changed := false
-	pods := append(slices.Clone(group.Pods[1:]), group.Leader)
-	for _, observed := range pods {
-		desired := observed.DeepCopy()
-		if desired.Labels == nil {
-			desired.Labels = map[string]string{}
-		}
-		if assignment == "" {
-			delete(desired.Labels, disaggv1.SubRoleLabelKey)
-		} else {
-			desired.Labels[disaggv1.SubRoleLabelKey] = assignment
-		}
-		if maps.Equal(desired.Labels, observed.Labels) {
-			continue
-		}
-		if err := m.client.Patch(ctx, desired, client.MergeFromWithOptions(observed, client.MergeFromWithOptimisticLock{})); err != nil {
-			return changed, err
-		}
-		changed = true
-	}
-	return changed, nil
-}
-
-// reconcileSubRolePlan first prepares retained groups, then atomically publishes
-// physical and logical Specs. Native StatefulSet downscale removes the suffix.
-func (m *LeaderWorkerSetManager) reconcileSubRolePlan(ctx context.Context, s *replicagroups.Snapshot, plan *subRolePlan) error {
-	if !plan.Armed {
-		return m.prepareSubRolePlan(ctx, s, plan)
-	}
-	return m.convergeSubRolePlan(ctx, s, plan)
-}
-
-// Preparation may reassign the retained prefix, but cannot publish its new
-// physical and logical Specs until a fresh observation sees every Pod patch.
-func (m *LeaderWorkerSetManager) prepareSubRolePlan(ctx context.Context, s *replicagroups.Snapshot, plan *subRolePlan) error {
-	if !subRoleNativeSettled(s) {
-		return nil
-	}
-	assignments := subRolePlanAssignments(s, plan)
-	if assignments == nil {
-		return nil
-	}
-	if changed, err := m.repairSubRoleAssignments(ctx, s.Groups, assignments); changed || err != nil {
-		return err
-	}
-	target := countSubRoles(plan.Counts)
-	if len(assignments) != min(len(s.Groups), target) {
-		return nil
-	}
-	// Non-nil unarmed assignments already satisfy every Ready floor.
-	return m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) {
-		l.Spec.Replicas = ptr.To(int32(target))
-		setSubRoleJSON(l, subRoleReplicasAnnotation, plan.Counts)
-		plan.Armed = true
-		setSubRoleJSON(l, subRolePlanAnnotation, plan)
-	})
-}
-
-// An armed plan repairs replacement labels before waiting for native
-// acknowledgement. Replacement readiness must never block completion.
-func (m *LeaderWorkerSetManager) convergeSubRolePlan(ctx context.Context, s *replicagroups.Snapshot, plan *subRolePlan) error {
-	target := countSubRoles(plan.Counts)
-	if int(getLWSReplicas(s.LWS)) != target {
-		return fmt.Errorf("LWS %s Spec changed during a sub-role transaction", s.LWS.Name)
-	}
-	assignments := subRolePlanAssignments(s, plan)
-	if assignments == nil {
-		return nil
-	}
-	if changed, err := m.repairSubRoleAssignments(ctx, s.Groups, assignments); changed || err != nil {
-		return err
-	}
-	if len(s.Groups) != target || len(assignments) != target || !subRoleNativeSettled(s) {
-		return nil
-	}
-	return m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) {
-		delete(l.Annotations, subRolePlanAnnotation)
-	})
-}
-
-func (m *LeaderWorkerSetManager) repairSubRoleAssignments(ctx context.Context, groups []replicagroups.Group, assignments map[types.UID]string) (bool, error) {
-	changed := false
+// Keep known leader assignments up to each target, then fill deficits in name order.
+func stickySubRoleAssignments(groups []replicagroups.Group, target map[string]int) map[types.UID]string {
+	remaining := maps.Clone(target)
+	assignments := map[types.UID]string{}
+	var unassigned []types.UID
 	for _, group := range groups {
-		assignment, retained := assignments[group.Leader.UID]
-		if !retained {
+		name := group.Leader.Labels[disaggv1.SubRoleLabelKey]
+		if remaining[name] == 0 {
+			unassigned = append(unassigned, group.Leader.UID)
 			continue
 		}
-		patched, err := m.patchSubRoleGroup(ctx, group, assignment)
-		if err != nil {
-			return changed, err
-		}
-		changed = changed || patched
+		assignments[group.Leader.UID] = name
+		remaining[name]--
 	}
-	return changed, nil
+	for _, name := range slices.Sorted(maps.Keys(remaining)) {
+		for remaining[name] > 0 && len(unassigned) > 0 {
+			assignments[unassigned[0]] = name
+			remaining[name]--
+			unassigned = unassigned[1:]
+		}
+	}
+	return assignments
 }
 
-func readSubRolePlan(lws *leaderv1.LeaderWorkerSet) (*subRolePlan, error) {
-	value := lws.Annotations[subRolePlanAnnotation]
-	if value == "" {
-		return nil, nil
-	}
-	plan := &subRolePlan{}
-	if err := json.Unmarshal([]byte(value), plan); err != nil {
-		return nil, fmt.Errorf("LWS %s has invalid sub-role scale plan: %w", lws.Name, err)
-	}
-	if plan.Counts == nil || plan.ReadyFloor == nil {
-		return nil, fmt.Errorf("LWS %s has incomplete sub-role scale plan", lws.Name)
-	}
-	if err := validateSubRoleCounts(plan.Counts); err != nil {
+func subRoleNativeSettled(s *replicagroups.Snapshot) bool {
+	sts := s.LeaderStatefulSet
+	return sts != nil && s.LWS.DeletionTimestamp.IsZero() && s.LWS.Status.ObservedGeneration >= s.LWS.Generation &&
+		sts.DeletionTimestamp.IsZero() && sts.Status.ObservedGeneration >= sts.Generation &&
+		ptr.Deref(sts.Spec.Replicas, 1) == getLWSReplicas(s.LWS)
+}
+
+// Metadata intent must match too: annotation changes do not bump generation.
+func (m *LeaderWorkerSetManager) readSubRoleLWS(ctx context.Context, expected *leaderv1.LeaderWorkerSet) (*leaderv1.LeaderWorkerSet, error) {
+	live := &leaderv1.LeaderWorkerSet{}
+	if err := m.apiReader.Get(ctx, client.ObjectKeyFromObject(expected), live); err != nil {
 		return nil, err
 	}
-	for child, floor := range plan.ReadyFloor {
-		if floor < 0 || floor > plan.Counts[child] {
-			return nil, fmt.Errorf("LWS %s has invalid sub-role readiness floor", lws.Name)
-		}
+	if expected.UID == "" || live.UID != expected.UID || live.ResourceVersion != expected.ResourceVersion ||
+		!live.DeletionTimestamp.IsZero() || metav1.GetControllerOf(live) == nil {
+		return nil, errReplicaGroupsPending
 	}
-	return plan, nil
+	return live, nil
 }
 
-// syncSubRoleGroups resumes an accepted transaction before looking at new
-// desired values, or repairs labels on the current physical replica set.
-func (m *LeaderWorkerSetManager) syncSubRoleGroups(ctx context.Context, lws *leaderv1.LeaderWorkerSet) (*replicagroups.Snapshot, bool, error) {
-	s, err := replicagroups.Observe(ctx, m.apiReader, lws)
-	if err != nil {
-		return nil, false, err
-	}
-	if s == nil || s.LWS.Generation != lws.Generation || !s.LWS.DeletionTimestamp.IsZero() {
-		return nil, false, errReplicaGroupsPending
-	}
-	expectedOwner, liveOwner := metav1.GetControllerOf(lws), metav1.GetControllerOf(s.LWS)
-	if expectedOwner == nil || liveOwner == nil || expectedOwner.UID != liveOwner.UID || expectedOwner.Kind != liveOwner.Kind || expectedOwner.APIVersion != liveOwner.APIVersion {
-		return nil, false, errReplicaGroupsPending
-	}
-	plan, err := readSubRolePlan(s.LWS)
-	if err != nil {
-		return nil, false, err
-	}
-	if plan != nil {
-		return s, false, m.reconcileSubRolePlan(ctx, s, plan)
-	}
-	counts, err := subRoleCounts(s.LWS, subRoleReplicasAnnotation)
-	if err != nil || len(counts) == 0 {
-		return s, true, err
-	}
-	_, removing := counts[""]
-	removing = removing && len(counts) == 1
-	groups := s.Groups // Cleanup also covers failed or terminating groups.
-	assignments := allocatedSubRoles(groups, counts)
-	changed := false
-	for _, group := range groups {
-		name, assigned := assignments[group.Leader.UID]
-		if !assigned && !removing {
+func (m *LeaderWorkerSetManager) labelSubRoleGroup(ctx context.Context, lws *leaderv1.LeaderWorkerSet, group replicagroups.Group, name string) error {
+	// Workers first, leader last. A partial write supplies neither child's Ready credit.
+	pods := append(slices.Clone(group.Pods[1:]), group.Leader)
+	for _, pod := range pods {
+		if value, exists := pod.Labels[disaggv1.SubRoleLabelKey]; value == name && (name != "" || !exists) {
 			continue
-		} // Excess/pending deletion groups keep their labels.
-		patched, err := m.patchSubRoleGroup(ctx, group, name)
-		if err != nil {
-			return nil, false, err
 		}
-		changed = changed || patched
-	}
-	if removing && !changed {
-		return s, false, m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) {
-			delete(l.Annotations, subRoleReplicasAnnotation)
-			delete(l.Annotations, disaggv1.InitialSubRoleReplicasAnnotationKey)
+		if _, err := m.readSubRoleLWS(ctx, lws); err != nil {
+			return err
+		}
+		labels := mergeLabels(pod.Labels, map[string]string{disaggv1.SubRoleLabelKey: name})
+		if name == "" {
+			delete(labels, disaggv1.SubRoleLabelKey)
+		}
+		patch, _ := json.Marshal([]map[string]any{
+			{"op": "test", "path": "/metadata/uid", "value": pod.UID},
+			{"op": "test", "path": "/metadata/resourceVersion", "value": pod.ResourceVersion},
+			{"op": "add", "path": "/metadata/labels", "value": labels},
 		})
+		if err := m.client.Patch(ctx, pod.DeepCopy(), client.RawPatch(types.JSONPatchType, patch)); err != nil {
+			return err
+		}
 	}
-	return s, !changed, nil
+	return nil
 }
 
-func (m *LeaderWorkerSetManager) scaleSubRoles(ctx context.Context, ds *disaggv1.DisaggregatedSet, lws *leaderv1.LeaderWorkerSet, counts map[string]int) error {
-	if err := validateSubRoleCounts(counts); err != nil {
-		return err
+// Each update is independent: nil preserves membership, accepts no scale, or
+// freezes history. An explicitly empty membership removes child routing.
+type subRoleUpdate struct {
+	membership, target, initial map[string]int
+}
+
+type subRoleState struct {
+	lws                      *leaderv1.LeaderWorkerSet
+	snapshot                 *replicagroups.Snapshot
+	issued, initial, pending map[string]int
+}
+
+func (m *LeaderWorkerSetManager) syncSubRoles(ctx context.Context, ds *disaggv1.DisaggregatedSet, lws *leaderv1.LeaderWorkerSet, update subRoleUpdate) (*subRoleState, error) {
+	if len(update.membership)+len(update.target)+len(update.initial) == 0 && lws.Annotations[subRoleReplicasAnnotation] == "" && lws.Annotations[disaggv1.InitialSubRoleReplicasAnnotationKey] == "" && lws.Annotations[subRolePlanAnnotation] == "" {
+		return nil, nil
 	}
+	state := &subRoleState{lws: lws}
 	if !metav1.IsControlledBy(lws, ds) {
-		return fmt.Errorf("LWS %s is not owned by DisaggregatedSet %s", lws.Name, ds.Name)
+		return state, fmt.Errorf("LeaderWorkerSet %s is not owned by DisaggregatedSet %s", lws.Name, ds.Name)
 	}
-	s, settled, err := m.syncSubRoleGroups(ctx, lws)
-	if err != nil {
-		return err
+	var err error
+	if state.issued, err = subRoleCounts(lws, subRoleReplicasAnnotation); err != nil {
+		return state, err
 	}
-	if !settled {
-		return errReplicaGroupsPending
+	if state.pending, err = subRoleCounts(lws, subRolePlanAnnotation); err != nil {
+		return state, err
 	}
-	current, err := subRoleCounts(s.LWS, subRoleReplicasAnnotation)
-	if err != nil {
-		return err
+	// Accepted assignments finish even if baseline metadata or new requests are invalid.
+	if state.pending != nil {
+		return state, m.syncSubRoleAssignments(ctx, state)
 	}
-	observedCounts, observedErr := subRoleCounts(lws, subRoleReplicasAnnotation)
-	if observedErr != nil {
-		return observedErr
+	if state.initial, err = subRoleCounts(lws, disaggv1.InitialSubRoleReplicasAnnotationKey); err != nil {
+		return state, err
 	}
-	// Metadata-only child count changes do not advance Generation. Pin both
-	// the physical and logical Specs that the planner actually observed.
-	if !metav1.IsControlledBy(s.LWS, ds) || getLWSReplicas(lws) != getLWSReplicas(s.LWS) || !maps.Equal(observedCounts, current) {
-		return errReplicaGroupsPending
+	membership := update.membership
+	if membership == nil {
+		membership = state.issued
+		if len(membership) == 0 {
+			membership = state.initial
+		}
 	}
-	if maps.Equal(current, counts) {
+	for _, counts := range []map[string]int{membership, update.target, update.initial} {
+		if err := validateSubRoleCounts(counts); err != nil {
+			return state, err
+		}
+	}
+	if len(membership) == 0 {
+		state.pending = map[string]int{"": int(getLWSReplicas(lws))}
+		return state, m.saveSubRoles(ctx, state)
+	}
+	baseline := state.issued
+	if len(state.issued) == 0 {
+		state.issued = fitSubRoles(membership, int(getLWSReplicas(lws)))
+		baseline = membership // Even a zero-sized bootstrap retains every intended child.
+	}
+	if len(state.initial) == 0 {
+		total, _ := disaggutils.GetInitialReplicas(lws)
+		state.initial = fitSubRoles(baseline, max(int(total), int(getLWSReplicas(lws))))
+	}
+	for child := range membership {
+		if _, exists := state.issued[child]; !exists {
+			state.issued[child] = 0
+		}
+	}
+	if update.initial != nil {
+		state.initial = update.initial
+	}
+	if err := m.saveSubRoles(ctx, state); err != nil {
+		return state, err // Observe metadata publication before assignment or planning.
+	}
+	if err := m.syncSubRoleAssignments(ctx, state); err != nil || update.target == nil {
+		return state, err
+	}
+	target, decreasing := maps.Clone(update.target), false
+	for name, count := range state.issued {
+		decreasing = decreasing || target[name] < count
+		if _, found := target[name]; !found {
+			target[name] = 0
+		}
+	}
+	if decreasing {
+		state.pending = target
+	} else {
+		state.issued = target
+	}
+	return state, m.saveSubRoles(ctx, state)
+}
+
+// One conditional write owns all durable child state and the matching parent sums.
+// A write returns Pending so subsequent decisions use its observed result.
+func (m *LeaderWorkerSetManager) saveSubRoles(ctx context.Context, state *subRoleState) error {
+	live := state.lws.DeepCopy()
+	for key, counts := range map[string]map[string]int{subRoleReplicasAnnotation: state.issued, subRolePlanAnnotation: state.pending} {
+		delete(live.Annotations, key)
+		if counts != nil {
+			setSubRoleJSON(live, key, counts)
+		}
+	}
+	if state.issued != nil {
+		live.Spec.Replicas = ptr.To(int32(countSubRoles(state.issued)))
+	}
+	if state.initial != nil {
+		setSubRoleJSON(live, disaggv1.InitialSubRoleReplicasAnnotationKey, state.initial)
+		live.Annotations[disaggv1.InitialReplicasAnnotationKey] = strconv.Itoa(countSubRoles(state.initial))
+	} else if state.issued == nil && state.pending == nil {
+		delete(live.Annotations, disaggv1.InitialSubRoleReplicasAnnotationKey)
+	}
+	if maps.Equal(live.Annotations, state.lws.Annotations) && getLWSReplicas(live) == getLWSReplicas(state.lws) {
 		return nil
 	}
-	// Removing routing is metadata-only. Persist cleanup intent so partial
-	// group patches/restarts cannot restore labels from the previous counts.
-	// Any accepted scale plan was completed by syncSubRoleGroups above.
-	if replicas, removing := counts[""]; removing {
-		if len(counts) != 1 || replicas != int(getLWSReplicas(s.LWS)) {
-			return fmt.Errorf("LWS %s routing removal must keep its physical Spec", lws.Name)
-		}
-		return m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) {
-			setSubRoleJSON(l, subRoleReplicasAnnotation, counts)
-		})
-	}
-	target := countSubRoles(counts)
-	draining := false
-	for child, n := range current {
-		draining = draining || counts[child] < n
-	}
-	if !draining {
-		return m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) {
-			l.Spec.Replicas = ptr.To(int32(target))
-			setSubRoleJSON(l, subRoleReplicasAnnotation, counts)
-		})
-	}
-	if !subRoleNativeSettled(s) {
+	if live.UID == "" || !live.DeletionTimestamp.IsZero() || metav1.GetControllerOf(live) == nil {
 		return errReplicaGroupsPending
 	}
-	plan := newSubRolePlan(s, current, counts)
-	if plan == nil {
-		return errReplicaGroupsPending
-	}
-	if err := m.patchSubRoleLWS(ctx, s.LWS, func(l *leaderv1.LeaderWorkerSet) { setSubRoleJSON(l, subRolePlanAnnotation, plan) }); err != nil {
+	before := state.lws.DeepCopy()
+	before.UID = "" // Include UID and resourceVersion to reject replacement and concurrent intent.
+	if err := m.client.Patch(ctx, live, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}
 	return errReplicaGroupsPending
+}
+
+func (m *LeaderWorkerSetManager) syncSubRoleAssignments(ctx context.Context, state *subRoleState) error {
+	s, err := replicagroups.Observe(ctx, m.apiReader, state.lws)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return errReplicaGroupsPending
+	}
+	if _, err := m.readSubRoleLWS(ctx, state.lws); err != nil {
+		return err
+	}
+	state.snapshot = s
+	if s.LWS.Spec.GroupIdentity == leaderv1.GroupIdentityHash {
+		return fmt.Errorf("sub-role assignment requires Ordinal identity")
+	}
+	issued, pending := state.issued, state.pending
+	target := pending
+	if target == nil {
+		target = issued
+	}
+	_, removing := target[""]
+	survivors := min(int(getLWSReplicas(s.LWS)), countSubRoles(target))
+	prefix, complete := subRolePrefix(s, survivors)
+	assignments := stickySubRoleAssignments(prefix.Groups, target)
+	if removing {
+		clear(assignments)
+		prefix.Groups = nil
+	}
+	// Partial writes and newborn labels must finish before application health can gate progress.
+	for _, group := range s.Groups {
+		name, coherent := groupSubRole(group)
+		assignment, retained := assignments[group.Leader.UID]
+		if !removing && (!coherent || retained && name == "") {
+			if err := m.labelSubRoleGroup(ctx, s.LWS, group, assignment); err != nil {
+				return err
+			}
+			return errReplicaGroupsPending
+		}
+	}
+	healthy := complete && int(prefix.Availability().RetainedReadyReplicas) == survivors
+	if pending != nil && !removing && !healthy {
+		return errReplicaGroupsPending
+	}
+	// Move retained groups only with a fully healthy prefix. Clear all outgoing
+	// routing before publishing the physical target in this same pass.
+	for _, group := range s.Groups {
+		assignment, retained := assignments[group.Leader.UID]
+		if retained && group.Leader.Labels[disaggv1.SubRoleLabelKey] == assignment {
+			continue
+		}
+		if retained && !healthy {
+			return errReplicaGroupsPending
+		}
+		if err := m.labelSubRoleGroup(ctx, s.LWS, group, assignment); err != nil {
+			return err
+		}
+		if retained {
+			return errReplicaGroupsPending
+		}
+	}
+	if pending != nil {
+		state.issued, state.pending = target, nil
+		if removing {
+			state.issued, state.initial = nil, nil
+		}
+		return m.saveSubRoles(ctx, state)
+	}
+	if !subRoleNativeSettled(s) {
+		return errReplicaGroupsPending
+	}
+	return nil
 }

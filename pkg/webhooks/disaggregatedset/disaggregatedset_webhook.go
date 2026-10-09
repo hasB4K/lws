@@ -24,6 +24,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -94,17 +95,10 @@ func (w *DisaggregatedSetWebhook) validate(obj *disaggv1.DisaggregatedSet) (admi
 			for j, child := range role.SubRoles {
 				childPath := rolePath.Child("subRoles").Index(j)
 				if child.Scaling == nil || child.Scaling.Mode != disaggv1.RoleScalingExternal {
-					if child.Replicas == nil {
-						staticReplicas++
-					} else {
-						staticReplicas += int64(*child.Replicas)
-					}
+					staticReplicas += int64(ptr.Deref(child.Replicas, 1))
 					continue
 				}
 				hasExternal = true
-				if child.Replicas != nil {
-					allErrs = append(allErrs, field.Forbidden(childPath.Child("replicas"), "replicas must be omitted when scaling.mode is External"))
-				}
 				allErrs = append(allErrs, validateScalerName(obj.Name+"-"+role.Name+"-"+child.Name, child.Name, childPath.Child("name"), generatedScalerNames)...)
 			}
 			if staticReplicas > math.MaxInt32 {
@@ -156,42 +150,32 @@ func validateScalerName(name, value string, path *field.Path, generated map[stri
 }
 
 func validateReservedSubRoleLabel(role disaggv1.DisaggregatedRoleSpec, path *field.Path) field.ErrorList {
-	templates := []struct {
-		path   *field.Path
-		labels map[string]string
-	}{
-		{path.Child("metadata", "labels"), role.Labels},
-		{path.Child("spec", "leaderWorkerTemplate", "workerTemplate", "metadata", "labels"), role.Spec.LeaderWorkerTemplate.WorkerTemplate.Labels},
-		{path.Child("spec", "leaderWorkerTemplate", "leaderTemplate", "metadata", "labels"), nil},
-	}
-	if leader := role.Spec.LeaderWorkerTemplate.LeaderTemplate; leader != nil {
-		templates[2].labels = leader.Labels
-	}
 	var errs field.ErrorList
-	for _, template := range templates {
-		if _, exists := template.labels[disaggv1.SubRoleLabelKey]; exists {
-			errs = append(errs, field.Forbidden(template.path.Key(disaggv1.SubRoleLabelKey), "label is reserved for controller-managed sub-role assignment"))
+	check := func(labels map[string]string, path *field.Path) {
+		if _, exists := labels[disaggv1.SubRoleLabelKey]; exists {
+			errs = append(errs, field.Forbidden(path.Key(disaggv1.SubRoleLabelKey), "label is reserved for controller-managed sub-role assignment"))
 		}
+	}
+	check(role.Labels, path.Child("metadata", "labels"))
+	templates := path.Child("spec", "leaderWorkerTemplate")
+	check(role.Spec.LeaderWorkerTemplate.WorkerTemplate.Labels, templates.Child("workerTemplate", "metadata", "labels"))
+	if leader := role.Spec.LeaderWorkerTemplate.LeaderTemplate; leader != nil {
+		check(leader.Labels, templates.Child("leaderTemplate", "metadata", "labels"))
 	}
 	return errs
 }
 
-// Validate the physical sum rather than the ignored parent target. External
-// children use one here; their live counts are validated when resolved.
+// Validate the physical sum rather than the ignored parent target. The schema
+// forbids replicas for External children, so they use one until resolved.
 func validationReplicasForRole(role disaggv1.DisaggregatedRoleSpec) *int32 {
 	if len(role.SubRoles) == 0 {
 		return role.Spec.Replicas
 	}
 	var total int64
 	for _, child := range role.SubRoles {
-		if child.Replicas == nil || child.Scaling != nil && child.Scaling.Mode == disaggv1.RoleScalingExternal {
-			total++
-		} else {
-			total += int64(*child.Replicas)
-		}
+		total += int64(ptr.Deref(child.Replicas, 1))
 	}
-	replicas := int32(min(total, int64(math.MaxInt32)))
-	return &replicas
+	return ptr.To(int32(min(total, int64(math.MaxInt32))))
 }
 
 // validateGeneratedNames rejects the DisaggregatedSet if any role would produce

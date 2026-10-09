@@ -109,14 +109,12 @@ func (manager *LeaderWorkerSetManager) collectRolloutObservations(
 		return nil, errReplicaGroupsPending
 	}
 	configs, result := disaggregatedsetutils.GetRoleConfigs(ds), make(rolloutReadiness)
-	for _, revision := range revisions {
+	for i, revision := range revisions {
 		for name, lws := range revision.Roles {
-			// A removed parent keeps its children. Only an explicitly ordinary
-			// parent asks to remove routing labels from its physical replicas.
+			// Only the appended target follows desired membership. Old revisions
+			// and removed parents keep their recorded layout while draining.
 			var counts map[string]int
-			// A historical Hash revision keeps its own layout when replaced by Ordinal.
-			if config := configs[name]; config != nil &&
-				(lws.Spec.GroupIdentity != leaderworkersetv1.GroupIdentityHash || config.Spec.GroupIdentity == leaderworkersetv1.GroupIdentityHash) {
+			if config := configs[name]; i == len(old) && config != nil {
 				counts = desiredSubRoles(config, desired)
 			}
 			state, err := manager.syncSubRoles(ctx, ds, lws, subRoleUpdate{membership: counts})

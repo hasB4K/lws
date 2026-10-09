@@ -745,14 +745,15 @@ func (executor *RollingUpdateExecutor) scaleRevision(
 				if err != nil {
 					return err
 				}
-				for child, count := range counts {
+				// Membership is enrolled by observation, not by scaling another revision.
+				for child, count := range current {
 					if direction == scaleUp {
-						counts[child] = max(count, current[child])
+						current[child] = max(counts[child], count)
 					} else {
-						counts[child] = min(count, current[child])
+						current[child] = min(counts[child], count)
 					}
 				}
-				if _, err := executor.LWSManager.syncSubRoles(ctx, ds, lws, subRoleUpdate{target: counts}); err != nil {
+				if _, err := executor.LWSManager.syncSubRoles(ctx, ds, lws, subRoleUpdate{target: current}); err != nil {
 					return err
 				}
 			}

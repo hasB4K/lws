@@ -56,6 +56,57 @@ func staticRole(name string) disaggregatedsetv1.DisaggregatedRoleSpec {
 	return disaggregatedsetv1.DisaggregatedRoleSpec{Name: name}
 }
 
+func TestSubRoleStatusPreservesHistoricalCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name, child, invalid string
+		ordinary, current    bool
+		parent, childCount   int32
+		assigned             bool
+	}{
+		{"ordinary history", "a", "", true, false, 2, 1, true},
+		{"removed historical child", "removed", "", false, false, 2, 1, true},
+		{"shared historical child", "a", "", false, false, 2, 2, true},
+		{"unknown current child", "removed", "", false, true, 1, 1, false},
+		{"incoherent history", "removed", "worker", false, false, 1, 1, false},
+		{"unrecorded historical child", "a", "membership", false, false, 1, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSubRoleFixture(t, 0, "a")
+			f.ds.Spec.Roles = []disaggregatedsetv1.DisaggregatedRoleSpec{{Name: "model", SubRoles: []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Name: "a"}}}}
+			require.NoError(t, f.manager.client.Update(t.Context(), f.ds))
+			old := f.withRevision("old", tc.child)
+			if tc.current {
+				old.lws.Labels[disaggregatedsetv1.RevisionLabelKey] = f.lws.Name
+			}
+			if tc.ordinary {
+				delete(old.lws.Annotations, subRoleReplicasAnnotation)
+				delete(old.lws.Annotations, disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey)
+			} else if tc.invalid == "membership" {
+				setSubRoleJSON(old.lws, subRoleReplicasAnnotation, map[string]int{"other": 1})
+			}
+			require.NoError(t, f.manager.client.Update(t.Context(), old.lws))
+			for i, pod := range old.observe().Groups[0].Pods {
+				if tc.ordinary || tc.invalid == "worker" && i == 1 {
+					delete(pod.Labels, disaggregatedsetv1.SubRoleLabelKey)
+					require.NoError(t, f.manager.client.Update(t.Context(), pod))
+				}
+			}
+			r := &DisaggregatedSetReconciler{Client: f.manager.client, LWSManager: f.manager}
+			desired := map[string]int{"model": 1, "model/a": 1}
+			require.NoError(t, r.updateStatus(t.Context(), f.ds, []string{"model"}, f.lws.Name, desired, nil))
+			require.Equal(t, []disaggregatedsetv1.RoleStatus{
+				{Name: "model", Replicas: tc.parent, ReadyReplicas: tc.parent, UpdatedReplicas: 1},
+				{Name: "model/a", Replicas: tc.childCount, ReadyReplicas: tc.childCount, UpdatedReplicas: 1},
+			}, f.ds.Status.RoleStatuses)
+			require.Equal(t, tc.assigned, meta.IsStatusConditionTrue(f.ds.Status.Conditions, string(disaggregatedsetv1.DisaggregatedSetSubRolesAssigned)))
+			require.False(t, meta.IsStatusConditionTrue(f.ds.Status.Conditions, string(disaggregatedsetv1.DisaggregatedSetAvailable)), "a Ready target cannot hide surviving historical capacity or invalid assignments")
+			require.NoError(t, f.manager.client.Delete(t.Context(), old.lws))
+			require.NoError(t, r.updateStatus(t.Context(), f.ds, []string{"model"}, f.lws.Name, desired, nil))
+			require.True(t, meta.IsStatusConditionTrue(f.ds.Status.Conditions, string(disaggregatedsetv1.DisaggregatedSetAvailable)))
+		})
+	}
+}
+
 func TestScalerManagerReconcileCreatesMissing(t *testing.T) {
 	ds := newDSWithRoles("myds", externalRole("prefill"), staticRole("decode"))
 	cl := fake.NewClientBuilder().WithScheme(wrappers.DisaggregatedSetTestScheme()).WithObjects(ds).Build()

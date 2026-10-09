@@ -286,7 +286,8 @@ func (r *DisaggregatedSetReconciler) updateStatus(ctx context.Context, disaggreg
 	return statusErr
 }
 
-// subRoleStatus counts each assigned group in its child and parent aggregate.
+// subRoleStatus counts coherent groups in the parent, including historical
+// layouts. Current child entries are the matching subset of that aggregate.
 func (m *LeaderWorkerSetManager) subRoleStatus(ctx context.Context, role *disaggregatedsetv1.DisaggregatedRoleSpec, workloads []*leaderworkersetv1.LeaderWorkerSet, revision string) ([]disaggregatedsetv1.RoleStatus, bool, error) {
 	statuses := make([]disaggregatedsetv1.RoleStatus, len(role.SubRoles)+1)
 	statuses[0].Name = role.Name
@@ -304,19 +305,33 @@ func (m *LeaderWorkerSetManager) subRoleStatus(ctx context.Context, role *disagg
 		if s == nil {
 			return nil, false, errReplicaGroupsPending
 		}
+		membership, err := subRoleCounts(s.LWS, subRoleReplicasAnnotation)
+		if err != nil {
+			return nil, false, err
+		}
+		current := s.LWS.Labels[disaggregatedsetv1.RevisionLabelKey] == revision
 		for _, group := range activeSubRoleGroups(s) {
 			name, coherent := groupSubRole(group)
 			i, known := index[name]
-			if !known || !coherent {
+			valid := known
+			if !current {
+				_, valid = membership[name]
+				valid = valid || membership == nil && name == ""
+			}
+			if !valid || !coherent {
 				assigned = false
 				continue
 			}
-			for _, status := range []*disaggregatedsetv1.RoleStatus{&statuses[0], &statuses[i]} {
+			groupStatuses := []*disaggregatedsetv1.RoleStatus{&statuses[0]}
+			if known {
+				groupStatuses = append(groupStatuses, &statuses[i])
+			}
+			for _, status := range groupStatuses {
 				status.Replicas++
 				if group.Ready && !group.Terminating {
 					status.ReadyReplicas++
 				}
-				if lws.Labels[disaggregatedsetv1.RevisionLabelKey] == revision {
+				if current {
 					status.UpdatedReplicas++
 				}
 			}

@@ -110,7 +110,7 @@ does today. When sub-roles are present:
 - replica ownership moves from the parent to its sub-roles;
 - each sub-role resolves a Static or External desired count;
 - the parent LWS target is the sum of those counts; and
-- every physical LWS group receives one sub-role label.
+- every target-revision physical LWS group receives one sub-role label.
 
 The controller deliberately does not create one LWS per sub-role. Sub-roles are lighter
 weight routing partitions inside one homogeneous physical role.
@@ -327,6 +327,11 @@ The unchanged planner treats children as ordinary roles with independent budgets
 coordination, completeness and scale-during-rollout policies. The executor sums issued
 child counts into one physical LWS; the parent adds no planner dimension or budget.
 
+Old revisions retain their recorded layout: ordinary roles stay ordinary and
+partitioned roles keep their own children. Desired membership applies only to the
+target revision, including in-place membership edits. Accepted pending assignments
+still finish and old replicas drain through the normal planner; their counts are not frozen.
+
 At rollout start, the old LWS snapshots both its aggregate initial replicas and its
 sub-role distribution, for example:
 
@@ -395,9 +400,11 @@ sub-role label.
 ### Status, Slices, and Compatibility
 
 `status.roleStatuses` lists the parent aggregate `model`, then current-spec children
-`model/a`, `model/b`, using existing `RoleStatus` fields. Parent counts sum those children;
-do not count both. Removed children drain internally. `SubRolesAssigned` reports whether
-every extant group has a valid assignment; only coherent whole groups contribute Ready.
+`model/a`, `model/b`, using existing `RoleStatus` fields. Parent counts include valid
+historical groups, so may exceed the visible child sum during a transition; do not count
+both levels. Removed children drain internally. `SubRolesAssigned` checks old groups
+against their revision's recorded layout and target groups against current membership;
+only coherent whole groups contribute Ready.
 
 Static sub-role replicas retain the existing per-slice meaning. Alpha rejects
 `spec.slices > 1` when any sub-role is External, following KEP-849. Assignment identity
@@ -405,8 +412,9 @@ already includes the slice, allowing a later KEP to add aggregate or per-slice s
 
 Omitting `subRoles` preserves existing names, labels, scaling, and status. Adding
 sub-roles does not create any Services.
-Enabling it labels existing groups in place and does not change the revision hash.
-Disabling it removes the dynamic labels and returns replica ownership to the parent.
+Enabling it labels target-revision groups in place and does not change the revision hash.
+Disabling it removes the target's dynamic labels and returns its replica ownership to
+the parent; old revisions retain their layout until drained.
 Changing the minimum parent-role count from two to one is a backward-compatible schema
 relaxation.
 

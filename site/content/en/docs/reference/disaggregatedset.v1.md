@@ -351,7 +351,8 @@ created, so changing it takes effect on the next rollout.</p>
 </td>
 <td>
    <p>RoleStatuses lists each current role followed by its sub-roles in spec order.
-Parent entries aggregate their children; do not sum both levels together.
+Parent entries include historical layouts, so may exceed the visible child sum.
+Do not sum parent and child entries together.
 Removed roles and sub-roles are omitted even while their groups drain.</p>
 </td>
 </tr>

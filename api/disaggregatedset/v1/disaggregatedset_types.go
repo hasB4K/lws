@@ -276,7 +276,8 @@ type DisaggregatedSetStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// RoleStatuses lists each current role followed by its sub-roles in spec order.
-	// Parent entries aggregate their children; do not sum both levels together.
+	// Parent entries include historical layouts, so may exceed the visible child sum.
+	// Do not sum parent and child entries together.
 	// Removed roles and sub-roles are omitted even while their groups drain.
 	// +listType=map
 	// +listMapKey=name

@@ -2162,74 +2162,150 @@ func TestSubRoleMixedHistoricalLayouts(t *testing.T) {
 	}
 }
 
-func TestSubRoleMigrationFromHashToOrdinal(t *testing.T) {
-	f := newSubRoleFixture(t, 0, "a", "b")
-	f.ds.Spec.Roles = []disaggregatedsetv1.DisaggregatedRoleSpec{{Name: "model", SubRoles: []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Name: "a"}, {Name: "b"}}}}
-	f.ds.Spec.Roles[0].Spec.GroupIdentity = leaderworkersetv1.GroupIdentityOrdinal
-	hash := f.lws.DeepCopy()
-	hash.Name, hash.UID, hash.ResourceVersion = "old-hash", "old-hash", ""
-	hash.Labels[disaggregatedsetv1.RevisionLabelKey] = "old"
-	hash.Spec.GroupIdentity, hash.Spec.LeaderWorkerTemplate.Size = leaderworkersetv1.GroupIdentityHash, ptr.To[int32](1)
-	hash.Annotations = map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "2"}
-	// Use the real Hash ownership chain, not Ordinal groups with a different flag.
-	for _, object := range replicaGroupObjects(hash, 2, 2) {
-		require.NoError(t, f.manager.client.Create(t.Context(), object))
+func TestSubRoleMigrationFromOrdinaryToOrdinal(t *testing.T) {
+	for _, identity := range []leaderworkersetv1.GroupIdentityType{leaderworkersetv1.GroupIdentityHash, leaderworkersetv1.GroupIdentityOrdinal} {
+		t.Run(string(identity), func(t *testing.T) {
+			f := newSubRoleFixture(t, 0, "a", "b")
+			f.ds.Spec.Roles = []disaggregatedsetv1.DisaggregatedRoleSpec{{Name: "model", SubRoles: []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Name: "a"}, {Name: "b"}}}}
+			f.ds.Spec.Roles[0].Spec.GroupIdentity = leaderworkersetv1.GroupIdentityOrdinal
+			ordinary := f.lws.DeepCopy()
+			ordinary.Name, ordinary.UID, ordinary.ResourceVersion = "old-ordinary", "old-ordinary", ""
+			ordinary.Labels[disaggregatedsetv1.RevisionLabelKey] = "old"
+			ordinary.Spec.GroupIdentity, ordinary.Spec.LeaderWorkerTemplate.Size = identity, ptr.To[int32](1)
+			ordinary.Annotations = map[string]string{disaggregatedsetv1.InitialReplicasAnnotationKey: "2"}
+			// Build the identity's real native ownership chain.
+			for _, object := range replicaGroupObjects(ordinary, 2, 2) {
+				require.NoError(t, f.manager.client.Create(t.Context(), object))
+			}
+			before, err := replicagroups.Observe(t.Context(), f.manager.apiReader, ordinary)
+			require.NoError(t, err)
+			for _, group := range f.observe().Groups {
+				group.Leader.Status.Conditions = nil
+				require.NoError(t, f.manager.client.Status().Update(t.Context(), group.Leader))
+			}
+			oldRevision := func() disaggregatedsetutils.RevisionRoles {
+				require.NoError(t, f.manager.client.Get(t.Context(), client.ObjectKeyFromObject(ordinary), ordinary))
+				return disaggregatedsetutils.RevisionRoles{Revision: "old", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{"model": ordinary.DeepCopy()}}
+			}
+			old, target := oldRevision(), f.revision("target")
+			desired := resolveDesiredReplicasByRole(f.ds, nil)
+			observed, err := f.manager.collectRolloutObservations(t.Context(), f.ds, disaggregatedsetutils.RevisionRolesList{old}, target, desired)
+			old = oldRevision()
+			assert.Equal(t, before.LWS.Annotations, ordinary.Annotations, "the old ordinary revision must never acquire child metadata")
+			require.NoError(t, err)
+			require.Equal(t, replicaReadiness{2, 2, 2, 2}, observed.role(old, "model"))
+			for _, child := range []string{"model/a", "model/b"} {
+				require.Equal(t, replicaReadiness{}, observed.role(old, child))
+				require.Equal(t, replicaReadiness{1, 1, 0, 0}, observed.role(target, child))
+			}
+			inputs := buildRolloutInputs(f.ds, disaggregatedsetutils.RevisionRolesList{old}, target, desired, observed)
+			state := rolloutStateForRevision(inputs.allRoleNames, disaggregatedsetutils.RevisionRolesList{old}, old, target, inputs.targetReplicas, inputs.config, observed)
+			require.Equal(t, []string{"model/a", "model/b", "model"}, inputs.allRoleNames)
+			require.Equal(t, RoleReplicaState{0, 0, 2}, state.AvailabilityBaseline)
+			// The children do not inherit ordinary counts; disjoint replacement preserves model's floor.
+			snapshot := snapshotForRolloutState(state)
+			require.Zero(t, availabilityFloor(snapshot[0]))
+			require.Zero(t, availabilityFloor(snapshot[1]))
+			require.Equal(t, 2, availabilityFloor(snapshot[2]))
+			executor := newTestExecutor(f.manager.client)
+			executor.LWSManager = f.manager
+			for range 2 {
+				result, complete, err := executor.reconcileExistingRollout(t.Context(), f.ds, disaggregatedsetutils.RevisionRolesList{oldRevision()}, f.revision("target"), desired)
+				require.NoError(t, err)
+				require.False(t, complete, "an unready target must not complete the rollout")
+				require.Positive(t, result.RequeueAfter)
+			}
+			require.EqualValues(t, 2, getLWSReplicas(oldRevision().Roles["model"]), "the ordinary pool must survive until the Ordinal children are Ready")
+			for _, group := range f.observe().Groups {
+				group.Leader.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				require.NoError(t, f.manager.client.Status().Update(t.Context(), group.Leader))
+			}
+			complete := false
+			for range 2 {
+				_, complete, err = executor.reconcileExistingRollout(t.Context(), f.ds, disaggregatedsetutils.RevisionRolesList{oldRevision()}, f.revision("target"), desired)
+				require.NoError(t, err)
+			}
+			require.True(t, complete)
+			require.Zero(t, getLWSReplicas(oldRevision().Roles["model"]))
+			after, err := replicagroups.Observe(t.Context(), f.manager.apiReader, ordinary)
+			require.NoError(t, err)
+			require.Equal(t, before.LWS.Annotations, after.LWS.Annotations)
+			require.Equal(t, before.Groups, after.Groups, "old ordinary Pods must not be relabeled")
+			require.JSONEq(t, `{"a":1,"b":1}`, f.observe().LWS.Annotations[subRoleReplicasAnnotation])
+		})
 	}
-	before, err := replicagroups.Observe(t.Context(), f.manager.apiReader, hash)
-	require.NoError(t, err)
-	for _, group := range f.observe().Groups {
-		group.Leader.Status.Conditions = nil
-		require.NoError(t, f.manager.client.Status().Update(t.Context(), group.Leader))
+}
+
+func TestSubRoleMembershipChangesOnlyCurrentRevision(t *testing.T) {
+	for _, children := range [][]string{nil, {"b", "c"}} {
+		t.Run(fmt.Sprint(children), func(t *testing.T) {
+			old := newSubRoleFixture(t, 0, "a", "b")
+			target := old.withRevision("target", "a", "b")
+			before := old.observe()
+			setChildren := func(names []string) {
+				old.ds.Spec.Roles = []disaggregatedsetv1.DisaggregatedRoleSpec{{Name: "model"}}
+				for _, name := range names {
+					old.ds.Spec.Roles[0].SubRoles = append(old.ds.Spec.Roles[0].SubRoles, disaggregatedsetv1.DisaggregatedSubRoleSpec{Name: name})
+				}
+			}
+			collect := func() rolloutReadiness {
+				for range 8 {
+					observed, err := old.manager.collectRolloutObservations(t.Context(), old.ds,
+						disaggregatedsetutils.RevisionRolesList{old.revision("old")}, target.revision("current"), resolveDesiredReplicasByRole(old.ds, nil))
+					require.True(t, err == nil || errors.Is(err, errReplicaGroupsPending), "%v", err)
+					if err == nil {
+						return observed
+					}
+				}
+				t.Fatal("membership did not converge")
+				return nil
+			}
+			setChildren(children)
+			observed := collect()
+			for _, child := range []string{"a", "b"} {
+				require.Equal(t, replicaReadiness{1, 1, 1, 1}, observed.role(old.revision("old"), "model/"+child))
+			}
+			if len(children) == 0 {
+				s := target.observe()
+				require.Empty(t, s.LWS.Annotations[subRoleReplicasAnnotation])
+				for _, group := range s.Groups {
+					child, coherent := groupSubRole(group)
+					require.True(t, coherent)
+					require.Empty(t, child, "only the current revision loses child routing")
+				}
+				setChildren([]string{"restored"})
+				collect()
+				require.JSONEq(t, `{"restored":2}`, target.observe().LWS.Annotations[subRoleReplicasAnnotation])
+				for _, group := range target.observe().Groups {
+					child, coherent := groupSubRole(group)
+					require.True(t, coherent)
+					require.Equal(t, "restored", child)
+				}
+			} else {
+				require.JSONEq(t, `{"a":1,"b":1,"c":0}`, target.observe().LWS.Annotations[subRoleReplicasAnnotation])
+			}
+			after := old.observe()
+			require.Equal(t, before.LWS.Annotations, after.LWS.Annotations, "old issued membership and frozen baseline stay unchanged")
+			require.Equal(t, before.Groups, after.Groups, "current layout changes must not relabel old Pods")
+			require.EqualValues(t, 2, getLWSReplicas(target.observe().LWS), "membership changes preserve current physical capacity")
+		})
 	}
-	oldRevision := func() disaggregatedsetutils.RevisionRoles {
-		require.NoError(t, f.manager.client.Get(t.Context(), client.ObjectKeyFromObject(hash), hash))
-		return disaggregatedsetutils.RevisionRoles{Revision: "old", Roles: map[string]*leaderworkersetv1.LeaderWorkerSet{"model": hash.DeepCopy()}}
-	}
-	old, target := oldRevision(), f.revision("target")
-	desired := resolveDesiredReplicasByRole(f.ds, nil)
-	observed, err := f.manager.collectRolloutObservations(t.Context(), f.ds, disaggregatedsetutils.RevisionRolesList{old}, target, desired)
-	old = oldRevision()
-	assert.Equal(t, before.LWS.Annotations, hash.Annotations, "the old Hash revision must never acquire child metadata")
-	require.NoError(t, err)
-	require.Equal(t, replicaReadiness{2, 2, 2, 2}, observed.role(old, "model"))
-	for _, child := range []string{"model/a", "model/b"} {
-		require.Equal(t, replicaReadiness{}, observed.role(old, child))
-		require.Equal(t, replicaReadiness{1, 1, 0, 0}, observed.role(target, child))
-	}
-	inputs := buildRolloutInputs(f.ds, disaggregatedsetutils.RevisionRolesList{old}, target, desired, observed)
-	state := rolloutStateForRevision(inputs.allRoleNames, disaggregatedsetutils.RevisionRolesList{old}, old, target, inputs.targetReplicas, inputs.config, observed)
-	require.Equal(t, []string{"model/a", "model/b", "model"}, inputs.allRoleNames)
-	require.Equal(t, RoleReplicaState{0, 0, 2}, state.AvailabilityBaseline)
-	// The children do not inherit Hash counts; disjoint replacement preserves model's floor.
-	snapshot := snapshotForRolloutState(state)
-	require.Zero(t, availabilityFloor(snapshot[0]))
-	require.Zero(t, availabilityFloor(snapshot[1]))
-	require.Equal(t, 2, availabilityFloor(snapshot[2]))
-	executor := newTestExecutor(f.manager.client)
-	executor.LWSManager = f.manager
-	for range 2 {
-		result, complete, err := executor.reconcileExistingRollout(t.Context(), f.ds, disaggregatedsetutils.RevisionRolesList{oldRevision()}, f.revision("target"), desired)
-		require.NoError(t, err)
-		require.False(t, complete, "an unready target must not complete the rollout")
-		require.Positive(t, result.RequeueAfter)
-	}
-	require.EqualValues(t, 2, getLWSReplicas(oldRevision().Roles["model"]), "the Hash pool must survive until the Ordinal children are Ready")
-	for _, group := range f.observe().Groups {
-		group.Leader.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-		require.NoError(t, f.manager.client.Status().Update(t.Context(), group.Leader))
-	}
-	complete := false
-	for range 2 {
-		_, complete, err = executor.reconcileExistingRollout(t.Context(), f.ds, disaggregatedsetutils.RevisionRolesList{oldRevision()}, f.revision("target"), desired)
-		require.NoError(t, err)
-	}
-	require.True(t, complete)
-	require.Zero(t, getLWSReplicas(oldRevision().Roles["model"]))
-	after, err := replicagroups.Observe(t.Context(), f.manager.apiReader, hash)
-	require.NoError(t, err)
-	require.Equal(t, before.LWS.Annotations, after.LWS.Annotations)
-	require.Equal(t, before.Groups, after.Groups, "old Hash Pods must not be relabeled")
-	require.JSONEq(t, `{"a":1,"b":1}`, f.observe().LWS.Annotations[subRoleReplicasAnnotation])
+}
+
+func TestSubRoleScalingKeepsRevisionMembership(t *testing.T) {
+	old := newSubRoleFixture(t, 0, "a", "b")
+	target := old.withRevision("target", "c", "d")
+	executor := &RollingUpdateExecutor{LWSManager: old.manager}
+	names := []string{"model/c", "model/d", "model/a", "model/b"}
+	require.ErrorIs(t, executor.scaleRevision(t.Context(), old.ds, old.revision("old"), names, RoleReplicaState{0, 0, 0, 0}, scaleDown), errReplicaGroupsPending)
+	old.sync()
+	old.native()
+	old.sync()
+	s := old.observe()
+	require.JSONEq(t, `{"a":0,"b":0}`, s.LWS.Annotations[subRoleReplicasAnnotation], "draining old counts must not enroll target-only child names")
+	require.JSONEq(t, `{"a":1,"b":1}`, s.LWS.Annotations[disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey])
+	require.ErrorIs(t, executor.scaleRevision(t.Context(), old.ds, target.revision("current"), names, RoleReplicaState{2, 1, 0, 0}, scaleUp), errReplicaGroupsPending)
+	require.JSONEq(t, `{"c":2,"d":1}`, target.observe().LWS.Annotations[subRoleReplicasAnnotation], "growing the target must not enroll old-only child names")
 }
 
 func TestSubRoleBaselineRepairAndLiveMembership(t *testing.T) {
@@ -2354,6 +2430,7 @@ func TestSubRoleExternalBaselineFreezesAfterInterruption(t *testing.T) {
 
 func TestSubRolePendingBarrierResumesEveryAcceptedAssignment(t *testing.T) {
 	blocked := newSubRoleFixture(t, 0, "a", "a", "b")
+	blocked.ds.Spec.Roles = []disaggregatedsetv1.DisaggregatedRoleSpec{{Name: "model"}}
 	healthy, target := blocked.withRevision("healthy", "a", "b"), blocked.withRevision("target", "a")
 	for _, f := range []*subRoleFixture{blocked, healthy} {
 		_, err := f.manager.syncSubRoles(t.Context(), f.ds, f.observe().LWS, subRoleUpdate{target: map[string]int{"a": 1, "b": 0}})
@@ -2372,6 +2449,7 @@ func TestSubRolePendingBarrierResumesEveryAcceptedAssignment(t *testing.T) {
 		require.NotEmpty(t, blocked.observe().LWS.Annotations[subRolePlanAnnotation])
 		require.Empty(t, healthy.observe().LWS.Annotations[subRolePlanAnnotation])
 		require.EqualValues(t, 1, getLWSReplicas(healthy.observe().LWS))
+		require.JSONEq(t, `{"a":1,"b":0}`, healthy.observe().LWS.Annotations[subRoleReplicasAnnotation], "accepted old assignments finish under an ordinary current config")
 		require.EqualValues(t, 1, getLWSReplicas(target.observe().LWS), "pending assignment blocks fresh planner decisions")
 	}
 }

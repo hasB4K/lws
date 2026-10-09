@@ -83,6 +83,12 @@ same retained-readiness checks. Old and target revisions never spend the same
 Ready credit in one decision. Completion requires exact target Spec and Ready,
 including when the desired replica count is zero.
 
+When old and target role names are disjoint, target readiness also replaces a
+fraction of the old roles' availability baseline. A target reduction must retain
+that already-used replacement credit: the target's own `maxUnavailable` cannot
+spend an old role's budget. This uses the same retained-readiness checks, including
+pending deletions and the no-worsening rule when availability is already low.
+
 Scale changes can leave a role above its latest surge ceiling while historical
 old-role fractions block its reduction. Under `AdvanceRollout`, an old drain
 may bypass that fraction window only to release existing excess:

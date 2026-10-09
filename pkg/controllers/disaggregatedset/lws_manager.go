@@ -114,7 +114,9 @@ func (manager *LeaderWorkerSetManager) collectRolloutObservations(
 			// A removed parent keeps its children. Only an explicitly ordinary
 			// parent asks to remove routing labels from its physical replicas.
 			var counts map[string]int
-			if config := configs[name]; config != nil {
+			// A historical Hash revision keeps its own layout when replaced by Ordinal.
+			if config := configs[name]; config != nil &&
+				(lws.Spec.GroupIdentity != leaderworkersetv1.GroupIdentityHash || config.Spec.GroupIdentity == leaderworkersetv1.GroupIdentityHash) {
 				counts = desiredSubRoles(config, desired)
 			}
 			state, err := manager.syncSubRoles(ctx, ds, lws, subRoleUpdate{membership: counts})

@@ -125,8 +125,7 @@ type DisaggregatedSetScalingPolicy struct {
 	DuringRollout ScalingDuringRolloutPolicy `json:"duringRollout,omitempty"`
 }
 
-// DisaggregatedSubRoleSpec defines an independently scalable routing pool
-// whose groups share their parent role's pod templates.
+// DisaggregatedSubRoleSpec defines a scaling and routing pool sharing its parent's templates.
 // +kubebuilder:validation:XValidation:rule="!has(self.scaling) || self.scaling.mode != 'External' || !has(self.replicas)",message="replicas must be omitted when scaling.mode is External"
 type DisaggregatedSubRoleSpec struct {
 	// Name is unique within the parent role.
@@ -135,12 +134,11 @@ type DisaggregatedSubRoleSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +required
 	Name string `json:"name"`
-	// Replicas counts assigned LWS groups. Static or omitted scaling defaults
-	// this value to one; External scaling requires it to be omitted.
+	// Replicas counts groups (Static default: 1); omit it for External scaling.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
-	// Scaling selects the source of this sub-role's replica target.
+	// Scaling selects this pool's replica source.
 	// +optional
 	Scaling *RoleScaling `json:"scaling,omitempty"`
 }
@@ -157,9 +155,8 @@ type DisaggregatedRoleSpec struct {
 	// +required
 	Name string `json:"name"`
 
-	// SubRoles partitions configuration-identical groups into routing pools.
-	// The parent replica target is their sum; parent scaling must be omitted
-	// and parent spec.replicas is ignored. Requires Ordinal group identity.
+	// SubRoles partitions one Ordinal LWS into pools sharing its templates.
+	// Child targets sum to parent replicas; omit parent scaling. Parent spec.replicas is ignored.
 	// +optional
 	// +listType=map
 	// +listMapKey=name
@@ -249,26 +246,9 @@ type PlacementPolicy struct {
 	Topology string `json:"topology,omitempty"`
 }
 
-// SubRoleStatus defines the observed state of one routing pool.
-type SubRoleStatus struct {
-	// Name matches a sub-role within its parent role.
-	// +required
-	Name string `json:"name"`
-	// Replicas is the number of assigned LWS groups.
-	// +optional
-	Replicas int32 `json:"replicas,omitempty"`
-	// ReadyReplicas counts whole ready groups with a consistent assignment
-	// on every member, not just ready leaders.
-	// +optional
-	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
-	// UpdatedReplicas counts assigned groups on the current revision.
-	// +optional
-	UpdatedReplicas int32 `json:"updatedReplicas,omitempty"`
-}
-
 // RoleStatus defines the observed state of a single role.
 type RoleStatus struct {
-	// Name is the name of the role (matches spec.roles[].name).
+	// Name is the role name or "parent/subrole" for a sub-role.
 	// +required
 	Name string `json:"name"`
 
@@ -277,17 +257,13 @@ type RoleStatus struct {
 	Replicas int32 `json:"replicas,omitempty"`
 
 	// ReadyReplicas is the number of ready replicas for this role.
+	// Sub-role readiness requires a coherent assignment across the whole group.
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 
 	// UpdatedReplicas is the number of replicas updated to the latest revision.
 	// +optional
 	UpdatedReplicas int32 `json:"updatedReplicas,omitempty"`
-	// SubRoleStatuses contains observed counts for this role's routing pools.
-	// +listType=map
-	// +listMapKey=name
-	// +optional
-	SubRoleStatuses []SubRoleStatus `json:"subRoleStatuses,omitempty"`
 }
 
 // DisaggregatedSetStatus defines the observed state of DisaggregatedSet.
@@ -299,9 +275,9 @@ type DisaggregatedSetStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// RoleStatuses contains the status for each role currently in spec.roles.
-	// The order matches spec.roles. A role removed from spec.roles has no entry
-	// here, even if LeaderWorkerSets for that role still exist while draining.
+	// RoleStatuses lists each current role followed by its sub-roles in spec order.
+	// Parent entries aggregate their children; do not sum both levels together.
+	// Removed roles and sub-roles are omitted even while their groups drain.
 	// +listType=map
 	// +listMapKey=name
 	// +optional

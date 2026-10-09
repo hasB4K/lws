@@ -69,6 +69,15 @@ func roleParts(key string) (parent, child string) {
 	return
 }
 
+// roleLeaves uses the same scaling fields for an ordinary role and its children.
+// An ordinary role is the single unnamed leaf; no Kubernetes object is copied.
+func roleLeaves(role *disaggregatedsetv1.DisaggregatedRoleSpec) []disaggregatedsetv1.DisaggregatedSubRoleSpec {
+	if len(role.SubRoles) > 0 {
+		return role.SubRoles
+	}
+	return []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Replicas: role.Spec.Replicas, Scaling: role.Scaling}}
+}
+
 // ScalerName is the deterministic name for a parent or child role's scaler.
 func ScalerName(dsName, role string) string { return dsName + "-" + strings.ReplaceAll(role, "/", "-") }
 
@@ -82,36 +91,29 @@ func resolveDesiredReplicasByRole(
 	scalers map[string]*disaggregatedsetv1.DisaggregatedSetRoleScaler,
 ) map[string]int {
 	desiredReplicasByRole := make(map[string]int, len(ds.Spec.Roles))
-	resolve := func(key string, scaling *disaggregatedsetv1.RoleScaling, replicas *int32) (int, bool) {
-		if scaling != nil && scaling.Mode == disaggregatedsetv1.RoleScalingExternal {
-			if scaler := scalers[key]; scaler != nil && scaler.Spec.Replicas >= 0 {
-				return int(scaler.Spec.Replicas), true
-			}
-			return 0, false
-		}
-		count := ptr.Deref(replicas, 1)
-		return int(count), count >= 0
-	}
-	for _, role := range ds.Spec.Roles {
-		if len(role.SubRoles) == 0 {
-			if count, ok := resolve(role.Name, role.Scaling, role.Spec.Replicas); ok {
-				desiredReplicasByRole[role.Name] = count
-			}
-			continue
-		}
+	for i := range ds.Spec.Roles {
+		role := &ds.Spec.Roles[i]
 		var total int64
 		complete := true
-		for _, child := range role.SubRoles {
-			key := childRoleKey(role.Name, child.Name)
-			count, ok := resolve(key, child.Scaling, child.Replicas)
-			complete = complete && ok
-			if ok {
-				desiredReplicasByRole[key] = count
-				total += int64(count)
+		for _, leaf := range roleLeaves(role) {
+			key := childRoleKey(role.Name, leaf.Name)
+			count := ptr.Deref(leaf.Replicas, 1)
+			if leaf.Scaling != nil && leaf.Scaling.Mode == disaggregatedsetv1.RoleScalingExternal {
+				scaler := scalers[key]
+				if scaler == nil {
+					complete = false
+					continue
+				}
+				count = scaler.Spec.Replicas
 			}
+			if count < 0 {
+				complete = false
+				continue
+			}
+			desiredReplicasByRole[key] = int(count)
+			total += int64(count)
 		}
-		// An unresolved child or overflowing sum must never look like a smaller
-		// physical parent target: the caller pauses this slice instead.
+		// Missing children and overflowing sums must not become smaller targets.
 		if complete && total <= math.MaxInt32 {
 			desiredReplicasByRole[role.Name] = int(total)
 		}
@@ -148,13 +150,11 @@ func (m *ScalerManager) Reconcile(
 	log := logf.FromContext(ctx)
 
 	externalRoles := make(map[string]bool)
-	for _, r := range ds.Spec.Roles {
-		if len(r.SubRoles) == 0 && r.Scaling != nil && r.Scaling.Mode == disaggregatedsetv1.RoleScalingExternal {
-			externalRoles[r.Name] = true
-		}
-		for _, child := range r.SubRoles {
-			if child.Scaling != nil && child.Scaling.Mode == disaggregatedsetv1.RoleScalingExternal {
-				externalRoles[childRoleKey(r.Name, child.Name)] = true
+	for i := range ds.Spec.Roles {
+		role := &ds.Spec.Roles[i]
+		for _, leaf := range roleLeaves(role) {
+			if leaf.Scaling != nil && leaf.Scaling.Mode == disaggregatedsetv1.RoleScalingExternal {
+				externalRoles[childRoleKey(role.Name, leaf.Name)] = true
 			}
 		}
 	}

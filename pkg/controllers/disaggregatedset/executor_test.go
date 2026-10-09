@@ -434,6 +434,30 @@ type reconcilerTestCase struct {
 	expectNewCreated         bool
 }
 
+func TestValidateDisjointReplacementStep(t *testing.T) {
+	for _, tc := range []struct {
+		name                                   string
+		ready, keepOld, invalidOld, invalidNew int
+		errorContains                          string
+	}{
+		{"half-ready replacement cannot retire all old capacity", 1, 2, 0, 1, "usable readiness"},
+		{"unready replacement cannot issue the full target", 0, 4, 4, 2, "outside"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Dimensions A, B, C: A4 is replaced by B2/C2, with one surge each.
+			initial, ready := RoleReplicaState{4, 0, 0}, RoleReplicaState{0, tc.ready, tc.ready}
+			state := rolloutState(initial, initial, initial, nil, nil, ready, ready,
+				RoleReplicaState{0, 2, 2}, configs([]int{1, 1, 1}, []int{0, 0, 0}))
+			require.NoError(t, validateUpdateStep(state, &UpdateStep{
+				Past: RoleReplicaState{tc.keepOld, 0, 0}, New: RoleReplicaState{0, 1, 1},
+			}))
+			require.ErrorContains(t, validateUpdateStep(state, &UpdateStep{
+				Past: RoleReplicaState{tc.invalidOld, 0, 0}, New: RoleReplicaState{0, tc.invalidNew, tc.invalidNew},
+			}), tc.errorContains)
+		})
+	}
+}
+
 func TestReconcilerIntegration(t *testing.T) {
 	testCases := []reconcilerTestCase{
 		{

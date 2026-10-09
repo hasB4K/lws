@@ -621,7 +621,7 @@ func TestScalingDuringRolloutExposesLatestExternalTarget(t *testing.T) {
 		testRolePrefill: revisionLWS("target", testRolePrefill, 5, 0, time.Now(), 5),
 	}}
 	readTarget := func() []int {
-		return rolloutTargetReplicas(ds, []string{testRolePrefill}, sets.New(testRolePrefill), old, target, map[string]int{testRolePrefill: 2})
+		return rolloutTargetReplicas(ds, []string{testRolePrefill}, sets.New(testRolePrefill), old, target, map[string]int{testRolePrefill: 2}, nil)
 	}
 	assert.Equal(t, []int{5}, readTarget(), "default keeps the in-flight External target")
 	ds.Spec.ScalingPolicy = &disaggregatedsetv1.DisaggregatedSetScalingPolicy{DuringRollout: disaggregatedsetv1.ScalingDuringRolloutPolicyAdvanceRollout}
@@ -650,7 +650,7 @@ func TestScalingDuringRolloutAppliesTargetDrainBeforeGrowth(t *testing.T) {
 			state := rolloutState([]int{0, 0}, []int{0, 0}, []int{0, 0}, nil, nil,
 				[]int{4, 8}, []int{4, 8}, []int{8, 4}, configs([]int{1, 1}, []int{0, 0}))
 			state.ScaleDuringRollout = true
-			inputs := rolloutInputs{allRoleNames: testRoleNames(), targetRoleNames: testRoleNames(), scaleDuringRollout: true}
+			inputs := rolloutInputs{allRoleNames: testRoleNames(), scaleDuringRollout: true}
 			err = executor.applyRolloutStep(context.Background(), ds, *target, inputs, disaggregatedsetutils.RevisionRoles{}, state, ComputeNextStep(state))
 			if failDrain {
 				require.ErrorContains(t, err, "injected drain failure")

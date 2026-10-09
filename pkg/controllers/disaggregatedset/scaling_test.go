@@ -34,6 +34,75 @@ import (
 	disaggregatedsetutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 )
 
+func TestScalingDuringRolloutPreservesDisjointReplacementCredit(t *testing.T) {
+	// A100 has already retired 95 replicas using B's 95% Ready fraction.
+	// B's own unavailable budget cannot spend that replacement credit again.
+	state := rolloutState([]int{100, 0}, []int{5, 0}, []int{5, 0}, nil, nil,
+		[]int{0, 110}, []int{0, 95}, []int{0, 100}, configs([]int{1, 1}, []int{0, 10}))
+	state.ScaleDuringRollout = true
+	assert.Nil(t, ComputeNextStep(state), "all 95 replacement Ready replicas still preserve A's floor")
+	assert.Error(t, validateUpdateStep(state, &UpdateStep{
+		Past: []int{5, 0}, New: []int{0, 105},
+	}), "shrinking B could leave only 90 Ready plus A5 against the shared baseline of 100")
+}
+
+func TestDisjointTargetCorrectionReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name                               string
+		oldRaw, oldReady, newRaw, newReady int
+		oldUnavailable, targetUnavailable  int
+		parked                             int
+		want                               int
+	}{
+		{"target budget cannot reuse replacement credit", 5, 5, 95, 95, 0, 10, 0, 110},
+		{"source unavailable budget permits correction", 5, 5, 95, 95, 10, 10, 0, 105},
+		{"surplus target readiness permits correction", 5, 5, 100, 100, 0, 10, 0, 105},
+		{"already degraded source does not demand recovery", 5, 5, 80, 80, 0, 30, 0, 110},
+		{"pending source deletion reserves credit", 10, 5, 95, 95, 0, 10, 0, 110},
+		{"pending target deletion reserves credit", 5, 5, 100, 95, 0, 10, 0, 110},
+		{"pending old loss does not freeze unready target excess", 100, 90, 0, 0, 0, 10, 0, 100},
+		{"pending source deletion does not impose dummy full floor", 50, 40, 100, 100, 0, 50, 0, 100},
+		{"parked readiness is not target replacement credit", 5, 5, 95, 95, 0, 10, 5, 105},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := rolloutState([]int{100, 0}, []int{tc.oldReady, 0}, []int{tc.oldReady, 0}, nil, nil,
+				[]int{0, 110}, []int{0, tc.newReady}, []int{0, 100}, configs([]int{1, 1}, []int{tc.oldUnavailable, tc.targetUnavailable}))
+			state.ScaleDuringRollout = true
+			state.ActiveOld.RawReadyReplicas = []int{tc.oldRaw, 0}
+			state.Target.RawReadyReplicas = []int{0, tc.newRaw}
+			if tc.parked > 0 {
+				state.ParkedOld = []ParkedRevisionState{{RequiredRoles: []bool{true, true},
+					SpecReplicas: []int{tc.parked, tc.parked}, RawReadyReplicas: []int{tc.parked, tc.parked}, ReadyReplicas: []int{tc.parked, tc.parked}}}
+			}
+			assert.Equal(t, []int{0, tc.want}, furthestTargetScaleDownTargets(state, snapshotForRolloutState(state)))
+			assert.True(t, targetScaleDownPreservesAvailability(state, []int{0, tc.want}))
+			if tc.want > 100 {
+				assert.False(t, targetScaleDownPreservesAvailability(state, []int{0, tc.want - 1}), "one extra deletion must not spend reserved Ready credit")
+			}
+		})
+	}
+}
+
+func TestDisjointTargetCorrectionKeepsWholeRevisionFraction(t *testing.T) {
+	state := rolloutState([]int{3, 0, 0}, []int{1, 0, 0}, []int{1, 0, 0}, nil, nil,
+		[]int{0, 4, 4}, []int{0, 2, 3}, []int{0, 2, 3}, configs([]int{1, 1, 1}, []int{0, 1, 1}))
+	state.ScaleDuringRollout = true
+	assert.Equal(t, []int{0, 4, 3}, furthestTargetScaleDownTargets(state, snapshotForRolloutState(state)))
+	assert.True(t, targetScaleDownPreservesAvailability(state, []int{0, 4, 3}))
+	assert.False(t, targetScaleDownPreservesAvailability(state, []int{0, 3, 3}), "B must retain ceil(2*2/3)=2 Ready; B1 replaces only one A")
+}
+
+func TestDisjointTargetCorrectionKeepsResidualSourceRole(t *testing.T) {
+	// A is now desired zero, but this target still supplies five required A
+	// replicas until B replaces more than 90% of the shared A100 baseline.
+	state := rolloutState([]int{100, 0}, []int{5, 0}, []int{5, 0}, nil, nil,
+		[]int{10, 110}, []int{10, 90}, []int{0, 100}, configs([]int{1, 1}, []int{0, 30}))
+	state.ScaleDuringRollout = true
+	assert.Equal(t, []int{5, 110}, furthestTargetScaleDownTargets(state, snapshotForRolloutState(state)))
+	assert.True(t, targetScaleDownPreservesAvailability(state, []int{5, 110}))
+	assert.False(t, targetScaleDownPreservesAvailability(state, []int{4, 110}))
+}
+
 func TestScalingDuringRolloutDecisions(t *testing.T) {
 	for _, tc := range []struct {
 		name                                   string

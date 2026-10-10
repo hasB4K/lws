@@ -87,6 +87,15 @@ func newTestExecutor(fakeClient client.Client) *RollingUpdateExecutor {
 	}
 }
 
+// reconcileTestTransition supplies the live revision list normally read by the controller.
+func reconcileTestTransition(ctx context.Context, executor *RollingUpdateExecutor, ds *disaggregatedsetv1.DisaggregatedSet, slice int, revision string, desired map[string]int) (ctrl.Result, bool, error) {
+	old, target, err := executor.LWSManager.GetRevisionRolesList(ctx, ds, slice, revision)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	return executor.ReconcileRevisionTransition(ctx, ds, slice, revision, old, target, desired)
+}
+
 // Ordinary executor fixtures model settled observations. Pending-work tests
 // supply explicit raw/committed counts; adapter tests use the real observer.
 func newTestLWSManager(c client.Client) *LeaderWorkerSetManager {
@@ -706,7 +715,7 @@ func TestRolloutRejectsInvalidReplicaGroupObservation(t *testing.T) {
 			failRead = true // The executor must also propagate a one-shot failure.
 			executor := newTestExecutor(c)
 			executor.LWSManager = manager
-			result, complete, err := executor.ReconcileRevisionTransition(t.Context(), ds, 0, "B", resolveDesiredReplicasByRole(ds, nil))
+			result, complete, err := reconcileTestTransition(t.Context(), executor, ds, 0, "B", resolveDesiredReplicasByRole(ds, nil))
 			if change == "read error" {
 				require.ErrorIs(t, err, failure)
 			} else {
@@ -788,7 +797,7 @@ func TestRollbackUsesLiveRetainedReadiness(t *testing.T) {
 						assert.EqualValues(t, 4, a.Status.ReadyReplicas, "observation must not mutate discovered inputs")
 						executor := newTestExecutor(c)
 						executor.LWSManager = manager // Real observer, reconstructed on every reconcile.
-						_, complete, err := executor.ReconcileRevisionTransition(t.Context(), ds, 0, "A", resolveDesiredReplicasByRole(ds, nil))
+						_, complete, err := reconcileTestTransition(t.Context(), executor, ds, 0, "A", resolveDesiredReplicasByRole(ds, nil))
 						require.NoError(t, err)
 						assert.Equal(t, phase.complete, complete)
 						assert.EqualValues(t, phase.old, getTestLWSReplicas(c, testNamespace, b.Name))
@@ -884,7 +893,7 @@ func TestReconcileRevisionTransitionDoesNotUseTerminatingTargetReadiness(t *test
 	fakeClient := newTestClient(objects...)
 	executor := newTestExecutor(fakeClient)
 
-	_, complete, err := executor.ReconcileRevisionTransition(ctx, ds, 0, targetRevision, resolveDesiredReplicasByRole(ds, nil))
+	_, complete, err := reconcileTestTransition(ctx, executor, ds, 0, targetRevision, resolveDesiredReplicasByRole(ds, nil))
 
 	require.NoError(t, err)
 	assert.False(t, complete)
@@ -1774,6 +1783,45 @@ func TestExternalTargetShrinksAfterRoleOldSpecReachesZero(t *testing.T) {
 	assert.EqualValues(t, 5, getTestLWSReplicas(fakeClient, testNamespace, target.Name))
 }
 
+func TestReconcileSliceReadsRevisionsOnce(t *testing.T) {
+	for _, readFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("readFails=%t", readFails), func(t *testing.T) {
+			ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{})
+			var objects []client.Object
+			for revision, replicas := range map[string]int32{"A": 4, "B": 1} {
+				for _, role := range testRoleNames() {
+					lws := revisionLWS(revision, role, replicas, replicas, time.Now(), 4)
+					lws.Spec.LeaderWorkerTemplate.Size = ptr.To[int32](1)
+					objects = append(objects, replicaGroupObjects(lws, replicas, replicas)...)
+				}
+			}
+			c := newTestClient(objects...)
+			r := newTestReconciler(c)
+			r.LWSManager = NewLeaderWorkerSetManager(c)
+			lists, failure := 0, errors.New("live list failed")
+			r.LWSManager.apiReader = interceptor.NewClient(c, interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*leaderworkersetv1.LeaderWorkerSetList); ok {
+						lists++
+						if readFails {
+							return failure
+						}
+					}
+					return c.List(ctx, list, opts...)
+				},
+			})
+			result, err := r.reconcileSlice(t.Context(), r.createRollingUpdateExecutor(), ds, 0, "B", resolveDesiredReplicasByRole(ds, nil))
+			require.Equal(t, 1, lists, "the executor must reuse the controller's live LWS list")
+			if readFails {
+				require.ErrorIs(t, err, failure)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, time.Second, result.RequeueAfter)
+			}
+		})
+	}
+}
+
 func TestReconcileRevisionTransitionRepairsPartialTargetRevision(t *testing.T) {
 	ctx := context.Background()
 	ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{})
@@ -1785,7 +1833,7 @@ func TestReconcileRevisionTransitionRepairsPartialTargetRevision(t *testing.T) {
 	fakeClient := newTestClient(objects...)
 	executor := newTestExecutor(fakeClient)
 
-	result, complete, err := executor.ReconcileRevisionTransition(ctx, ds, 0, targetRevision, map[string]int{
+	result, complete, err := reconcileTestTransition(ctx, executor, ds, 0, targetRevision, map[string]int{
 		testRolePrefill: 4,
 		testRoleDecode:  4,
 	})
@@ -1820,7 +1868,7 @@ func TestInterruptedRolloutKeepsInitialBaseline(t *testing.T) {
 
 	desiredReplicasByRole := resolveDesiredReplicasByRole(ds, nil)
 	targetRevision := disaggregatedsetutils.ComputeRevision(ds.Spec.Roles)
-	result, _, err := executor.ReconcileRevisionTransition(ctx, ds, 0, targetRevision, desiredReplicasByRole)
+	result, _, err := reconcileTestTransition(ctx, executor, ds, 0, targetRevision, desiredReplicasByRole)
 	require.NoError(t, err)
 	assert.NotZero(t, result.RequeueAfter)
 
@@ -1875,7 +1923,7 @@ func TestRolloutAvailabilityBaselineFollowsNonDrainedRevisions(t *testing.T) {
 			desired := resolveDesiredReplicasByRole(ds, nil)
 			reconcile := func() bool {
 				// Reconstruct the executor each time; there is no carried baseline.
-				_, complete, err := newTestExecutor(fakeClient).ReconcileRevisionTransition(ctx, ds, 0, "C", desired)
+				_, complete, err := reconcileTestTransition(ctx, newTestExecutor(fakeClient), ds, 0, "C", desired)
 				require.NoError(t, err)
 				return complete
 			}
@@ -1921,7 +1969,7 @@ func TestTwoReadinessIncompleteOldRevisionsConverge(t *testing.T) {
 	complete := false
 	for i := 0; i < 10 && !complete; i++ {
 		var err error
-		_, complete, err = newTestExecutor(fakeClient).ReconcileRevisionTransition(ctx, ds, 0, "C", desired)
+		_, complete, err = reconcileTestTransition(ctx, newTestExecutor(fakeClient), ds, 0, "C", desired)
 		require.NoError(t, err)
 
 		// Old Prefill remains broken. Target replicas become Ready and old

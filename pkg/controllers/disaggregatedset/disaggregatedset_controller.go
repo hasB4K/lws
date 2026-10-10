@@ -490,7 +490,7 @@ func (r *DisaggregatedSetReconciler) reconcileSlice(
 		return ctrl.Result{}, err
 	}
 
-	oldRevisions, _, err := executor.LWSManager.GetRevisionRolesList(ctx, disaggregatedSet, slice, revision)
+	oldRevisions, newRevision, err := executor.LWSManager.GetRevisionRolesList(ctx, disaggregatedSet, slice, revision)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -502,7 +502,7 @@ func (r *DisaggregatedSetReconciler) reconcileSlice(
 	var result ctrl.Result
 	if len(oldRevisions) > 0 {
 		var complete bool
-		result, complete, err = executor.ReconcileRevisionTransition(ctx, disaggregatedSet, slice, revision, desiredReplicasByRole)
+		result, complete, err = executor.ReconcileRevisionTransition(ctx, disaggregatedSet, slice, revision, oldRevisions, newRevision, desiredReplicasByRole)
 		if err != nil {
 			return result, err
 		}

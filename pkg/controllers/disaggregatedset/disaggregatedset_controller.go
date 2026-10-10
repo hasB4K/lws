@@ -510,7 +510,7 @@ func (r *DisaggregatedSetReconciler) reconcileSlice(
 			return result, err
 		}
 	} else {
-		result, err = r.reconcileCurrentRevision(ctx, disaggregatedSet, slice, revision, desiredReplicasByRole)
+		result, err = r.reconcileCurrentRevision(ctx, disaggregatedSet, slice, revision, newRevision, desiredReplicasByRole)
 		if err != nil {
 			return result, err
 		}
@@ -556,11 +556,17 @@ func (r *DisaggregatedSetReconciler) createRollingUpdateExecutor() *RollingUpdat
 }
 
 //nolint:unparam // Result is always empty but signature matches controller-runtime pattern
-func (r *DisaggregatedSetReconciler) reconcileCurrentRevision(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, revision string, desiredReplicasByRole map[string]int) (ctrl.Result, error) {
+func (r *DisaggregatedSetReconciler) reconcileCurrentRevision(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, revision string, current *disaggregatedsetutils.RevisionRoles, desiredReplicasByRole map[string]int) (ctrl.Result, error) {
 	roleConfigs := disaggregatedsetutils.GetRoleConfigs(disaggregatedSet)
 
 	for role, config := range roleConfigs {
-		if err := r.reconcileCurrentRevisionRole(ctx, disaggregatedSet, slice, role, config, revision, desiredReplicasByRole); err != nil {
+		// The live slice list was read after policy sync. Reuse it so our own
+		// policy write cannot leave Scale comparing against an older cached generation.
+		var existing *leaderworkersetv1.LeaderWorkerSet
+		if current != nil {
+			existing = current.Roles[role]
+		}
+		if err := r.reconcileCurrentRevisionRole(ctx, disaggregatedSet, slice, existing, config, revision, desiredReplicasByRole); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to reconcile %s role: %w", role, err)
 		}
 	}
@@ -568,14 +574,10 @@ func (r *DisaggregatedSetReconciler) reconcileCurrentRevision(ctx context.Contex
 	return ctrl.Result{}, nil
 }
 
-func (r *DisaggregatedSetReconciler) reconcileCurrentRevisionRole(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, role string, config *disaggregatedsetv1.DisaggregatedRoleSpec, revision string, desiredReplicasByRole map[string]int) error {
+func (r *DisaggregatedSetReconciler) reconcileCurrentRevisionRole(ctx context.Context, disaggregatedSet *disaggregatedsetv1.DisaggregatedSet, slice int, existing *leaderworkersetv1.LeaderWorkerSet, config *disaggregatedsetv1.DisaggregatedRoleSpec, revision string, desiredReplicasByRole map[string]int) error {
 	log := logf.FromContext(ctx)
 
-	existing, err := r.LWSManager.GetForRole(ctx, disaggregatedSet, slice, revision, role)
-	if err != nil {
-		return fmt.Errorf("failed to get LWS for role %s revision %s: %w", role, revision, err)
-	}
-
+	role := config.Name
 	desiredReplicas := int32(desiredReplicasByRole[role])
 
 	// With no old revision to replace, create a missing LWS directly at its

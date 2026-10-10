@@ -334,6 +334,67 @@ func TestCleanupDrainedLWSRetainsAtMostOneMarker(t *testing.T) {
 	}
 }
 
+func TestReconcileSliceScalesAfterPolicySyncWithLaggingCache(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		desired, initial int32
+	}{
+		{"policy only", 4, 4},
+		{"policy and replicas with baseline patch", 6, 4},
+		{"policy and replicas with baseline already persisted", 6, 6},
+		{"policy and scale down", 2, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lws := revisionLWS("A", testRolePrefill, 4, 4, time.Time{}, tc.initial)
+			lws.Generation = 1
+			lws.Spec.GroupIdentity = leaderworkersetv1.GroupIdentityHash
+			lws.Spec.GroupReplacementPolicy = leaderworkersetv1.GroupReplacementPostTermination
+			base := newTestClient(lws)
+			stale := lws.DeepCopy()
+			cached := interceptor.NewClient(base, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if got, ok := obj.(*leaderworkersetv1.LeaderWorkerSet); ok && key == client.ObjectKeyFromObject(stale) {
+						stale.DeepCopyInto(got)
+						return nil
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					before := &leaderworkersetv1.LeaderWorkerSet{}
+					require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(obj), before))
+					if err := c.Patch(ctx, obj, patch, opts...); err != nil {
+						return err
+					}
+					got := obj.(*leaderworkersetv1.LeaderWorkerSet)
+					// Unlike the API server, the fake client does not increment generation.
+					if before.Spec.GroupReplacementPolicy != got.Spec.GroupReplacementPolicy || getLWSReplicas(before) != getLWSReplicas(got) {
+						got.Generation++
+						return c.Update(ctx, got)
+					}
+					return nil
+				},
+			})
+			manager := NewLeaderWorkerSetManager(cached)
+			manager.apiReader = base
+			r := &DisaggregatedSetReconciler{LWSManager: manager}
+			ds := newTwoRoleTestDisaggregatedSet([2]int32{tc.desired, 4}, [2]int{1, 1}, [2]int{})
+			ds.Spec.Roles = ds.Spec.Roles[:1]
+			ds.Spec.Roles[0].Spec.GroupIdentity = leaderworkersetv1.GroupIdentityHash
+			ds.Spec.Roles[0].Spec.GroupReplacementPolicy = leaderworkersetv1.GroupReplacementImmediate
+
+			_, err := r.reconcileSlice(t.Context(), r.createRollingUpdateExecutor(), ds, 0, "A", map[string]int{testRolePrefill: int(tc.desired)})
+			require.NoError(t, err, "our own policy write must not cause a stale-observation conflict")
+			stored := &leaderworkersetv1.LeaderWorkerSet{}
+			require.NoError(t, base.Get(t.Context(), client.ObjectKeyFromObject(lws), stored))
+			require.Equal(t, tc.desired, getLWSReplicas(stored), "scale in the same pass, without waiting for the cache")
+			require.Equal(t, leaderworkersetv1.GroupReplacementImmediate, stored.Spec.GroupReplacementPolicy)
+			initial, ok := disaggregatedsetutils.GetInitialReplicas(stored)
+			require.True(t, ok)
+			require.Equal(t, tc.desired, initial)
+		})
+	}
+}
+
 func TestScaleRejectsConcurrentReplicaChange(t *testing.T) {
 	lws := revisionLWS("A", testRolePrefill, 4, 4, time.Now(), 4)
 	base := newTestClient(lws)

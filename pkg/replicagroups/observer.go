@@ -107,26 +107,12 @@ func Observe(ctx context.Context, reader client.Reader, expected *leaderworkerse
 		return snapshot, nil
 	}
 
-	leaderOwners := make(map[types.UID]bool)
-	switch workload := workload.(type) {
-	case *appsv1.StatefulSet:
-		snapshot.LeaderStatefulSet = workload
-		leaderOwners[workload.UID] = true
-	case *appsv1.Deployment:
-		snapshot.LeaderDeployment = workload
-		var replicaSets appsv1.ReplicaSetList
+	var replicaSets appsv1.ReplicaSetList
+	if hash {
 		if err := reader.List(ctx, &replicaSets, client.InNamespace(lws.Namespace),
 			client.MatchingLabels{leaderworkersetv1.SetNameLabelKey: lws.Name}); err != nil {
 			return nil, fmt.Errorf("listing leader ReplicaSets: %w", err)
 		}
-		for i := range replicaSets.Items {
-			rs := &replicaSets.Items[i]
-			if metav1.IsControlledBy(rs, workload) {
-				snapshot.ReplicaSets = append(snapshot.ReplicaSets, rs)
-				leaderOwners[rs.UID] = true
-			}
-		}
-		slices.SortFunc(snapshot.ReplicaSets, func(a, b *appsv1.ReplicaSet) int { return cmp.Compare(a.Name, b.Name) })
 	}
 
 	// Do not filter by desired size: even a leader-only target can have residual
@@ -136,25 +122,53 @@ func Observe(ctx context.Context, reader client.Reader, expected *leaderworkerse
 		client.MatchingLabels{leaderworkersetv1.SetNameLabelKey: lws.Name}); err != nil {
 		return nil, fmt.Errorf("listing worker StatefulSets: %w", err)
 	}
-	workersByName := make(map[string]*appsv1.StatefulSet, len(workerSets.Items))
-	for i := range workerSets.Items {
-		workersByName[workerSets.Items[i].Name] = &workerSets.Items[i]
-	}
-
 	var pods corev1.PodList
 	if err := reader.List(ctx, &pods, client.InNamespace(lws.Namespace),
 		client.MatchingLabels{leaderworkersetv1.SetNameLabelKey: lws.Name}); err != nil {
 		return nil, fmt.Errorf("listing group Pods: %w", err)
 	}
+	return buildSnapshot(lws, workload, replicaSets.Items, workerSets.Items, pods.Items)
+}
+
+// buildSnapshot is shared by single and batched observations. Descendant lists
+// are scoped to one LWS by label; owner UIDs, not labels, establish membership.
+func buildSnapshot(lws *leaderworkersetv1.LeaderWorkerSet, workload client.Object,
+	replicaSets []appsv1.ReplicaSet, workerSets []appsv1.StatefulSet, pods []corev1.Pod,
+) (*Snapshot, error) {
+	snapshot := &Snapshot{LWS: lws}
+	if workload == nil || !metav1.IsControlledBy(workload, lws) {
+		return snapshot, nil
+	}
+	hash := lws.Spec.GroupIdentity == leaderworkersetv1.GroupIdentityHash
+	leaderOwners := make(map[types.UID]bool)
+	switch workload := workload.(type) {
+	case *appsv1.StatefulSet:
+		snapshot.LeaderStatefulSet = workload
+		leaderOwners[workload.UID] = true
+	case *appsv1.Deployment:
+		snapshot.LeaderDeployment = workload
+		for i := range replicaSets {
+			rs := &replicaSets[i]
+			if metav1.IsControlledBy(rs, workload) {
+				snapshot.ReplicaSets = append(snapshot.ReplicaSets, rs)
+				leaderOwners[rs.UID] = true
+			}
+		}
+		slices.SortFunc(snapshot.ReplicaSets, func(a, b *appsv1.ReplicaSet) int { return cmp.Compare(a.Name, b.Name) })
+	}
+	workersByName := make(map[string]*appsv1.StatefulSet, len(workerSets))
+	for i := range workerSets {
+		workersByName[workerSets[i].Name] = &workerSets[i]
+	}
 	podsByOwner := make(map[types.UID][]*corev1.Pod)
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for i := range pods {
+		pod := &pods[i]
 		if owner := metav1.GetControllerOf(pod); owner != nil {
 			podsByOwner[owner.UID] = append(podsByOwner[owner.UID], pod)
 		}
 	}
-	for i := range pods.Items {
-		leader := &pods.Items[i]
+	for i := range pods {
+		leader := &pods[i]
 		owner := metav1.GetControllerOf(leader)
 		if owner == nil || !leaderOwners[owner.UID] || !podutils.LeaderPod(*leader) {
 			continue

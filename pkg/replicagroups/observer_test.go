@@ -52,9 +52,13 @@ type fixture struct {
 	workers    [][]*corev1.Pod
 }
 
-func newFixture(identity leaderworkersetv1.GroupIdentityType, replicas, size int) *fixture {
+func newFixture(identity leaderworkersetv1.GroupIdentityType, replicas, size int, names ...string) *fixture {
+	name := "role-a"
+	if len(names) > 0 {
+		name = names[0]
+	}
 	f := &fixture{lws: &leaderworkersetv1.LeaderWorkerSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "role-a", Namespace: "test", UID: "lws-uid", Generation: 7},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test", UID: types.UID(name + "-lws-uid"), Generation: 7},
 		Spec: leaderworkersetv1.LeaderWorkerSetSpec{
 			Replicas: ptr.To(int32(replicas)), GroupIdentity: identity,
 			LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{Size: ptr.To(int32(size))},
@@ -159,7 +163,7 @@ func (f *fixture) objects() []client.Object {
 	return objects
 }
 
-func newReader(t *testing.T, objects ...client.Object) client.WithWatch {
+func newReader(t testing.TB, objects ...client.Object) client.WithWatch {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
@@ -186,7 +190,7 @@ func TestObserveGroups(t *testing.T) {
 				holdTermination(f.leaders[2])
 				objects := f.objects()
 				slices.Reverse(objects)
-				observed, err := Observe(t.Context(), newReader(t, objects...), f.lws)
+				observed, err := observeWithBatchParity(t, newReader(t, objects...), f.lws)
 				require.NoError(t, err)
 				require.NotNil(t, observed)
 				require.Len(t, observed.Groups, 4)
@@ -269,7 +273,7 @@ func TestObserveWholeGroupReadinessAndTermination(t *testing.T) {
 			t.Run(string(identity)+"/"+tc.name, func(t *testing.T) {
 				f := newFixture(identity, 1, 3)
 				tc.change(f)
-				observed, err := Observe(t.Context(), newReader(t, f.objects()...), f.lws)
+				observed, err := observeWithBatchParity(t, newReader(t, f.objects()...), f.lws)
 				if tc.unknown {
 					require.ErrorContains(t, err, "invalid group size")
 					assert.Nil(t, observed, "unknown must not become observed zero readiness")
@@ -309,7 +313,7 @@ func TestAvailabilityUsesEachGroupsRevisionSize(t *testing.T) {
 					f.workers[0][0].Status.Conditions[0].Status = corev1.ConditionFalse
 					want = 1
 				}
-				observed, err := Observe(t.Context(), newReader(t, objects...), f.lws)
+				observed, err := observeWithBatchParity(t, newReader(t, objects...), f.lws)
 				require.NoError(t, err)
 				assert.Equal(t, Availability{ReadyReplicas: want, RetainedReadyReplicas: want}, observed.Availability())
 			}
@@ -336,7 +340,7 @@ func TestObserveRejectsStaleOwnershipAtEveryLink(t *testing.T) {
 			t.Run(string(identity)+"/"+tc.name, func(t *testing.T) {
 				f := newFixture(identity, 1, 3)
 				tc.change(f)
-				observed, err := Observe(t.Context(), newReader(t, f.objects()...), f.lws)
+				observed, err := observeWithBatchParity(t, newReader(t, f.objects()...), f.lws)
 				require.NoError(t, err)
 				require.Len(t, observed.Groups, tc.wantGroups)
 				assert.Zero(t, observed.Availability())
@@ -350,7 +354,7 @@ func TestObserveRejectsStaleOwnershipAtEveryLink(t *testing.T) {
 	t.Run("Hash leaders belong to old ReplicaSet", func(t *testing.T) {
 		f := newFixture(leaderworkersetv1.GroupIdentityHash, 1, 3)
 		f.replicaSet.UID = "replacement-rs"
-		observed, err := Observe(t.Context(), newReader(t, f.objects()...), f.lws)
+		observed, err := observeWithBatchParity(t, newReader(t, f.objects()...), f.lws)
 		require.NoError(t, err)
 		assert.Empty(t, observed.Groups)
 	})
@@ -372,7 +376,7 @@ func TestObserveAbsentOrReplacedObjects(t *testing.T) {
 			case "leader":
 				objects = slices.DeleteFunc(objects, func(object client.Object) bool { return object == f.leaders[0] })
 			}
-			observed, err := Observe(t.Context(), newReader(t, objects...), expected)
+			observed, err := observeWithBatchParity(t, newReader(t, objects...), expected)
 			require.NoError(t, err)
 			if absent == "LWS" || absent == "replacement LWS" {
 				assert.Nil(t, observed)
@@ -410,7 +414,7 @@ func TestObserveScopesListsAndPreservesMultipleReplicaSets(t *testing.T) {
 	otherSet.Name, otherSet.UID = "other-set", "other-set"
 	otherSet.Labels[leaderworkersetv1.SetNameLabelKey] = "other"
 	objects := append(f.objects(), old, oldLeader, foreign, foreignLeader, otherNamespace, otherSet)
-	observed, err := Observe(t.Context(), newReader(t, objects...), f.lws)
+	observed, err := observeWithBatchParity(t, newReader(t, objects...), f.lws)
 	require.NoError(t, err)
 	require.Len(t, observed.ReplicaSets, 2)
 	assert.Equal(t, old.UID, observed.ReplicaSets[0].UID)
@@ -428,7 +432,7 @@ func TestObserveOrdinalsAndResidualWorkers(t *testing.T) {
 	f := newFixture(leaderworkersetv1.GroupIdentityOrdinal, 12, 12)
 	// Ordinals come from the native StatefulSet names, not mutable labels.
 	f.leaders[0].Labels[leaderworkersetv1.GroupIndexLabelKey] = "not-an-ordinal"
-	observed, err := Observe(t.Context(), newReader(t, f.objects()...), f.lws)
+	observed, err := observeWithBatchParity(t, newReader(t, f.objects()...), f.lws)
 	require.NoError(t, err)
 	for i, group := range observed.Groups {
 		assert.Equal(t, i, group.Ordinal)
@@ -443,7 +447,7 @@ func TestObserveOrdinalsAndResidualWorkers(t *testing.T) {
 	f = newFixture(leaderworkersetv1.GroupIdentityOrdinal, 1, 3)
 	f.lws.Spec.LeaderWorkerTemplate.Size = ptr.To[int32](1)
 	holdTermination(f.workers[0][1])
-	observed, err = Observe(t.Context(), newReader(t, f.objects()...), f.lws)
+	observed, err = observeWithBatchParity(t, newReader(t, f.objects()...), f.lws)
 	require.NoError(t, err)
 	require.Len(t, observed.Groups, 1)
 	assert.Len(t, observed.Groups[0].Pods, 3)
@@ -600,7 +604,7 @@ func TestAvailability(t *testing.T) {
 				if tc.change != nil {
 					tc.change(f)
 				}
-				observed, err := Observe(t.Context(), newReader(t, f.objects()...), f.lws)
+				observed, err := observeWithBatchParity(t, newReader(t, f.objects()...), f.lws)
 				require.NoError(t, err)
 				retained := tc.wantOrdinal
 				if identity == leaderworkersetv1.GroupIdentityHash {
@@ -620,7 +624,7 @@ func TestHashAvailabilityReservesVictimsPerReplicaSet(t *testing.T) {
 	second := f.replicaSet.DeepCopy()
 	second.Name, second.UID, second.Spec.Replicas = "other-rs", "other-rs", ptr.To[int32](2)
 	objects := append(f.objects(), second)
-	observed, err := Observe(t.Context(), newReader(t, objects...), f.lws)
+	observed, err := observeWithBatchParity(t, newReader(t, objects...), f.lws)
 	require.NoError(t, err)
 	// All 3 Ready groups belong to the RS targeting 1. The other RS's unused
 	// target of 2 must not erase the first RS's two pending deletions.
@@ -630,20 +634,20 @@ func TestHashAvailabilityReservesVictimsPerReplicaSet(t *testing.T) {
 	for _, leader := range f.leaders[1:] {
 		leader.Status.Conditions[0].Status = corev1.ConditionFalse
 	}
-	observed, err = Observe(t.Context(), newReader(t, objects...), f.lws)
+	observed, err = observeWithBatchParity(t, newReader(t, objects...), f.lws)
 	require.NoError(t, err)
 	// Conversely, the first RS's excess unready groups must not withhold the
 	// second RS's one Ready group, which is not exposed to its deletions.
 	assert.EqualValues(t, 1, observed.Availability().RetainedReadyReplicas)
 
 	second.Generation++
-	observed, err = Observe(t.Context(), newReader(t, objects...), f.lws)
+	observed, err = observeWithBatchParity(t, newReader(t, objects...), f.lws)
 	require.NoError(t, err)
 	assert.Zero(t, observed.Availability().RetainedReadyReplicas)
 
 	second.Status.ObservedGeneration++
 	second.Spec.Replicas = ptr.To[int32](1)
-	observed, err = Observe(t.Context(), newReader(t, objects...), f.lws)
+	observed, err = observeWithBatchParity(t, newReader(t, objects...), f.lws)
 	require.NoError(t, err)
 	assert.Zero(t, observed.Availability().RetainedReadyReplicas, "unfinished target redistribution")
 }

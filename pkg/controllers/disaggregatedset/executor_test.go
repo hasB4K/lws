@@ -2894,11 +2894,11 @@ func TestSubRoleBaselineRepairAndLiveMembership(t *testing.T) {
 			statuses, _, err := f.manager.subRoleStatus(t.Context(), &disaggregatedsetv1.DisaggregatedRoleSpec{Name: "model", SubRoles: []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Name: "a"}, {Name: "b"}}}, []*leaderworkersetv1.LeaderWorkerSet{s.LWS}, s.LWS.Name)
 			require.NoError(t, err)
 			require.Equal(t, []int32{1, 0, 1}, []int32{statuses[0].Replicas, statuses[1].Replicas, statuses[2].Replicas}, "failed and terminating leaders must not inflate status replicas")
-			for _, membership := range []map[string]int{{}, {"reenabled": 3}} {
+			for _, membership := range []map[string]int{{}, {"re-enabled": 3}} {
 				_, err = f.manager.syncSubRoles(t.Context(), f.ds, f.observe().LWS, subRoleUpdate{membership: membership})
 				require.ErrorIs(t, err, errReplicaGroupsPending)
 			}
-			require.Empty(t, f.observe().LWS.Annotations[subRoleReplicasAnnotation], "finish accepted cleanup before reenable")
+			require.Empty(t, f.observe().LWS.Annotations[subRoleReplicasAnnotation], "finish accepted cleanup before enabling subroles again")
 			require.EqualValues(t, len(children), getLWSReplicas(f.observe().LWS), "unpartitioning retains physical replicas")
 			for _, group := range f.observe().Groups {
 				child, coherent := groupSubRole(group)

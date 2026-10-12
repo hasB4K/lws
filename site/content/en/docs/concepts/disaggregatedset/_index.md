@@ -94,6 +94,8 @@ old-role fractions block its reduction. Under `AdvanceRollout`, an old drain
 may bypass that fraction window only to release existing excess:
 `max(0, totalOldSpec + targetSpec - desired - maxSurge)`. The exception cannot
 drain below the ceiling, bypass availability or split required old roles.
+Only roles with a positive desired count use this correction; removed roles
+keep their old fraction window.
 Ordinary retirement keeps its historical fraction window; pending-work budgets
 keep their original size baseline. This is an opt-in scale correction, not an
 extra growth allowance.

@@ -853,13 +853,13 @@ func boundGrowingRoleTargetsToWindow(
 }
 
 // boundDrainingSnapshotTargets preserves historical rollout coordination,
-// except that opt-in scaling may release existing physical excess. That
-// correction stops at the latest surge ceiling and still passes availability
-// and whole-revision completeness checks.
+// except that opt-in scaling may release existing physical excess of current
+// roles. Removed roles have no new size to correct and keep their old pacing.
+// The correction still passes availability and whole-revision completeness.
 func boundDrainingSnapshotTargets(snapshot rolloutSnapshot, current, reference, proposed RoleReplicaState) RoleReplicaState {
 	bounded := boundDrainingRoleTargetsToWindow(current, reference, proposed)
 	for i, role := range snapshot {
-		if role.ScaleDuringRollout {
+		if role.ScaleDuringRollout && role.NewTargetReplicas > 0 {
 			excess := max(0, role.OldSpecReplicas+role.NewSpecReplicas-role.SurgeBaselineReplicas-role.Config.MaxSurge)
 			bounded[i] = min(bounded[i], max(proposed[i], current[i]-excess))
 		}

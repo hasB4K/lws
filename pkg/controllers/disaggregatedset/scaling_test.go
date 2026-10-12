@@ -79,6 +79,21 @@ func TestMovingTargetKeepsDisjointStartupBounds(t *testing.T) {
 	}
 }
 
+func TestMovingTargetKeepsRemovedRoleCoordination(t *testing.T) {
+	// A removed role's desired zero is not a new capacity target. Its larger
+	// saved unavailable budget must not bypass the old rollout fraction window.
+	for _, advance := range []bool{false, true} {
+		state := rolloutState([]int{10, 10, 0, 0}, []int{10, 10, 0, 0}, []int{10, 10, 0, 0}, nil, nil,
+			[]int{0, 0, 0, 0}, []int{0, 0, 0, 0}, []int{0, 0, 10, 10}, configs([]int{1, 1, 0, 0}, []int{9, 1, 1, 1}))
+		state.ScaleDuringRollout = advance
+		step := ComputeNextStep(state)
+		require.NotNil(t, step)
+		assert.Equal(t, []int{8, 9, 0, 0}, step.Past, "advance=%v", advance)
+		assert.Equal(t, []int{0, 0, 0, 0}, step.New)
+		require.NoError(t, validateUpdateStep(state, step))
+	}
+}
+
 func TestDisjointTargetCorrectionReadiness(t *testing.T) {
 	for _, tc := range []struct {
 		name                               string
@@ -352,7 +367,7 @@ func assertScalingSafety(t *testing.T, state RolloutState, step *UpdateStep) {
 		phaseTargets[i] = max(state.Target.SpecReplicas[i], phaseTargets[i])
 		growing[i] = max(state.Target.SpecReplicas[i], step.New[i])
 		oldReference[i] = state.ActiveOld.InitialReplicas[i]
-		if state.ScaleDuringRollout {
+		if state.ScaleDuringRollout && state.Target.DesiredReplicas[i] > 0 {
 			physical := state.ActiveOld.SpecReplicas[i] + state.Target.SpecReplicas[i]
 			for _, parked := range state.ParkedOld {
 				physical += parked.SpecReplicas[i]

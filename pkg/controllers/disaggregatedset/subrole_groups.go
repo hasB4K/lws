@@ -655,7 +655,7 @@ func (m *LeaderWorkerSetManager) markSubRoleVictim(ctx context.Context, lws *lea
 	if subRoleVictim(group, plan) && subRoleProtected(lws, group) {
 		return false, nil
 	}
-	if _, err := m.readSubRoleLWS(ctx, lws); err != nil {
+	if err := m.checkSubRoleLWS(ctx, lws); err != nil {
 		return false, err
 	}
 	pod := group.Leader
@@ -682,7 +682,7 @@ func (m *LeaderWorkerSetManager) deleteSubRoleExtras(ctx context.Context, s *rep
 		if _, assigned := assignments[group.Leader.UID]; assigned || subRoleProtected(s.LWS, group) || group.Leader.Labels[disaggv1.SubRoleLabelKey] != "" {
 			continue
 		}
-		if _, err := m.readSubRoleLWS(ctx, s.LWS); err != nil {
+		if err := m.checkSubRoleLWS(ctx, s.LWS); err != nil {
 			return changed, err
 		}
 		pod := group.Leader
@@ -716,7 +716,7 @@ func (m *LeaderWorkerSetManager) syncHashSubRoleAssignments(ctx context.Context,
 			if !subRoleVictim(group, plan) {
 				continue
 			}
-			if _, err := m.readSubRoleLWS(ctx, s.LWS); err != nil {
+			if err := m.checkSubRoleLWS(ctx, s.LWS); err != nil {
 				return err
 			}
 			pod := group.Leader

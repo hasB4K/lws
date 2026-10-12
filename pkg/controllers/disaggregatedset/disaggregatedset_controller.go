@@ -198,6 +198,11 @@ func cachedWorkloadsMatchDesired(ds *disaggregatedsetv1.DisaggregatedSet, worklo
 			return false
 		}
 		seen.Insert(lws.Name)
+		// Physical counts cannot prove that child assignments are settled.
+		if len(config.SubRoles) > 0 || lws.Annotations[subRoleReplicasAnnotation] != "" ||
+			lws.Annotations[subRolePlanAnnotation] != "" || lws.Annotations[disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey] != "" {
+			return false
+		}
 		desired, known := desiredReplicasByRole[role]
 		initial, valid := disaggregatedsetutils.GetInitialReplicas(lws)
 		if !known || !valid || int(getLWSReplicas(lws)) != desired || int(initial) != desired {
@@ -227,9 +232,23 @@ func (r *DisaggregatedSetReconciler) syncMaxUnavailable(
 	if err != nil {
 		return err
 	}
-	roles := sets.New(disaggregatedsetutils.GetRoleNames(ds)...)
+	roles := sets.New(rolloutRoleNames(ds)...)
 	for _, lws := range workloads {
-		roles.Insert(lws.Labels[disaggregatedsetv1.RoleLabelKey])
+		parent := lws.Labels[disaggregatedsetv1.RoleLabelKey]
+		if lws.Annotations[subRoleReplicasAnnotation] == "" && lws.Annotations[disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey] == "" {
+			roles.Insert(parent)
+			continue
+		}
+		// Retain removed children's budgets until their physical history is gone.
+		for _, key := range []string{subRoleReplicasAnnotation, disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey} {
+			counts, err := subRoleCounts(lws, key)
+			if err != nil {
+				return err
+			}
+			for child := range counts {
+				roles.Insert(childRoleKey(parent, child))
+			}
+		}
 	}
 	encoded, err := maxUnavailableAnnotation(ds, sets.List(roles), desiredReplicasByRole)
 	if err != nil {

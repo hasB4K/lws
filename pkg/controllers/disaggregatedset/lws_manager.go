@@ -109,6 +109,7 @@ func (manager *LeaderWorkerSetManager) collectRolloutObservations(
 		return nil, errReplicaGroupsPending
 	}
 	configs, result := disaggregatedsetutils.GetRoleConfigs(ds), make(rolloutReadiness)
+	var ordinary []*leaderworkersetv1.LeaderWorkerSet
 	for i, revision := range revisions {
 		for name, lws := range revision.Roles {
 			// Only the appended target follows desired membership. Old revisions
@@ -126,10 +127,15 @@ func (manager *LeaderWorkerSetManager) collectRolloutObservations(
 				observeSubRoleReadiness(state, result)
 				continue
 			}
-			sets = append(sets, lws)
+			ordinary = append(ordinary, lws)
 		}
 	}
-	return manager.observeReadiness(ctx, sets)
+	observed, err := manager.observeReadiness(ctx, ordinary)
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(result, observed)
+	return result, nil
 }
 
 func observeSubRoleReadiness(state *subRoleState, observed rolloutReadiness) {
@@ -524,7 +530,7 @@ func (manager *LeaderWorkerSetManager) UpdateInitialReplicas(
 ) error {
 	current := &leaderworkersetv1.LeaderWorkerSet{}
 	key := types.NamespacedName{Name: leaderWorkerSet.Name, Namespace: ds.Namespace}
-	if err := manager.client.Get(ctx, key, current); err != nil {
+	if err := manager.apiReader.Get(ctx, key, current); err != nil {
 		return fmt.Errorf("failed to get LeaderWorkerSet %s: %w", leaderWorkerSet.Name, err)
 	}
 	if !metav1.IsControlledBy(current, ds) {

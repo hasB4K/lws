@@ -429,6 +429,14 @@ func TestCachedWorkloadsMatchDesired(t *testing.T) {
 			s.ds.Spec.Roles[1].Spec.GroupReplacementPolicy = leaderworkersetv1.GroupReplacementImmediate
 		}, true},
 		{"unresolved target", func(s *state) { delete(s.desired, testRolePrefill) }, false},
+		{"child assignment needs observation", func(s *state) {
+			s.ds.Spec.Roles[0].SubRoles = []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Name: "a", Replicas: ptr.To[int32](4)}}
+		}, false},
+		{"previous child layout needs observation", func(s *state) { s.workloads[0].Annotations[subRoleReplicasAnnotation] = `{"a":4}` }, false},
+		{"pending child assignment", func(s *state) { s.workloads[0].Annotations[subRolePlanAnnotation] = `{"a":4}` }, false},
+		{"child history recovery", func(s *state) {
+			s.workloads[0].Annotations[disaggregatedsetv1.InitialSubRoleReplicasAnnotationKey] = `{"a":4}`
+		}, false},
 		{"changed target", func(s *state) { s.desired[testRolePrefill]++ }, false},
 		{"missing workload", func(s *state) { s.workloads = s.workloads[:3] }, false},
 		{"nil workload", func(s *state) { s.workloads[0] = nil }, false},

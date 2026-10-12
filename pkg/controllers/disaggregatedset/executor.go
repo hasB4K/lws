@@ -246,12 +246,7 @@ func buildRolloutInputs(
 	desiredReplicasByRole map[string]int,
 	readiness rolloutReadiness,
 ) rolloutInputs {
-	targetRoleNames := []string{}
-	for _, role := range disaggregatedSet.Spec.Roles {
-		for _, child := range roleLeaves(&role) {
-			targetRoleNames = append(targetRoleNames, childRoleKey(role.Name, child.Name))
-		}
-	}
+	targetRoleNames := rolloutRoleNames(disaggregatedSet)
 	desiredRoles, oldRoles := collectDesiredAndOldRoles(targetRoleNames, append(slices.Clone(oldRevisions), targetRevision), readiness)
 	removedRoleNames := sets.List(oldRoles.Difference(desiredRoles))
 	allRoleNames := append(slices.Clone(targetRoleNames), removedRoleNames...)

@@ -78,6 +78,16 @@ func roleLeaves(role *disaggregatedsetv1.DisaggregatedRoleSpec) []disaggregateds
 	return []disaggregatedsetv1.DisaggregatedSubRoleSpec{{Replicas: role.Spec.Replicas, Scaling: role.Scaling}}
 }
 
+func rolloutRoleNames(ds *disaggregatedsetv1.DisaggregatedSet) []string {
+	var names []string
+	for _, role := range ds.Spec.Roles {
+		for _, child := range roleLeaves(&role) {
+			names = append(names, childRoleKey(role.Name, child.Name))
+		}
+	}
+	return names
+}
+
 // ScalerName is the deterministic name for a parent or child role's scaler.
 func ScalerName(dsName, role string) string { return dsName + "-" + strings.ReplaceAll(role, "/", "-") }
 

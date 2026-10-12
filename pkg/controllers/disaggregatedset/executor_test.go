@@ -2592,9 +2592,10 @@ func TestSubRoleProjectionAndBudgets(t *testing.T) {
 			}
 			state := rolloutStateForRevision(inputs.allRoleNames, disaggregatedsetutils.RevisionRolesList{old}, old, target, inputs.targetReplicas, inputs.config, observed)
 			for i, name := range inputs.allRoleNames {
-				want, targetCount := RollingUpdateConfig{MaxSurge: 1}, 0
+				want, targetCount := RollingUpdateConfig{MaxSurge: 1, MaxUnavailable: 1}, 0
 				if name == "router" {
 					targetCount = 3
+					want.MaxUnavailable = 0
 				} else if slices.Contains(order, name[len("model/"):]) {
 					targetCount = desired[name]
 					want.MaxSurge, _ = intstr.GetScaledValueFromIntOrPercent(&budget, targetCount, true)
@@ -2606,6 +2607,37 @@ func TestSubRoleProjectionAndBudgets(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestSubRoleBudgetsSurviveRemovalAndPolicyReset(t *testing.T) {
+	f := newSubRoleFixture(t, 0, "a", "a", "b", "b")
+	require.NoError(t, f.manager.client.Get(t.Context(), client.ObjectKeyFromObject(f.ds), f.ds))
+	f.ds.Spec.Roles = []disaggregatedsetv1.DisaggregatedRoleSpec{{Name: "model", SubRoles: []disaggregatedsetv1.DisaggregatedSubRoleSpec{
+		{Name: "a", Replicas: ptr.To[int32](4)}, {Name: "b", Replicas: ptr.To[int32](6)},
+	}}}
+	f.ds.Spec.Roles[0].Spec.RolloutStrategy.RollingUpdateConfiguration = &leaderworkersetv1.RollingUpdateConfiguration{
+		MaxSurge: intstr.FromInt(1), MaxUnavailable: intstr.FromString("50%"),
+	}
+	require.NoError(t, f.manager.client.Update(t.Context(), f.ds))
+	r := newTestReconciler(f.manager.client)
+	require.NoError(t, r.syncMaxUnavailable(t.Context(), f.ds, resolveDesiredReplicasByRole(f.ds, nil)))
+	assert.Equal(t, map[string]int{"model/a": 2, "model/b": 3}, rememberedMaxUnavailable(f.ds))
+
+	// The old child exists only in frozen history. The current children use
+	// their live policy; removing an explicit policy resets their budgets.
+	setSubRoleJSON(f.lws, subRoleReplicasAnnotation, map[string]int{"b": 4})
+	require.NoError(t, f.manager.client.Update(t.Context(), f.lws))
+	f.ds.Spec.Roles[0].SubRoles[0].Name = "c"
+	f.ds.Spec.Roles[0].Spec.RolloutStrategy.RollingUpdateConfiguration = nil
+	require.NoError(t, f.manager.client.Update(t.Context(), f.ds))
+	require.NoError(t, r.syncMaxUnavailable(t.Context(), f.ds, resolveDesiredReplicasByRole(f.ds, nil)))
+	assert.Equal(t, map[string]int{"model/a": 2, "model/b": 0, "model/c": 0}, rememberedMaxUnavailable(f.ds))
+	config := extractRollingUpdateConfig(f.ds, []string{"model/a", "model/b", "model/c"}, resolveDesiredReplicasByRole(f.ds, nil))
+	assert.Equal(t, []RollingUpdateConfig{{MaxSurge: 1, MaxUnavailable: 2}, {MaxSurge: 1}, {MaxSurge: 1}}, config)
+
+	require.NoError(t, f.manager.client.Delete(t.Context(), f.lws))
+	require.NoError(t, r.syncMaxUnavailable(t.Context(), f.ds, resolveDesiredReplicasByRole(f.ds, nil)))
+	assert.NotContains(t, rememberedMaxUnavailable(f.ds), "model/a")
 }
 
 func TestSubRoleMixedHistoricalLayouts(t *testing.T) {
@@ -2711,7 +2743,7 @@ func TestSubRoleMigrationFromOrdinaryToOrdinal(t *testing.T) {
 			snapshot := snapshotForRolloutState(state)
 			require.Zero(t, availabilityFloor(snapshot[0]))
 			require.Zero(t, availabilityFloor(snapshot[1]))
-			require.Equal(t, 2, availabilityFloor(snapshot[2]))
+			require.Equal(t, 1, availabilityFloor(snapshot[2]), "removed ordinary roles can release one group")
 			executor := newTestExecutor(f.manager.client)
 			executor.LWSManager = f.manager
 			for range 2 {
@@ -2720,7 +2752,7 @@ func TestSubRoleMigrationFromOrdinaryToOrdinal(t *testing.T) {
 				require.False(t, complete, "an unready target must not complete the rollout")
 				require.Positive(t, result.RequeueAfter)
 			}
-			require.EqualValues(t, 2, getLWSReplicas(oldRevision().Roles["model"]), "the ordinary pool must survive until the Ordinal children are Ready")
+			require.EqualValues(t, 1, getLWSReplicas(oldRevision().Roles["model"]), "the old pool keeps its availability floor until the Ordinal children are Ready")
 			for _, group := range f.observe().Groups {
 				group.Leader.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 				require.NoError(t, f.manager.client.Status().Update(t.Context(), group.Leader))

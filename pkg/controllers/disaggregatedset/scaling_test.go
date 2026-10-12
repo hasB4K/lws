@@ -46,6 +46,39 @@ func TestScalingDuringRolloutPreservesDisjointReplacementCredit(t *testing.T) {
 	}), "shrinking B could leave only 90 Ready plus A5 against the shared baseline of 100")
 }
 
+func TestMovingTargetKeepsDisjointStartupBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		old, issued, ready []int
+		wantOld, wantNew   []int
+		rebalance          bool
+	}{
+		{"drain before using released capacity", []int{4, 4, 0, 0}, []int{0, 0, 0, 0}, []int{0, 0, 0, 0}, []int{3, 3, 0, 0}, []int{0, 0, 0, 0}, false},
+		{"start missing role first", []int{3, 3, 0, 0}, []int{0, 0, 1, 0}, []int{0, 0, 1, 0}, []int{3, 3, 0, 0}, []int{0, 0, 1, 1}, false},
+		{"unready pair cannot spend another old group", []int{3, 3, 0, 0}, []int{0, 0, 1, 1}, []int{0, 0, 1, 0}, nil, nil, false},
+		{"repair earlier unready surplus", []int{3, 3, 0, 0}, []int{0, 0, 3, 1}, []int{0, 0, 0, 0}, []int{3, 3, 0, 0}, []int{0, 0, 1, 1}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := rolloutState([]int{4, 4, 0, 0}, tc.old, tc.old, nil, nil, tc.issued, tc.ready,
+				[]int{0, 0, 4, 4}, configs([]int{0, 0, 0, 0}, []int{1, 1, 1, 1}))
+			state.ScaleDuringRollout = true
+			state.Target.UnschedulableRoles = []bool{false, false, true, true}
+			step := ComputeNextStep(state)
+			if tc.wantNew == nil {
+				require.Nil(t, step)
+				return
+			}
+			require.NotNil(t, step)
+			assert.Equal(t, tc.wantOld, step.Past)
+			assert.Equal(t, tc.wantNew, step.New)
+			assert.Equal(t, tc.rebalance, step.UsesTargetRebalance)
+			assert.False(t, step.UsesBootstrapSurge)
+			assert.False(t, step.UsesUnavailableFallback)
+			require.NoError(t, validateUpdateStep(state, step))
+		})
+	}
+}
+
 func TestDisjointTargetCorrectionReadiness(t *testing.T) {
 	for _, tc := range []struct {
 		name                               string
@@ -446,6 +479,14 @@ func TestScalingDuringRolloutDelayedConvergence(t *testing.T) {
 				state.Target.RawReadyReplicas = slices.Clone(state.Target.SpecReplicas)
 				state.Target.ReadyReplicas = slices.Clone(state.Target.SpecReplicas)
 			}
+			// The executor rebuilds baselines after target edits and retirement;
+			// a removed role in an overlapping revision has no disjoint floor.
+			var parkedSpec []int
+			if len(state.ParkedOld) > 0 {
+				parkedSpec = state.ParkedOld[0].SpecReplicas
+			}
+			state.AvailabilityBaseline = rolloutState(state.ActiveOld.InitialReplicas, state.ActiveOld.SpecReplicas,
+				nil, parkedSpec, nil, nil, nil, state.Target.DesiredReplicas, nil).AvailabilityBaseline
 			if step := ComputeNextStep(state); step != nil {
 				require.NoError(t, validateUpdateStep(state, step), "scenario %d reconcile %d", scenario, reconcile)
 				assertScalingSafety(t, state, step)

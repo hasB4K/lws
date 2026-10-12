@@ -243,21 +243,23 @@ func minimumTargetAvailableTargets(state RolloutState, snapshot rolloutSnapshot)
 // pending old deletions, without requiring recovery of an already degraded floor.
 func disjointTargetReadyFraction(state RolloutState, observed rolloutSnapshot) (numerator, denominator int) {
 	denominator = 1
-	raw := usableReadyReplicas(state.Target.RequiredRoles, state.Target.RawReadyReplicas)
-	progress, hasTarget := coordinationWindowForProgress(state.Target.DesiredReplicas, raw)
+	progress, hasTarget := coordinationWindowForProgress(state.Target.DesiredReplicas, state.Target.RawReadyReplicas)
+	if !allRequiredRolesPresent(state.Target.RequiredRoles, state.Target.RawReadyReplicas) {
+		progress.leastAdvancedReplicas = 0
+	}
 	if !hasTarget {
 		return
 	}
 	rawNumerator := min(progress.leastAdvancedReplicas, progress.leastAdvancedTarget)
-	for i, protected := range disjointOldRoles(state) {
+	for i, role := range observed {
 		baseline := state.AvailabilityBaseline[i]
-		if !protected || baseline == 0 {
+		if state.Target.DesiredReplicas[i] != 0 || baseline == 0 {
 			continue
 		}
 		credit := int(int64(baseline) * int64(rawNumerator) / int64(progress.leastAdvancedTarget))
 		floor := max(0, baseline-state.Config[i].MaxUnavailable)
 		available := observed[i].ObservedUsableReadyReplicas + credit
-		needed := max(0, min(available, floor)-observed[i].OldUsableReadyReplicas)
+		needed := max(0, min(available, floor)-role.ActiveOldUsableReadyReplicas-role.ParkedUsableReadyReplicas)
 		if int64(needed)*int64(denominator) > int64(numerator)*int64(baseline) {
 			numerator, denominator = needed, baseline
 		}
@@ -368,7 +370,9 @@ func snapshotForRolloutState(state RolloutState) rolloutSnapshot {
 		availabilityBaseline := state.AvailabilityBaseline[i]
 		surgeBaseline := max(state.ActiveOld.InitialReplicas[i], state.Target.DesiredReplicas[i])
 		if state.ScaleDuringRollout {
-			availabilityBaseline = state.Target.DesiredReplicas[i]
+			if state.Target.DesiredReplicas[i] > 0 {
+				availabilityBaseline = state.Target.DesiredReplicas[i]
+			}
 			surgeBaseline = state.Target.DesiredReplicas[i]
 		}
 		snapshot[i] = roleRolloutSnapshot{
@@ -685,7 +689,7 @@ func disjointSurplusStep(state RolloutState, snapshot rolloutSnapshot) *UpdateSt
 	}
 	next := slicesClone(state.Target.SpecReplicas)
 	for i, role := range snapshot {
-		if role.NewTargetReplicas > 0 && role.AvailabilityBaselineReplicas > 0 {
+		if role.NewTargetReplicas > 0 && state.AvailabilityBaseline[i] > 0 {
 			return nil
 		}
 		keepReady := minimumSpecToPreserveReady(role.NewSpecReplicas, role.NewCommittedReadyReplicas, min(1, role.NewCommittedReadyReplicas))

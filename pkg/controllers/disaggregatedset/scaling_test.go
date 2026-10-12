@@ -652,6 +652,46 @@ func TestScalingDuringRolloutPrefersAnyOldDrainOverTargetShrink(t *testing.T) {
 	assertRevisionReplicas(t, c, "hashC", [2]int32{3, 3})
 }
 
+func TestScalingDuringRolloutKeepsDefaultCandidatePreference(t *testing.T) {
+	// B cannot drain, but can correct an earlier target surplus. A can drain
+	// one Decode group. Only opt-in scaling should prefer A over B's repair.
+	now := time.Now()
+	objects := revisionLWSObjects("hashA", [2]int32{4, 4}, [2]int32{4, 4}, [2]int32{6, 4}, now)
+	objects = append(objects, revisionLWSObjects("hashB", [2]int32{1, 1}, [2]int32{1, 0}, [2]int32{1, 1}, now.Add(time.Hour))...)
+	objects = append(objects,
+		revisionLWS("hashC", "new-prefill", 3, 0, now.Add(2*time.Hour), 4),
+		revisionLWS("hashC", "new-decode", 1, 0, now.Add(2*time.Hour), 4))
+	executor := newTestExecutor(newTestClient(objects...))
+	ds := newTwoRoleTestDisaggregatedSet([2]int32{4, 4}, [2]int{1, 1}, [2]int{1, 1})
+	old, target, err := executor.LWSManager.GetRevisionRolesList(context.Background(), ds, 0, "hashC")
+	require.NoError(t, err)
+	require.NotNil(t, target)
+	readiness, err := executor.LWSManager.observeRolloutReadiness(context.Background(), old, *target)
+	require.NoError(t, err)
+	inputs := rolloutInputs{
+		allRoleNames: append(testRoleNames(), "new-prefill", "new-decode"), targetReplicas: []int{0, 0, 4, 4},
+		config: configs([]int{0, 0, 1, 1}, []int{1, 1, 1, 1}), readiness: readiness,
+	}
+	candidates := orderedRevisionCandidates(old, readiness)
+	for _, tc := range []struct {
+		advance  bool
+		revision string
+		step     UpdateStep
+	}{
+		{false, "hashB", UpdateStep{Past: []int{1, 1, 0, 0}, New: []int{0, 0, 1, 1}, UsesTargetRebalance: true}},
+		{true, "hashA", UpdateStep{Past: []int{4, 3, 0, 0}, New: []int{0, 0, 3, 1}}},
+	} {
+		t.Run(fmt.Sprintf("advance=%v", tc.advance), func(t *testing.T) {
+			inputs.scaleDuringRollout = tc.advance
+			selected, state, step, err := executor.selectNextRolloutStep(context.Background(), candidates, old, *target, inputs)
+			require.NoError(t, err)
+			require.Equal(t, tc.revision, selected.Revision)
+			require.Equal(t, &tc.step, step)
+			require.NoError(t, validateUpdateStep(state, step))
+		})
+	}
+}
+
 func TestScalingDuringRolloutExposesLatestExternalTarget(t *testing.T) {
 	ds := newTwoRoleTestDisaggregatedSet([2]int32{2, 2}, [2]int{1, 1}, [2]int{})
 	ds.Spec.Roles[0].Scaling = &disaggregatedsetv1.RoleScaling{Mode: disaggregatedsetv1.RoleScalingExternal}

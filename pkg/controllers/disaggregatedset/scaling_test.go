@@ -681,7 +681,7 @@ func TestScalingDuringRolloutKeepsDefaultCandidatePreference(t *testing.T) {
 	old, target, err := executor.LWSManager.GetRevisionRolesList(context.Background(), ds, 0, "hashC")
 	require.NoError(t, err)
 	require.NotNil(t, target)
-	readiness, err := executor.LWSManager.observeRolloutReadiness(context.Background(), old, *target)
+	readiness, err := executor.LWSManager.collectRolloutObservations(context.Background(), ds, old, *target, nil)
 	require.NoError(t, err)
 	inputs := rolloutInputs{
 		allRoleNames: append(testRoleNames(), "new-prefill", "new-decode"), targetReplicas: []int{0, 0, 4, 4},

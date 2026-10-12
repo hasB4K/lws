@@ -169,16 +169,16 @@ func subRoleNativeSettled(s *replicagroups.Snapshot) bool {
 }
 
 // Metadata intent must match too: annotation changes do not bump generation.
-func (m *LeaderWorkerSetManager) readSubRoleLWS(ctx context.Context, expected *leaderv1.LeaderWorkerSet) (*leaderv1.LeaderWorkerSet, error) {
+func (m *LeaderWorkerSetManager) checkSubRoleLWS(ctx context.Context, expected *leaderv1.LeaderWorkerSet) error {
 	live := &leaderv1.LeaderWorkerSet{}
 	if err := m.apiReader.Get(ctx, client.ObjectKeyFromObject(expected), live); err != nil {
-		return nil, err
+		return err
 	}
 	if expected.UID == "" || live.UID != expected.UID || live.ResourceVersion != expected.ResourceVersion ||
 		!live.DeletionTimestamp.IsZero() || metav1.GetControllerOf(live) == nil {
-		return nil, errReplicaGroupsPending
+		return errReplicaGroupsPending
 	}
-	return live, nil
+	return nil
 }
 
 func (m *LeaderWorkerSetManager) labelSubRoleGroup(ctx context.Context, lws *leaderv1.LeaderWorkerSet, group replicagroups.Group, name string) error {
@@ -188,7 +188,7 @@ func (m *LeaderWorkerSetManager) labelSubRoleGroup(ctx context.Context, lws *lea
 		if value, exists := pod.Labels[disaggv1.SubRoleLabelKey]; value == name && (name != "" || !exists) {
 			continue
 		}
-		if _, err := m.readSubRoleLWS(ctx, lws); err != nil {
+		if err := m.checkSubRoleLWS(ctx, lws); err != nil {
 			return err
 		}
 		labels := mergeLabels(pod.Labels, map[string]string{disaggv1.SubRoleLabelKey: name})
@@ -336,7 +336,7 @@ func (m *LeaderWorkerSetManager) syncSubRoleAssignments(ctx context.Context, sta
 	if s == nil {
 		return errReplicaGroupsPending
 	}
-	if _, err := m.readSubRoleLWS(ctx, state.lws); err != nil {
+	if err := m.checkSubRoleLWS(ctx, state.lws); err != nil {
 		return err
 	}
 	state.snapshot = s

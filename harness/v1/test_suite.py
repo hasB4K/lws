@@ -14,10 +14,11 @@ class SuiteTests(unittest.TestCase):
     def test_default_matrix_is_bounded_and_balanced(self):
         p = parser()
         runs = matrix(p.parse_args([]), p)
-        self.assertEqual(len(runs), 22)
-        self.assertEqual(sum(r[1] == "Hash" for r in runs), 11)
+        self.assertEqual(len(runs), 24)
+        self.assertEqual(sum(r[1] == "Hash" for r in runs), 12)
         self.assertEqual(len(set(runs)), len(runs))
-        self.assertEqual(len(matrix(p.parse_args(["--include-large"]), p)), 24)
+        self.assertEqual(len(matrix(p.parse_args(["--include-large"]), p)), 26)
+        self.assertEqual({r[1] for r in runs if r[0] == "autoscaler-handoff"}, {"Ordinal", "Hash"})
 
     def test_single_case_selection(self):
         p = parser()

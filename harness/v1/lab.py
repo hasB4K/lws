@@ -94,7 +94,7 @@ class Lab:
     def reset(self):
         self.k("-n", self.namespace, "delete", DS_RESOURCE, "--all", "--wait=true", "--timeout=90s")
         self.k("-n", self.namespace, "delete", "lws", "--all", "--wait=true", "--timeout=90s")
-        self.wait("previous groups disappear", lambda s: not s["pods"] and not s["lws"], timeout=120)
+        self.wait("previous groups and scalers disappear", lambda s: not s["pods"] and not s["lws"] and not s["scalers"], timeout=120)
         self.set_slots(64)
 
     def set_slots(self, count):
@@ -155,7 +155,8 @@ class Lab:
     def patch_set(self, patch):
         self.k("-n", self.namespace, "patch", DS_RESOURCE, self.ds_name, "--type=merge", "-p", json.dumps(patch))
 
-    def update(self, version=None, counts=None, policy=None, ready=None, names=None, surge=None, unavailable=None):
+    def update(self, version=None, counts=None, policy=None, ready=None, names=None, surge=None, unavailable=None,
+               external_roles=()):
         ds = self.k("-n", self.namespace, "get", DS_RESOURCE, self.ds_name, "-o", "json", json_output=True)
         roles = copy.deepcopy(ds["spec"]["roles"])
         for i, role in enumerate(roles):
@@ -163,6 +164,9 @@ class Lab:
                 role["name"] = names[i]
             if counts is not None and role["name"] in counts:
                 role["spec"]["replicas"] = counts[role["name"]]
+            if role["name"] in external_roles:
+                role["scaling"] = {"mode": "External"}
+                role["spec"].pop("replicas", None)
             for key, value in (("maxSurge", surge), ("maxUnavailable", unavailable)):
                 if value is not None:
                     role["spec"]["rolloutStrategy"]["rollingUpdateConfiguration"][key] = value.get(role["name"], 0) if isinstance(value, dict) else value
@@ -205,14 +209,15 @@ class Lab:
             self.update(version=version, ready=ready)
 
     def snapshot(self):
-        objects = self.k("-n", self.namespace, "get", DS_RESOURCE + ",lws,pods", "-o", "json", json_output=True)["items"]
+        objects = self.k("-n", self.namespace, "get", DS_RESOURCE + ",lws,pods,dsrs", "-o", "json", json_output=True)["items"]
         kinds = lambda name: [x for x in objects if x["kind"] == name]
         ds = next(iter(kinds("DisaggregatedSet")), None)
         # Scope controller events by UID: delayed events from a previous demo
         # must not look like emergency recovery in the next scenario.
         events = self.k("-n", self.namespace, "get", "events", "--field-selector",
                         "involvedObject.uid=" + ds["metadata"]["uid"], "-o", "json", json_output=True)["items"] if ds else []
-        return {"ds": ds, "lws": kinds("LeaderWorkerSet"), "pods": kinds("Pod"), "events": events}
+        return {"ds": ds, "lws": kinds("LeaderWorkerSet"), "pods": kinds("Pod"), "events": events,
+                "scalers": kinds("DisaggregatedSetRoleScaler")}
 
     def pods(self, state, version=None, role=None):
         return [p for p in state["pods"] if not p["metadata"].get("deletionTimestamp")
@@ -273,6 +278,9 @@ class Lab:
         for role in (state["ds"] or {}).get("spec", {}).get("roles", []):
             config = role["spec"].get("rolloutStrategy", {}).get("rollingUpdateConfiguration", {})
             counts = ",".join(f"{s['name']}={s.get('replicas', '?')}" for s in role.get("subRoles", [])) or str(role["spec"].get("replicas", "scaler"))
+            if role.get("scaling", {}).get("mode") == "External":
+                scaler = next((s for s in state.get("scalers", []) if s["metadata"]["name"] == self.ds_name + "-" + role["name"]), None)
+                counts = f"{scaler['spec']['replicas'] if scaler else 'unresolved'} (External)"
             targets.append(f"{role['name']}={counts} [MS={config.get('maxSurge', 'default')}, MU={config.get('maxUnavailable', 'default')}]")
         if targets:
             print("  Desired: " + " | ".join(targets), flush=True)

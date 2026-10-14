@@ -2,7 +2,7 @@
 
 A small, colorful regression lab for the final v1 rollout changes. It builds one pinned controller, creates its own kind cluster, runs real Pods through the scenarios below, and deletes that cluster when finished or interrupted. No existing cluster or default kubeconfig is used.
 
-The default matrix contains **22 runs across nine scenario families**. Every family runs with Ordinal and Hash group identity. Scale-down also covers both policies; the small-outage case covers integer and percentage budgets. An optional larger rename adds two runs.
+The default matrix contains **24 runs across ten scenario families**. Every family runs with Ordinal and Hash group identity. Scale-down also covers both policies; the small-outage case covers integer and percentage budgets. An optional larger rename adds two runs, for 26 in total.
 
 See [validation results](VALIDATION.md) for the executed matrix, harness fixes, and the Ghostty verification limitation.
 
@@ -11,11 +11,12 @@ See [validation results](VALIDATION.md) for the executed matrix, harness fixes, 
 Requirements: Docker, kind, kubectl, Git, Go matching this repository's `go.mod`, Python 3, jq, Bash, and standard Unix tools. No Python packages are needed. First setup needs network access for Go modules and container images. Docker needs enough memory for a Kubernetes control plane and the demo Pods; approximately 8 GiB is a useful starting point.
 
 ```bash
-git clone --branch codex/v1-regression-harness https://github.com/hasB4K/lws.git lws-v1-lab
+git clone --branch codex/harness-v1 https://github.com/hasB4K/lws.git lws-v1-lab
 cd lws-v1-lab
 
 ./harness/v1/run.sh --list                  # exact selected matrix; no Docker calls
-./harness/v1/run.sh all --auto              # all 22 runs, unattended
+./harness/v1/run.sh all --auto              # all 24 runs, unattended
+./harness/v1/run.sh autoscaler-handoff --auto # Static → External, both identities
 ./harness/v1/run.sh outage --interactive    # pause at events; open k9s in Ghostty
 ./harness/v1/run.sh scale-up --identity hash --interactive
 ./harness/v1/run.sh scale-down --policy Immediate --auto
@@ -24,9 +25,11 @@ cd lws-v1-lab
 ./harness/v1/run.sh all --include-large --auto
 ```
 
-`kind` must be on PATH, or set `KIND=/absolute/path/to/kind`. `KIND_NODE_IMAGE` optionally overrides the default `kindest/node:v1.36.1`. Clone with history: `baseline.json` points to a controller commit that must be available locally.
+An installed `kind` on PATH is found automatically; no export is needed. Alternatively, set `KIND=/absolute/path/to/kind` to select another binary. `KIND_NODE_IMAGE` optionally overrides the default `kindest/node:v1.36.1`. Clone with history: `baseline.json` points to a controller commit that must be available locally.
 
 Automatic mode is the default. Use `--fail-fast` to stop after the first failed run; otherwise the report records failures and continues with the remaining cases. A failing or incomplete matrix returns a nonzero exit status.
+
+With cached builds/images on the tested laptop, budget about **20 minutes** for `all --auto`, or **22 minutes** with `--include-large`. These are estimates from the earlier full run plus the new handoff timings, not measurements of a fresh expanded matrix. The handoff pair alone took about two minutes including setup. First-time downloads/builds take longer.
 
 ### Watch and trigger events
 
@@ -60,6 +63,7 @@ P means Prefill; D means Decode. **MS** is `maxSurge`, **MU** is `maxUnavailable
 | `ordinary` | Start at 2P/4D with MS1/MU0, hold the new version's readiness, then release it. Check ordinary asymmetric progress, capacity protection, convergence, and replica-only scaling without a new revision. | 2 |
 | `scale-up` | During unequal progress toward 4P/4D, raise desired to 6P/6D with MS1/MU0. Missing capacity must not justify deleting existing Ready capacity or cancelling needed loading groups. Finish at the exact new desired counts. | 2 |
 | `scale-down` | During the same mixed rollout, reduce desired from 4 to 2 per role. Compare Deferred and Immediate: prefer safe old drains and retain scheduled new groups needed for the final count. | 4 |
+| `autoscaler-handoff` | Start with 3P/2D, two Pods per group, MS1/MU0. Switch Prefill from Static to External without changing templates. Its scaler must inherit three groups; hold off the first scaler write for 15 seconds and verify all ten original Pods stay Ready. Then write Prefill 3→4→2 through `/scale`; Decode stays untouched. | 2 |
 | `rename` | Rename both roles at 2P/2D, MS0/MU1, with tight capacity. Released slots must allow the first new P and D to start; the faster role must not monopolize replacement growth. | 2 |
 | `restart-rollback` | Interrupt A→B with C, restart the controller, then roll back to B. Check recovery with a fresh informer cache and reuse of the existing revision. MS1/MU1. | 2 |
 | `subroles` | Two-Pod groups share one physical LWS. Shrink/relabel, restart the controller, grow, and roll out while checking group-wide labels and independent child targets. MS1/MU0 per child. | 2 |
@@ -113,6 +117,7 @@ Important limits:
 - The restart/rollback case tests an actual controller restart and cold-cache recovery. It does not reproduce the old crash harness's artificially delayed API-write fault injection.
 - `native-restart` covers merged `RecreateGroupOnPodRestart`, not the unmerged in-place restart prototype.
 - Hash subrole deletion preferences are not exact deletion authority. The case checks coherent eventual assignment and recovery, not guaranteed preservation of a particular Hash child group.
+- `autoscaler-handoff` tests the handoff and real `/scale` reads/writes, not a running metrics-driven HPA or KEDA. Pod UID checks detect a drain/recreation even between samples; polling does not capture every short-lived API write or Ready condition change. The case covers ordinary roles at steady state, not switching during a rollout or switching a subrole.
 - Slots are not GPUs. These tests do not prove schedulability after arbitrary resource-size changes, nor cover real GPU plugins, network partitions, multiple nodes, or every possible interleaving.
 
 ## Cleanup and artifacts

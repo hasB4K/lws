@@ -98,8 +98,8 @@ func HarnessObserve(ctx context.Context, reader client.Reader, key client.Object
 		}
 		bySlice[slice] = append(bySlice[slice], lws)
 		lwsRows = append(lwsRows, harnessLWS(s))
-		if !s.ScalingObserved() {
-			warnings = append(warnings, lws.Name+": native scale acknowledgement is pending")
+		if warning := harnessScaleWarning(s); warning != "" {
+			warnings = append(warnings, lws.Name+": "+warning)
 		}
 		if lws.Annotations[subRolePlanAnnotation] != "" {
 			warnings = append(warnings, lws.Name+": accepted subrole assignment is pending; planner preview is theoretical")
@@ -216,7 +216,18 @@ func harnessLWS(s *replicagroups.Snapshot) map[string]any {
 	initial, _ := disaggutils.GetInitialReplicas(lws)
 	return map[string]any{"name": lws.Name, "uid": lws.UID, "revision": lws.Labels[disaggv1.RevisionLabelKey], "role": lws.Labels[disaggv1.RoleLabelKey],
 		"slice": lws.Labels[disaggv1.SliceLabelKey], "identity": lws.Spec.GroupIdentity, "initial": initial, "spec": getLWSReplicas(lws),
-		"rawReady": a.ReadyReplicas, "retainedReady": a.RetainedReadyReplicas, "scalingObserved": s.ScalingObserved(), "groups": groups}
+		"rawReady": a.ReadyReplicas, "retainedReady": a.RetainedReadyReplicas,
+		"scalingObserved": s.ScalingObserved(), "deletionsObserved": s.DeletionsObserved(), "groups": groups}
+}
+
+func harnessScaleWarning(s *replicagroups.Snapshot) string {
+	if !s.DeletionsObserved() {
+		return "native scale/deletion acknowledgement is pending"
+	}
+	if !s.ScalingObserved() {
+		return "some requested Pods are missing; the controller may still adjust the target"
+	}
+	return ""
 }
 
 func harnessCandidate(names []string, state RolloutState) map[string]any {

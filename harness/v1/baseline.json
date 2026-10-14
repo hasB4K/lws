@@ -1,8 +1,6 @@
 {
-  "commit": "cf833e2421f105e16d4366a2cc17057a1b5bec17",
-  "main": "b43d3b4ec81ff243435ac2f98c6c0138712adb05",
-  "prs": {
-    "1181": "a0d47fe88c3355e018ddb29c289679a8b4f2c84f",
-    "1172": "924c5427e10cb1eb808b22562a0d98b6d3afe02f"
-  }
+  "commit": "625b53055ce274875bf6766970bcdba0beaa7f59",
+  "repository": "https://github.com/kubernetes-sigs/lws",
+  "ref": "main",
+  "pinnedOn": "2026-10-14"
 }

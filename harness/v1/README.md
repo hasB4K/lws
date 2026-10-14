@@ -1,6 +1,6 @@
 # LWS v1 rollout lab
 
-A small, colorful regression lab for the final v1 rollout changes. It builds one pinned controller, creates its own kind cluster, runs real Pods through the scenarios below, and deletes that cluster when finished or interrupted. No existing cluster or default kubeconfig is used.
+A small, colorful regression lab for the final v1 rollout changes. It builds one pinned upstream `main` controller, creates its own kind cluster, runs real Pods through the scenarios below, and deletes that cluster when finished or interrupted. No existing cluster or default kubeconfig is used.
 
 The default matrix contains **26 runs across eleven scenario families**. Every family runs with Ordinal and Hash group identity. Scale-down also covers both policies; the small-outage case covers integer and percentage budgets. An optional larger rename adds two runs, for 28 in total.
 
@@ -30,7 +30,7 @@ An installed `kind` on PATH is found automatically; no export is needed. Alterna
 
 Automatic mode is the default. Use `--fail-fast` to stop after the first failed run; otherwise the report records failures and continues with the remaining cases. A failing or incomplete matrix returns a nonzero exit status.
 
-With cached builds/images on the tested laptop, budget about **21 minutes** for `all --auto`, or **23 minutes** with `--include-large`. These are estimates from the earlier full run plus the added handoff and rename-outage timings, not measurements of a fresh expanded matrix. The handoff pair alone took about two minutes including setup. First-time downloads/builds take longer.
+With cached dependencies/images on the tested laptop, `all --include-large --auto` took **22m44s**, including setup and cleanup. Budget about **21 minutes** for `all --auto`, estimated by excluding the two large cases from that same run. This is a single measured run, not an average. First-time downloads/builds take longer.
 
 ### Watch and trigger events
 
@@ -102,12 +102,9 @@ The observer and API samples are **not atomic snapshots or the controller's own 
 
 ## Provenance and limits
 
-`baseline.json` is the source of truth for the pinned local integration:
+`baseline.json` pins [upstream `main` at `625b530`](https://github.com/kubernetes-sigs/lws/commit/625b53055ce274875bf6766970bcdba0beaa7f59), fetched on 14 October 2026. This includes the merged #1181 and #1172, along with the subsequent main changes through #1184. No unmerged controller patches are included.
 
-- Upstream main: `b43d3b4ec81ff243435ac2f98c6c0138712adb05`.
-- [#1181](https://github.com/kubernetes-sigs/lws/pull/1181): `a0d47fe88c3355e018ddb29c289679a8b4f2c84f`.
-- [#1172](https://github.com/kubernetes-sigs/lws/pull/1172): `924c5427e10cb1eb808b22562a0d98b6d3afe02f`.
-- Merged controller: `cf833e2421f105e16d4366a2cc17057a1b5bec17`.
+The pin keeps runs reproducible; the launcher does not silently fetch a different `main` on each run. The harness branch is based on the same commit, so its diagnostic planner matches the controller being tested.
 
 The controller is built from a Git archive of that commit, not uncommitted controller files. Its deployment uses the original CRDs/webhooks and feature defaults; the local overlay selects the pinned image, one manager replica, and smaller manager resource requests. The dashboard/helper is built from the harness checkout.
 

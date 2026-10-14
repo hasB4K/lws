@@ -23,10 +23,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	disaggv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	"sigs.k8s.io/lws/pkg/replicagroups"
 	disaggutils "sigs.k8s.io/lws/pkg/utils/disaggregatedset"
 )
 
@@ -76,4 +79,34 @@ func TestHarnessObserveCannotInitializeMetadataOrIncludeForeignObjects(t *testin
 	require.Empty(t, current.Annotations)
 	require.Len(t, report["slices"], 1)
 	require.NotNil(t, report["slices"].([]map[string]any)[0]["steadyBounds"])
+}
+
+func TestHarnessDistinguishesCreationShortfallFromPendingObservations(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		desired, nativeReplicas int32
+		deletionsObserved       bool
+		warning                 string
+	}{
+		{"settled empty workload", 0, 0, true, ""},
+		{"confirmed creation shortfall", 2, 0, true, "some requested Pods are missing; the controller may still adjust the target"},
+		{"Pod observation still behind native status", 2, 2, false, "native scale/deletion acknowledgement is pending"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No Pods have been observed. Native status distinguishes an actual
+			// creation shortfall from an incomplete view of existing Pods.
+			s := &replicagroups.Snapshot{
+				LWS: &leaderv1.LeaderWorkerSet{Spec: leaderv1.LeaderWorkerSetSpec{Replicas: ptr.To(tc.desired)}},
+				LeaderStatefulSet: &appsv1.StatefulSet{
+					ObjectMeta: metav1.ObjectMeta{UID: "native"},
+					Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(tc.desired)},
+					Status:     appsv1.StatefulSetStatus{Replicas: tc.nativeReplicas},
+				},
+			}
+			row := harnessLWS(s)
+			require.Equal(t, tc.desired == 0, row["scalingObserved"])
+			require.Equal(t, tc.deletionsObserved, row["deletionsObserved"])
+			require.Equal(t, tc.warning, harnessScaleWarning(s))
+		})
+	}
 }

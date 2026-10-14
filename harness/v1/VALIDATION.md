@@ -1,8 +1,23 @@
 # Validation — 14 October 2026
 
-Controller: `cf833e2421f105e16d4366a2cc17057a1b5bec17`, the pinned integration of upstream main, #1181 and #1172 described in `baseline.json`. Environment: macOS/arm64, Docker Desktop, kind Kubernetes v1.36.1, k9s v0.51.0. No existing cluster was used.
+## Current upstream main
 
-## Live results
+Controller: `625b53055ce274875bf6766970bcdba0beaa7f59`, upstream `main` fetched on 14 October 2026. No unmerged controller patches are included.
+
+- All 33 Python harness tests passed; Bash syntax checks passed.
+- Tagged Go tests passed for the DisaggregatedSet controller, shared replica-group observer, DisaggregatedSet utilities, and read-only observer helper. Tagged vet checks passed for the controller and helper.
+- **All 28 cases passed in one `./harness/v1/run.sh all --include-large --auto` invocation.** This includes both identities for autoscaler handoff, full-outage rename, restart/rollback, subroles, emergency recovery, and the larger rename, plus both scale-down policies and integer/percentage small-outage budgets. No scenario expectations were changed for this refresh.
+- The run took **22m44s including setup and cleanup**: 21m52s of scenarios, of which 20m03s covered the 26 default cases. The default-only estimate is about 21 minutes including the same overhead; it was not timed as a separate invocation.
+- Artifacts are retained locally in `.state/run.dcrELs`. Every result records controller commit `625b53055ce274875bf6766970bcdba0beaa7f59`; `runtime-result.json` records `exitCode: 0` and `suitePassed: true`. The owned kind cluster was removed, and no kind clusters remained.
+- The full run started before the reporting-only diagnostic update. The updated helper was then built separately and exercised against the same live cluster. It exposes both `scalingObserved` and `deletionsObserved`, distinguishing pending Pod creation from unacknowledged scale/deletion work. The tested controller and scenarios were unchanged.
+
+Environment: macOS/arm64, Docker Desktop, kind Kubernetes v1.36.1. Native Ghostty window launch/close remains unverified; the historical interactive checks and limitation are documented below.
+
+## Historical local-merge baseline
+
+Controller: `cf833e2421f105e16d4366a2cc17057a1b5bec17`, the temporary integration of upstream main, #1181 and #1172 used by the first harness version. These historical results do not substitute for validation of the current upstream pin. Environment: macOS/arm64, Docker Desktop, kind Kubernetes v1.36.1, k9s v0.51.0. No existing cluster was used.
+
+### Live results
 
 All **28 distinct scenarios** have a passing kind execution across the runs below: 26 default runs plus the two optional larger rename runs. The expanded 28-case matrix has not been rerun as a single invocation.
 
@@ -38,7 +53,7 @@ Local evidence is retained under `.state/` and deliberately excluded from Git:
 - `run.gyhK6Z`: deliberate Ctrl-C at an interactive checkpoint; exit 130, observer stopped and owned kind node removed.
 - Earlier bring-up logs remain available too, including the intentional SIGTERM cleanup test.
 
-## Runtime and code checks
+### Runtime and code checks
 
 - 33 Python tests passed: scenario selection, assignment predicates, autoscaler handoff and mode patching, full-outage rename checkpoints and budgets, physical completion, admission readiness, private-context/viewer arguments and cleanup ownership checks. The handoff checks reject zero replicas, a recreated or terminating Pod, lost readiness, and replacement of an LWS.
 - Bash syntax and tagged observer build/vet/tests passed.

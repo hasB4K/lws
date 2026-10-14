@@ -11,7 +11,7 @@ See [validation results](VALIDATION.md) for the executed matrix, harness fixes, 
 Requirements: Docker, kind, kubectl, Git, Go matching this repository's `go.mod`, Python 3, jq, Bash, and standard Unix tools. No Python packages are needed. First setup needs network access for Go modules and container images. Docker needs enough memory for a Kubernetes control plane and the demo Pods; approximately 8 GiB is a useful starting point.
 
 ```bash
-git clone --branch codex/harness-v1 https://github.com/hasB4K/lws.git lws-v1-lab
+git clone --branch codex/v1-regression-harness https://github.com/hasB4K/lws.git lws-v1-lab
 cd lws-v1-lab
 
 ./harness/v1/run.sh --list                  # exact selected matrix; no Docker calls

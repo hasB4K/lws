@@ -15,6 +15,7 @@ CASES = {
     "scale-down": ("cases_scaling", "scale_down", "lower demand, preserve needed loading groups; 4→2, both policies"),
     "autoscaler-handoff": ("cases_scaling", "autoscaler_handoff", "Static→External without draining; 3P/2D, then /scale P 3→4→2"),
     "rename": ("cases_rollout", "rename", "renamed roles share released slots fairly; 2P/2D, MS0/MU1"),
+    "rename-outage": ("cases_rollout", "rename_outage", "rename both roles with full downtime allowed; 2P/3D, MS0/MU100%"),
     "restart-rollback": ("cases_scaling", "restart_rollback", "interrupt A→B with C, restart manager, roll back B; MS1/MU1"),
     "subroles": ("cases_scaling", "subroles", "relabel, shrink, restart, grow, roll one physical LWS; MS1/MU0 per child"),
     "native-restart": ("cases_scaling", "native_restart", "crash a worker then a leader; only their group is recreated"),
@@ -26,7 +27,7 @@ CASES = {
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("cases", nargs="*", help="case IDs, or all (the ten default families)")
+    p.add_argument("cases", nargs="*", help="case IDs, or all (the eleven default families)")
     p.add_argument("--identity", choices=("ordinal", "hash", "both"), default="both")
     p.add_argument("--policy", choices=("Deferred", "Immediate"), help="select one scale-down policy instead of both")
     p.add_argument("--variant", choices=("integer", "percentage"), help="select one outage budget instead of both")

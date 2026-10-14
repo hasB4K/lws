@@ -3,8 +3,9 @@
 import copy
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import DEFAULT, patch
 
+from cases_rollout import RENAMED, ROLES, _rename_capacity, rename_outage
 from cases_scaling import _assigned, _handoff_preserved
 from lab import (CHILD_COUNTS, GROUP_LABEL, LWS_LABEL, PREFIX, ROLE_LABEL,
                  SUBROLE_LABEL, VERSION_LABEL, WORKER_INDEX, Lab, role_spec)
@@ -143,6 +144,78 @@ class AutoscalerHandoffTests(unittest.TestCase):
         del expected[0]["spec"]["replicas"]
         write.assert_called_once_with({"spec": {"roles": expected}})
         self.assertEqual(roles, original, "Updating the role must not mutate the read snapshot")
+
+
+class RenameOutageTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = object.__new__(Lab)
+
+    @staticmethod
+    def fleet(old=(0, 0), new=(2, 3)):
+        state = {"lws": [], "pods": [], "events": []}
+        for version, roles, counts in (("A", ROLES, old), ("B", RENAMED, new)):
+            for role, count in zip(roles, counts):
+                state["lws"].append({
+                    "metadata": {"name": role, "labels": {ROLE_LABEL: role}},
+                    "spec": role_spec(role, count, "Hash", version, surge=0, unavailable="100%")["spec"],
+                })
+                for group in range(count):
+                    pod = AssignmentCheckpointTests.pod("0")
+                    pod["metadata"].update(name=f"{role}-{group}", uid=f"uid-{role}-{group}")
+                    pod["metadata"]["labels"].update({ROLE_LABEL: role, LWS_LABEL: role,
+                                                       GROUP_LABEL: f"{role}-{group}", VERSION_LABEL: version})
+                    pod["status"]["conditions"][0]["status"] = "True" if version == "A" else "False"
+                    state["pods"].append(pod)
+        return state
+
+    def test_capacity_accepts_full_outage_but_not_per_role_surge(self):
+        self.assertTrue(_rename_capacity(self.lab, self.fleet(), (2, 3)))
+        for old, new in (((1, 0), (2, 2)), ((0, 1), (1, 3))):
+            with self.subTest(old=old, new=new):
+                self.assertEqual(sum(old) + sum(new), 5, "Total alone would miss this violation")
+                with self.assertRaises(AssertionError):
+                    _rename_capacity(self.lab, self.fleet(old, new), (2, 3))
+
+    def test_emergency_allowances_are_not_needed(self):
+        for reason in ("BootstrapSurge", "AvailabilityFallback"):
+            with self.subTest(reason=reason):
+                state = self.fleet()
+                state["events"] = [{"reason": reason}]
+                with self.assertRaises(AssertionError):
+                    _rename_capacity(self.lab, state, (2, 3))
+
+    def test_loading_requires_full_drain_and_complete_unready_replacement(self):
+        with patch.object(self.lab, "create") as create, \
+                patch.multiple(self.lab, update=DEFAULT, wait=DEFAULT, hold=DEFAULT,
+                               checkpoint=DEFAULT, release=DEFAULT, converge=DEFAULT) as calls:
+            calls["converge"].return_value = self.fleet()
+            rename_outage(self.lab)
+        create.assert_called_once_with(2, 3, surge=0, unavailable="100%", slots=5)
+        calls["update"].assert_called_once_with(version="B", names=RENAMED, ready=False)
+        loading = calls["wait"].call_args_list[0].args[1]
+        self.assertIs(calls["hold"].call_args.args[2], loading)
+        self.assertTrue(loading(self.fleet()))
+        self.assertFalse(loading(self.fleet(old=(1, 2), new=(1, 1))))
+        self.assertFalse(loading(self.fleet(new=(2, 2))))
+        state = self.fleet()
+        state["pods"][-1]["spec"].pop("nodeName")
+        self.assertFalse(loading(state), "Requested Pods are not necessarily scheduled")
+        state = self.fleet()
+        state["pods"][0]["status"]["conditions"][0]["status"] = "True"
+        with self.assertRaises(AssertionError):
+            loading(state)
+
+    def test_rename_preserves_both_percentage_budgets(self):
+        roles = [role_spec(role, count, "Hash", "A", surge=0, unavailable="100%")
+                 for role, count in zip(ROLES, (2, 3))]
+        with patch.object(self.lab, "k", return_value={"spec": {"roles": roles}}), \
+                patch.object(self.lab, "patch_set") as write:
+            self.lab.update(version="B", names=RENAMED, ready=False)
+        updated = write.call_args.args[0]["spec"]["roles"]
+        self.assertEqual([role["name"] for role in updated], list(RENAMED))
+        for role in updated:
+            self.assertEqual(role["spec"]["rolloutStrategy"]["rollingUpdateConfiguration"],
+                             {"maxSurge": 0, "maxUnavailable": "100%"})
 
 
 if __name__ == "__main__":

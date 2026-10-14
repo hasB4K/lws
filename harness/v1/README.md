@@ -2,7 +2,7 @@
 
 A small, colorful regression lab for the final v1 rollout changes. It builds one pinned controller, creates its own kind cluster, runs real Pods through the scenarios below, and deletes that cluster when finished or interrupted. No existing cluster or default kubeconfig is used.
 
-The default matrix contains **24 runs across ten scenario families**. Every family runs with Ordinal and Hash group identity. Scale-down also covers both policies; the small-outage case covers integer and percentage budgets. An optional larger rename adds two runs, for 26 in total.
+The default matrix contains **26 runs across eleven scenario families**. Every family runs with Ordinal and Hash group identity. Scale-down also covers both policies; the small-outage case covers integer and percentage budgets. An optional larger rename adds two runs, for 28 in total.
 
 See [validation results](VALIDATION.md) for the executed matrix, harness fixes, and the Ghostty verification limitation.
 
@@ -15,9 +15,10 @@ git clone --branch codex/v1-regression-harness https://github.com/hasB4K/lws.git
 cd lws-v1-lab
 
 ./harness/v1/run.sh --list                  # exact selected matrix; no Docker calls
-./harness/v1/run.sh all --auto              # all 24 runs, unattended
+./harness/v1/run.sh all --auto              # all 26 runs, unattended
 ./harness/v1/run.sh autoscaler-handoff --auto # Static → External, both identities
 ./harness/v1/run.sh outage --interactive    # pause at events; open k9s in Ghostty
+./harness/v1/run.sh rename-outage --interactive # rename with MS=0 / MU=100%, both identities
 ./harness/v1/run.sh scale-up --identity hash --interactive
 ./harness/v1/run.sh scale-down --policy Immediate --auto
 ./harness/v1/run.sh outage --variant integer --identity ordinal --auto
@@ -29,7 +30,7 @@ An installed `kind` on PATH is found automatically; no export is needed. Alterna
 
 Automatic mode is the default. Use `--fail-fast` to stop after the first failed run; otherwise the report records failures and continues with the remaining cases. A failing or incomplete matrix returns a nonzero exit status.
 
-With cached builds/images on the tested laptop, budget about **20 minutes** for `all --auto`, or **22 minutes** with `--include-large`. These are estimates from the earlier full run plus the new handoff timings, not measurements of a fresh expanded matrix. The handoff pair alone took about two minutes including setup. First-time downloads/builds take longer.
+With cached builds/images on the tested laptop, budget about **21 minutes** for `all --auto`, or **23 minutes** with `--include-large`. These are estimates from the earlier full run plus the added handoff and rename-outage timings, not measurements of a fresh expanded matrix. The handoff pair alone took about two minutes including setup. First-time downloads/builds take longer.
 
 ### Watch and trigger events
 
@@ -65,6 +66,7 @@ P means Prefill; D means Decode. **MS** is `maxSurge`, **MU** is `maxUnavailable
 | `scale-down` | During the same mixed rollout, reduce desired from 4 to 2 per role. Compare Deferred and Immediate: prefer safe old drains and retain scheduled new groups needed for the final count. | 4 |
 | `autoscaler-handoff` | Start with 3P/2D, two Pods per group, MS1/MU0. Switch Prefill from Static to External without changing templates. Its scaler must inherit three groups; hold off the first scaler write for 15 seconds and verify all ten original Pods stay Ready. Then write Prefill 3→4→2 through `/scale`; Decode stays untouched. | 2 |
 | `rename` | Rename both roles at 2P/2D, MS0/MU1, with tight capacity. Released slots must allow the first new P and D to start; the faster role must not monopolize replacement growth. | 2 |
+| `rename-outage` | Rename both roles at 2P/3D with MS0/MU100% on both old and new roles, in five slots. All old groups must disappear and all five replacements must schedule while readiness is closed. Hold the permitted full outage, release Prefill first, then Decode. Check zero-surge limits and no emergency allowance. | 2 |
 | `restart-rollback` | Interrupt A→B with C, restart the controller, then roll back to B. Check recovery with a fresh informer cache and reuse of the existing revision. MS1/MU1. | 2 |
 | `subroles` | Two-Pod groups share one physical LWS. Shrink/relabel, restart the controller, grow, and roll out while checking group-wide labels and independent child targets. MS1/MU0 per child. | 2 |
 | `native-restart` | Crash a worker, then a leader, in a two-Pod group. Only the affected group should be recreated; unrelated group UIDs must survive. | 2 |

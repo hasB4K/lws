@@ -102,6 +102,47 @@ def rename(lab):
     _renamed_rollout(lab, old=(2, 2), desired=(2, 2), new_unavailable=1)
 
 
+def _rename_capacity(lab, state, counts):
+    for old_role, new_role, ceiling in zip(ROLES, RENAMED, counts):
+        requested = _count(lab, state, "A", old_role) + _count(lab, state, "B", new_role)
+        lab.assert_(requested <= ceiling, f"Renaming {old_role} exceeded its zero-surge ceiling")
+    lab.assert_(not _reason(state, "BootstrapSurge") and not _reason(state, "AvailabilityFallback"),
+                "A rename permitting full downtime should not need emergency capacity")
+    return True
+
+
+def rename_outage(lab):
+    counts = (2, 3)
+    lab.create(*counts, surge=0, unavailable="100%", slots=sum(counts))
+    lab.checkpoint("Rename 2P/3D with MS=0 and MU=100% on both old and new roles. Full downtime is permitted.",
+                   "Rename both roles, change A to B, and hold all B application readiness.")
+    lab.update(version="B", names=RENAMED, ready=False)
+
+    def loading(state):
+        _rename_capacity(lab, state, counts)
+        lab.assert_(all(_count(lab, state, "B", role, "ready") == 0 for role in RENAMED),
+                    "Replacement readiness opened before the manual event")
+        return all(_count(lab, state, "A", role) == 0 for role in ROLES) and \
+            all(_count(lab, state, "B", role) == n and
+                _count(lab, state, "B", role, "scheduled") == n for role, n in zip(RENAMED, counts)) and \
+            len(state["pods"]) == sum(counts) and not lab.pods(state, version="A")
+
+    # MU=1 cannot pass this checkpoint: it must retain old groups until B is Ready.
+    lab.wait("All old groups drained; all five renamed groups scheduled, none Ready", loading)
+    lab.hold("Zero Ready is allowed here; no sixth slot or emergency allowance is needed", 8, loading)
+    lab.checkpoint("Make both renamed Prefill groups Ready; Decode is still loading.",
+                   "Open only B Prefill readiness files.")
+    lab.release(version="B", role=RENAMED[0])
+    lab.wait("Renamed Prefill is Ready while renamed Decode remains unready", lambda state:
+             _rename_capacity(lab, state, counts) and
+             _count(lab, state, "B", RENAMED[0], "ready") == counts[0] and
+             _count(lab, state, "B", RENAMED[1], "ready") == 0)
+    lab.checkpoint("Release Decode and restore the complete 2P/3D service.",
+                   "Open B Decode readiness files.")
+    state = lab.converge("B", dict(zip(RENAMED, counts)))
+    _rename_capacity(lab, state, counts)
+
+
 def large_rename(lab):
     _renamed_rollout(lab, old=(9, 4), desired=(8, 3), new_unavailable=4)
 

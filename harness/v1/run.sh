@@ -129,7 +129,7 @@ APPLESCRIPT
     else
       section "Remove owned kind cluster $CLUSTER"
       if [[ -s "$KCFG" ]]; then
-        k -n v1-harness get disaggregatedsets,lws,pods -o yaml > "$RUN_DIR/final-resources.yaml" 2>&1
+        k -n v1-harness get disaggregatedsets,lws,pods,dsrs -o yaml > "$RUN_DIR/final-resources.yaml" 2>&1
         k -n v1-harness get events --sort-by=.lastTimestamp > "$RUN_DIR/events.log" 2>&1
         k -n lws-system logs deployment/lws-controller-manager --all-containers --tail=3000 > "$RUN_DIR/controller.log" 2>&1
       fi

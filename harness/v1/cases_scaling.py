@@ -150,6 +150,76 @@ def scale_down(lab):
     lab.converge("B", {"prefill": 2, "decode": 2})
 
 
+def _handoff_preserved(lab, state, before):
+    """UIDs also catch a drain/recreation that completed between samples."""
+    lab.assert_(_uids(state["pods"]) == _uids(before["pods"]),
+                "Static→External deleted or replaced an existing Pod")
+    lab.assert_(_uids(state["lws"]) == _uids(before["lws"]),
+                "Changing the replica source created or deleted a workload revision")
+    for role, original in lab.counts(before, "A").items():
+        current = _count(lab, state, "A", role)
+        lab.assert_(current["spec"] == original["spec"] and current["ready"] == original["ready"],
+                    f"Static→External changed {role}'s requested or Ready group count")
+    return True
+
+
+def autoscaler_handoff(lab):
+    # Two-Pod groups distinguish replica-group counts from individual Pods.
+    lab.create(3, 2, size=2, surge=1, unavailable=0)
+    before = lab.snapshot()
+    lab.assert_(not before["scalers"], "A Static role unexpectedly has a scaler")
+    lab.checkpoint("Hand Prefill's three Ready groups to an external scaler. Keep every Pod.",
+                   "Set Prefill scaling.mode=External and remove its inline replicas in one patch; keep templates unchanged.")
+    lab.update(external_roles=("prefill",))
+    scaler_name = lab.ds_name + "-prefill"
+
+    def seeded(state):
+        _handoff_preserved(lab, state, before)
+        scalers = state["scalers"]
+        if not scalers:
+            return False
+        lab.assert_(len(scalers) == 1 and scalers[0]["metadata"]["name"] == scaler_name,
+                    "Only the External Prefill role should get a scaler")
+        scaler = scalers[0]
+        lab.assert_(scaler["spec"].get("replicas") == 3,
+                    "The new scaler must start at three existing groups, not zero, one, or six Pods")
+        lab.assert_(any(owner.get("controller") and owner["uid"] == before["ds"]["metadata"]["uid"]
+                        for owner in scaler["metadata"].get("ownerReferences", [])),
+                    "The scaler is not owned by this DisaggregatedSet")
+        return scaler.get("status", {}).get("replicas") == 3 and \
+            state["ds"].get("status", {}).get("observedGeneration") == state["ds"]["metadata"]["generation"]
+
+    lab.wait("The generated scaler inherits three replicas, without replacing any Pod", seeded)
+    scale_url = f"/apis/disaggregatedset.x-k8s.io/v1/namespaces/{lab.namespace}/disaggregatedsetrolescalers/{scaler_name}/scale"
+    scale = lab.k("get", "--raw", scale_url, json_output=True)
+    lab.assert_(scale["spec"]["replicas"] == 3 and scale["status"]["replicas"] == 3,
+                "The autoscaler's first /scale read did not see the existing three groups")
+    lab.hold("No autoscaler write for 15 seconds: all ten original Pods stay Ready", 15, seeded)
+
+    for previous, desired in ((3, 4), (4, 2)):
+        prior = lab.snapshot()
+        lab.checkpoint(f"The external scaler now requests Prefill {previous} → {desired}; Decode remains at two.",
+                       f"kubectl scale dsrs/{scaler_name} --replicas={desired} (writes /scale)")
+        lab.k("-n", lab.namespace, "scale", "dsrs/" + scaler_name, f"--replicas={desired}")
+
+        def scaled(state):
+            lab.assert_(_uids(state["lws"]) == _uids(before["lws"]), "/scale created another revision")
+            lab.assert_(_uids(lab.pods(state, role="decode")) == _uids(lab.pods(before, role="decode")),
+                        "Scaling Prefill replaced a Decode Pod")
+            decode, prefill = (_count(lab, state, "A", role) for role in ("decode", "prefill"))
+            lab.assert_(decode["spec"] == decode["ready"] == 2, "Scaling Prefill disturbed Decode capacity")
+            lab.assert_(min(previous, desired) <= prefill["spec"] <= max(previous, desired) and
+                        prefill["ready"] >= min(previous, desired), "External scaling drained needed Prefill groups")
+            if desired > previous:
+                lab.assert_(_uids(prior["pods"]) <= _uids(state["pods"]), "Scale-up replaced existing Pods")
+            return prefill["spec"] == prefill["ready"] == desired and \
+                len(state["pods"]) == (desired + 2) * 2 and all(_ready(p) for p in _live(state["pods"])) and \
+                not any(p["metadata"].get("deletionTimestamp") for p in state["pods"])
+
+        lab.wait(f"/scale reaches {desired}P/2D without changing templates", scaled, stable=3)
+    lab.note("This tests the autoscaler handoff and /scale API; it does not deploy a metrics-driven HPA.")
+
+
 def restart_rollback(lab):
     lab.create(4, 4, surge=1, unavailable=1)
     lab.checkpoint("Start B with readiness held.", "Change A templates to B.")

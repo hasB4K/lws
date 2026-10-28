@@ -383,7 +383,7 @@ Keep validation tests separate from planner expectations where practical, so the
 Use a disposable cluster, direct replica changes, and deterministically delayed readiness. The automated scale-up comparison covers Ordinal and Hash with all four scale-up/scale-down policy combinations:
 
 1. Compare `Deferred` and `Immediate` while decreasing a target below already-created target Spec.
-2. With both budgets at 25%, increase desired from 8 to 16 while six old groups remain and four target groups are loading. Compare `scaleUpDuringRollout: Deferred` (target grows to 8) and `Immediate` (target grows to 10, filling `16 - 6`). Verify that old Ready capacity is preserved and normal surge limits hold. Make one old Pod per role unready without changing requested counts, and verify that neither policy creates another top-up batch.
+2. Compare `scaleUpDuringRollout: Deferred` and `Immediate` under both scale-down policies while target groups are not Ready. Verify that Immediate fills the gap between desired replicas and those still requested in old revisions, preserving old Ready capacity and surge limits. Repeated observations or readiness loss alone must not trigger another top-up.
 3. Release readiness and verify old-first progress followed by exact convergence.
 4. Check the configured budgets, required-role completeness, and retained readiness throughout the run, not only its final counts.
 

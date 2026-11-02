@@ -8,7 +8,7 @@ Each version-1 asset contains a 1920×1080 canvas, a deduplicated primitive dict
 
 Playback draws the prepared frame and interpolates positions. It does not calculate replica counts, availability budgets, fractional windows, or routing shares. All original scene states, metric values, and explanations are retained. Text uses Arial and Menlo.
 
-Each file's `provenance` and `source` metadata retain the evidence description, original scene checkpoint, fixture references, and SHA-256 hashes of the relevant renderer and source data. The distinction matters: gating uses observed Pod states with calculated routing shares and illustrative requests; scaling uses production-planner output with simulated readiness/timing; fractional-window progression is a deterministic teaching schedule.
+Each file's `provenance` and `source` metadata retain the evidence description, original scene checkpoint, fixture references, and SHA-256 hashes of the relevant renderer and source data. The distinction matters: gating uses observed Pod states with calculated routing shares and illustrative requests; scaling replays real Kubernetes runs with controlled model-loading readiness; fractional-window progression is a deterministic teaching schedule. Scaling panels are independent recordings aligned at the replica-change marker, with compressed playback. Counts come from completed API observations, not planner simulations.
 
 ## Regeneration
 
@@ -20,6 +20,6 @@ pnpm exec playwright install chromium
 pnpm export:docs --out /path/to/lws/site/static/animations
 ```
 
-To regenerate only one asset, add `--scene gating`, `--scene scaling`, or `--scene fractional`. Use `PLAYWRIGHT_CHANNEL=chrome` with the export command to reuse an installed Google Chrome instead of Playwright's downloaded browser.
+To regenerate only one asset, add `--scene gating`, `--scene scaling`, `--scene fractional`, or `--scene scaling-up`. For recorded scaling input, follow the standalone project's `docs/RECORDED_SCALING.md`. Use `PLAYWRIGHT_CHANNEL=chrome` with the export command to reuse an installed Google Chrome instead of Playwright's downloaded browser.
 
 The tool invokes the original scene renderer in all six palettes, records its finite Canvas operations, and verifies every state boundary against the source pixels before writing the files. Colors are recorded faithfully, including semantic green/red metrics, never inferred by recoloring. Gating's decorative motion is sampled at 24 fps and interpolated during playback. Decoded files are limited to 16 MiB. See the standalone project's `docs/PREPARED_DRAWINGS.md` for the detailed workflow. No videos or generated raster frames are required.

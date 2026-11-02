@@ -46,7 +46,7 @@ Immediate counts requested groups, including those still loading, across **all**
 This extra growth reaches the desired count; it does not raise `maxSurge` or permit extra old-group deletions. Normal rollout growth may still use the allowed surge, and renamed-role safeguards still apply. Immediate can start more groups sooner, but cannot make them schedulable or Ready sooner.
 
 {{< canvas-animation data="/animations/scaling-up.json" title="Deferred versus Immediate scale-up from 4 to 10 groups" >}}
-When demand rises, both have 4 Ready A groups and 1 loading B group per role. Immediate requests 6 B groups without waiting for that loading batch; Deferred waits. Readiness and timing are illustrative.
+Two recorded Kubernetes runs show how each policy grows B after demand rises from 4 to 10 groups per role. Model-loading readiness is controlled, and playback is compressed.
 {{< /canvas-animation >}}
 
 ## When demand decreases
@@ -56,12 +56,8 @@ The scale-down policy controls reductions independently of the scale-up policy. 
 The animation below reduces demand from **37 to 20 Prefill groups** and **19 to 10 Decode groups** while B is still loading. It compares the two **scale-down** policies using autoscaler requests, with both rollout budgets set to 10%. Scale-up remains Deferred in both examples.
 
 {{< canvas-animation data="/animations/scaling.json" title="Deferred versus Immediate scale-down during a rollout" >}}
-Real planner decisions with simulated readiness and timing. This example assumes deletions remove Ready groups first.
+Two recorded Kubernetes runs with controlled model-loading readiness. Panels are aligned at the replica change; each shows its own observed state. Playback is compressed.
 {{< /canvas-animation >}}
-
-After watching the animation, you might ask:
-
-**Why not reduce B straight to 20 Prefill groups?** With `maxUnavailable: 10%`, at least **18 must stay Ready**. At 23 groups, 18 are Ready and 5 are loading. Reaching 20 requires three deletions. The planner chooses a count, not which groups are deleted: losing three Ready groups would leave only **15**. It cannot assume that only loading groups will be removed, so it waits for more groups to become Ready.
 
 **Immediate does not mean instant removal.** Both scale-down policies follow your rollout budgets, so extra groups may need to stay while replacements become Ready. Freeing resources earlier does not necessarily make the whole rollout finish sooner.
 

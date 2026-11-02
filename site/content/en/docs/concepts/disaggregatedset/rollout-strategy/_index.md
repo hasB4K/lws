@@ -41,6 +41,29 @@ rolloutStrategy:
 
 The minimum Ready count is `desired - maxUnavailable`; the maximum requested count is `desired + maxSurge`. Both count across old and new revisions of the role. Terminating Pods can take time to disappear.
 
+## One percentage for all roles
+
+Use one set-wide percentage to hold a rollout for canary analysis:
+
+```yaml
+spec:
+  rolloutStrategy:
+    canaryPercent: 25
+```
+
+This requests 25% of each role's replica groups on the new revision, independently in every slice. It works with both Ordinal and Hash groups, including virtual roles: each sub-role gets its own share. It does **not** set a traffic percentage or account for different GPU sizes.
+
+- Set `0` with the template change to start with all surviving groups old. Raise it to advance; `100` completes the rollout. Without an old revision, initial creation still starts the full desired workload. Omitting the field leaves the existing rollout behavior unchanged.
+- Counts round up, keeping at least one old and one new group during a partial canary. At 25%, 4 groups become 3 old + 1 new; 8 groups become 6 old + 2 new. With just 2 groups, any partial percentage leaves 1 old + 1 new.
+- Autoscaling up can add groups to both revisions. Historical templates, budgets and membership are preserved; fully drained old history is not recreated. New-group growth still follows the selected scale-up policy.
+- Scale-down keeps its selected policy. At 25%, scaling 6 old + 2 new down to 4 gives 3 old + 1 new with `Immediate`, but 2 old + 2 new with `Deferred`. The latter retains started target groups, so its 50% share can remain until promotion or another replica change.
+- Lowering the percentage does not undo rollout progress. To roll back immediately, revert the template and set `canaryPercent: 100` together.
+- The embedded LWS `partition` field remains unsupported. This control belongs to DisaggregatedSet, not the child LWS rollout.
+
+A settled, fully Ready hold reports `Progressing=True` with reason `CanaryHeld`, and its message includes the percentage and observed new/desired counts. Argo CD can recognize this requested intermediate state through a custom health check; it is not native Argo Rollouts workload support.
+
+There are two explicit limits. A one-group logical role cannot be split: the controller reports `CanaryBlocked` until it has at least two groups or the percentage reaches 100. Scaling an existing canary down to one can therefore leave it above desired until that action is taken. Also, a surviving old revision must have the same active roles and sub-roles; renaming, adding/removing active sub-roles, or changing a leaf between zero and nonzero requires finishing that layout change at 100 before starting a canary. Scaling the whole workload to zero remains allowed.
+
 ## What is the fractional window?
 
 The window limits how far one role can get ahead of the others. Its width is **`1 / smallest non-zero role count`**, calculated automatically.

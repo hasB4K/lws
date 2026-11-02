@@ -57,8 +57,10 @@ test('documentation embeds local prepared data without a separate application', 
     assert.doesNotMatch(source, /<video|\.mp4|\.gif/);
   }
   const shortcode = await read('../layouts/shortcodes/canvas-animation.html');
-  assert.match(shortcode, /js.Build/);
-  assert.match(shortcode, /relURL/);
+  assert.match(shortcode, /partial "animation-player.html"/);
+  const player = await read('../layouts/partials/animation-player.html');
+  assert.match(player, /js.Build/);
+  assert.match(player, /relURL/);
   assert.doesNotMatch(shortcode, /iframe|scene=/);
 });
 

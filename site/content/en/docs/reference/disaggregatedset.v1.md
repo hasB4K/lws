@@ -235,6 +235,44 @@ revisions so HPA observes the serving fleet during a rolling update.</p>
 </tbody>
 </table>
 
+## `DisaggregatedSetRolloutStrategy`     {#disaggregatedset-x-k8s-io-v1-DisaggregatedSetRolloutStrategy}
+
+
+**Appears in:**
+
+- [DisaggregatedSetSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedSetSpec)
+
+
+<p>DisaggregatedSetRolloutStrategy configures a set-wide canary hold.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+
+
+<tr><td><code>canaryPercent</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>CanaryPercent is the target revision's percentage of each role or sub-role's
+desired replica groups, applied independently in every slice. Omitted or
+100 applies no global hold; 0 starts no new groups. It does not limit initial
+creation when there is no old revision. Lowering it does not undo progress.
+For 1..99, the new count rounds up and keeps at least one old and one new
+group. A positive one-group role cannot be split and blocks until replicas
+increase or CanaryPercent reaches 100. This is not a traffic percentage.
+Scale-up replenishes surviving old capacity under either scaling policy;
+target growth still follows that policy's pacing. Retired history is never
+recreated. Deferred scale-down retains already-started
+target groups, so their share can exceed this percentage until promotion
+or another replica change. Active role/sub-role layouts must match an old
+surviving revision; otherwise promotion to 100 is required.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
 ## `DisaggregatedSetScalingPolicy`     {#disaggregatedset-x-k8s-io-v1-DisaggregatedSetScalingPolicy}
     
 
@@ -342,6 +380,14 @@ Changing Slices scales copies up or down and does not trigger a rollout.</p>
    <p>ScalingPolicy controls scale-up and scale-down during rolling updates.
 Omit it to use Deferred for both directions: readiness-paced growth and
 target reductions after old revisions drain.</p>
+</td>
+</tr>
+<tr><td><code>rolloutStrategy</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-DisaggregatedSetRolloutStrategy"><code>DisaggregatedSetRolloutStrategy</code></a>
+</td>
+<td>
+   <p>RolloutStrategy controls progressive delivery across all roles and sub-roles.
+Changing it does not create a new revision.</p>
 </td>
 </tr>
 <tr><td><code>placementPolicy</code><br/>
@@ -741,4 +787,4 @@ at least one Ready group. It never exceeds ReadyReplicas.</p>
 </tr>
 </tbody>
 </table>
-  
+

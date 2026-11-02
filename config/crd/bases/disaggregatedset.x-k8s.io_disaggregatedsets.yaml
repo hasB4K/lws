@@ -19601,6 +19601,31 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              rolloutStrategy:
+                description: |-
+                  RolloutStrategy controls progressive delivery across all roles and sub-roles.
+                  Changing it does not create a new revision.
+                properties:
+                  canaryPercent:
+                    description: |-
+                      CanaryPercent is the target revision's percentage of each role or sub-role's
+                      desired replica groups, applied independently in every slice. Omitted or
+                      100 applies no global hold; 0 starts no new groups. It does not limit initial
+                      creation when there is no old revision. Lowering it does not undo progress.
+                      For 1..99, the new count rounds up and keeps at least one old and one new
+                      group. A positive one-group role cannot be split and blocks until replicas
+                      increase or CanaryPercent reaches 100. This is not a traffic percentage.
+                      Scale-up replenishes surviving old capacity under either scaling policy;
+                      target growth still follows that policy's pacing. Retired history is never
+                      recreated. Deferred scale-down retains already-started
+                      target groups, so their share can exceed this percentage until promotion
+                      or another replica change. Active role/sub-role layouts must match an old
+                      surviving revision; otherwise promotion to 100 is required.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                type: object
               scalingPolicy:
                 description: |-
                   ScalingPolicy controls scale-up and scale-down during rolling updates.

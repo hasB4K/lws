@@ -280,6 +280,11 @@ type DisaggregatedSetSpec struct {
 	// +optional
 	ScalingPolicy *DisaggregatedSetScalingPolicy `json:"scalingPolicy,omitempty"`
 
+	// RolloutStrategy controls progressive delivery across all roles and sub-roles.
+	// Changing it does not create a new revision.
+	// +optional
+	RolloutStrategy *DisaggregatedSetRolloutStrategy `json:"rolloutStrategy,omitempty"`
+
 	// PlacementPolicy controls how a slice's roles are co-located and how the
 	// DisaggregatedSet's slices are spread across topology domains. When set, the
 	// controller injects pod affinity and anti-affinity into the managed
@@ -287,6 +292,27 @@ type DisaggregatedSetSpec struct {
 	// created, so changing it takes effect on the next rollout.
 	// +optional
 	PlacementPolicy *PlacementPolicy `json:"placementPolicy,omitempty"`
+}
+
+// DisaggregatedSetRolloutStrategy configures a set-wide canary hold.
+type DisaggregatedSetRolloutStrategy struct {
+	// CanaryPercent is the target revision's percentage of each role or sub-role's
+	// desired replica groups, applied independently in every slice. Omitted or
+	// 100 applies no global hold; 0 starts no new groups. It does not limit initial
+	// creation when there is no old revision. Lowering it does not undo progress.
+	// For 1..99, the new count rounds up and keeps at least one old and one new
+	// group. A positive one-group role cannot be split and blocks until replicas
+	// increase or CanaryPercent reaches 100. This is not a traffic percentage.
+	// Scale-up replenishes surviving old capacity under either scaling policy;
+	// target growth still follows that policy's pacing. Retired history is never
+	// recreated. Deferred scale-down retains already-started
+	// target groups, so their share can exceed this percentage until promotion
+	// or another replica change. Active role/sub-role layouts must match an old
+	// surviving revision; otherwise promotion to 100 is required.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	CanaryPercent *int32 `json:"canaryPercent,omitempty"`
 }
 
 // PlacementType selects the DisaggregatedSet placement guarantee.

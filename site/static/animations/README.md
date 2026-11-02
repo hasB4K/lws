@@ -4,7 +4,7 @@ These JSON assets preserve the documentation scenes as finite drawing data. LWS 
 
 ## Format
 
-Each version-1 asset contains a 1920×1080 canvas, a deduplicated primitive dictionary, and frames with durations, ordered primitive indices, captions, and hover/tap evidence. Primitives are rectangles, circles, line paths, or text. Colors contain either one value or a light/dark pair. Optional motion tracks contain a primitive index and `[time, x, y]` keyframes.
+Each version-1 asset contains a 1920×1080 canvas, a deduplicated primitive dictionary, and frames with durations, ordered primitive indices, captions, and hover/tap evidence. Primitives are rectangles, circles, line paths, or text. `themes` lists `lws`, `lws-dark`, `mistral-light`, `mistral-dark`, `llm-d-light`, and `llm-d-dark`. Colors contain either one unchanged value or one value per listed theme. Legacy files without `themes` use LWS light/dark pairs. Optional motion tracks contain a primitive index and `[time, x, y]` keyframes.
 
 Playback draws the prepared frame and interpolates positions. It does not calculate replica counts, availability budgets, fractional windows, or routing shares. All original scene states, metric values, and explanations are retained. Text uses Arial and Menlo.
 
@@ -22,4 +22,4 @@ pnpm export:docs --out /path/to/lws/site/static/animations
 
 To regenerate only one asset, add `--scene gating`, `--scene scaling`, or `--scene fractional`. Use `PLAYWRIGHT_CHANNEL=chrome` with the export command to reuse an installed Google Chrome instead of Playwright's downloaded browser.
 
-The tool invokes the original scene renderer, records its finite Canvas operations, and verifies every state boundary in both LWS themes against the source pixels before writing the files. Gating's decorative motion is sampled at 24 fps and interpolated during playback. See the standalone project's `docs/PREPARED_DRAWINGS.md` for the detailed workflow. No videos or generated raster frames are required.
+The tool invokes the original scene renderer in all six palettes, records its finite Canvas operations, and verifies every state boundary against the source pixels before writing the files. Colors are recorded faithfully, including semantic green/red metrics, never inferred by recoloring. Gating's decorative motion is sampled at 24 fps and interpolated during playback. Decoded files are limited to 16 MiB. See the standalone project's `docs/PREPARED_DRAWINGS.md` for the detailed workflow. No videos or generated raster frames are required.

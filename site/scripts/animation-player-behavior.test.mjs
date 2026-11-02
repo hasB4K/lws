@@ -12,9 +12,11 @@ const drawing = () => ({version: 1, width: 1920, height: 1080, title: 'Example',
   frames: [{duration: 2, caption: 'First state', items: [0]}, {duration: 2, caption: 'Second state', items: [0]}],
 });
 
-function fixture(data = drawing(), {intersection = true, reducedMotion = true} = {}) {
-  const observers = [], mutations = [], queries = [], responses = [data];
-  const ctx = {clears: 0, translations: [], clearRect() {this.clears++;},
+function fixture(data = drawing(), {intersection = true, reducedMotion = true, width = 1920, height = 1080, dpr = 1} = {}) {
+  const observers = [], mutations = [], resizes = [], media = [], queries = [], responses = [data];
+  const bounds = {left: 0, top: 0, width, height}, backingWrites = [];
+  const ctx = {clears: 0, translations: [], transforms: [], clearRect() {this.clears++;},
+    setTransform(...transform) {this.transforms.push(transform);},
     translate(...point) {this.translations.push(point);}, save() {}, restore() {},
     beginPath() {}, roundRect() {}, arc() {}, fill() {}, stroke() {}};
   const element = () => {
@@ -33,6 +35,12 @@ function fixture(data = drawing(), {intersection = true, reducedMotion = true} =
     'previous', 'next', 'player', 'controls', 'error'];
   const nodes = Object.fromEntries(names.map(name => [name, element()]));
   nodes.canvas.getContext = () => ctx;
+  nodes.canvas.getBoundingClientRect = () => ({...bounds});
+  for (const [name, initial] of [['width', 1920], ['height', 1080]]) {
+    let value = initial;
+    Object.defineProperty(nodes.canvas, name, {get: () => value,
+      set: next => {value = next; backingWrites.push([name, next]);}});
+  }
   nodes.error.hidden = true;
   const root = {...element(), dataset: {animationSource: '/example.json'},
     querySelector(selector) {queries.push(selector); return nodes[selector.match(/data-animation-([^\]]+)/)[1]];},
@@ -46,9 +54,19 @@ function fixture(data = drawing(), {intersection = true, reducedMotion = true} =
     observe() {}
     fire(visible) {this.callback([{isIntersecting: visible}]);}
   }
-  const sandbox = {document, console, Error, performance: {now: () => 0},
-    matchMedia: () => ({matches: reducedMotion, addEventListener() {}}),
-    ResizeObserver: class {observe() {}},
+  const sandbox = {document, console, Error, devicePixelRatio: dpr, performance: {now: () => 0},
+    matchMedia: query => {
+      const listeners = [], resolution = query.match(/resolution:\s*([\d.]+)dppx/);
+      const item = {resolution, listeners,
+        get matches() {return resolution ? Number(resolution[1]) === sandbox.devicePixelRatio : reducedMotion;},
+        addEventListener(_name, callback, options) {listeners.push({callback, once: options?.once});},
+      };
+      media.push(item); return item;
+    },
+    ResizeObserver: class {
+      constructor(callback) {this.callback = callback; resizes.push(this);}
+      observe(target) {this.target = target;}
+    },
     MutationObserver: class {constructor(callback) {mutations.push(callback);} observe() {}},
     requestAnimationFrame: () => 1, cancelAnimationFrame() {},
     fetch: async () => {
@@ -62,10 +80,27 @@ function fixture(data = drawing(), {intersection = true, reducedMotion = true} =
   vm.runInNewContext(`${source}\nthis.Player = AnimationPlayer;`, sandbox);
   new sandbox.Player(root);
   return {nodes, ctx, queries, observers, mutations, responses, document,
+    bounds, backingWrites,
     fetches: () => fetches,
     ready: () => new Promise(resolve => setImmediate(resolve)),
     seek(time) {nodes.seek.value = String(time); nodes.seek.handlers.input();},
     theme(theme) {document.documentElement.dataset.bsTheme = theme; mutations.forEach(callback => callback([]));},
+    resize(width, height) {
+      Object.assign(bounds, {width, height});
+      for (const observer of resizes.filter(item => item.target === nodes.canvas)) {
+        observer.callback([{target: nodes.canvas, contentRect: {...bounds}}]);
+      }
+    },
+    pixelRatio(value) {
+      const previous = media.filter(item => item.resolution).map(item => [item, item.matches]);
+      sandbox.devicePixelRatio = value;
+      for (const [item, matched] of previous) if (item.matches !== matched) {
+        for (const listener of [...item.listeners]) {
+          if (listener.once) item.listeners.splice(item.listeners.indexOf(listener), 1);
+          listener.callback({matches: item.matches});
+        }
+      }
+    },
     root,
   };
 }
@@ -159,6 +194,45 @@ test('browsers without IntersectionObserver load immediately with usable paused 
   assert.equal(f.nodes.summary.textContent, 'Second state');
 });
 
+test('adaptive backing sizes repaint the paused state, but unchanged and hidden sizes do not', async () => {
+  const f = fixture(drawing(), {width: 630.25, height: 354.5, dpr: 2}); await f.ready();
+  assert.deepEqual([f.nodes.canvas.width, f.nodes.canvas.height], [1261, 709]);
+  assert.deepEqual(f.ctx.transforms.at(-1), [1261 / 1920, 0, 0, 709 / 1080, 0, 0]);
+  assert.equal(f.ctx.clears, 1);
+  f.seek(2.5);
+  const before = f.ctx.clears;
+  f.resize(960, 540);
+  assert.deepEqual([f.nodes.canvas.width, f.nodes.canvas.height], [1920, 1080]);
+  assert.equal(f.ctx.clears, before + 1, 'A resized backing buffer must repaint even while paused');
+  assert.equal(f.nodes.seek.value, '2.5');
+  assert.equal(f.nodes.summary.textContent, 'Second state');
+  assert.equal(f.nodes.play.textContent, 'Play');
+  const writes = f.backingWrites.length;
+  for (const [width, height] of [[960, 540], [0, 0], [0, 540], [960, 0], [960, 540]]) f.resize(width, height);
+  assert.equal(f.backingWrites.length, writes, 'Repeated or hidden sizes cannot reallocate the buffer');
+  assert.equal(f.ctx.clears, before + 1);
+  assert.equal(f.fetches(), 1);
+});
+
+test('DPR-only changes re-arm the density watcher and extreme sizes stay bounded', async () => {
+  const f = fixture(drawing(), {width: 640, height: 360}); await f.ready();
+  f.seek(2.5);
+  const before = f.ctx.clears;
+  f.pixelRatio(2);
+  assert.deepEqual([f.nodes.canvas.width, f.nodes.canvas.height], [1280, 720]);
+  f.pixelRatio(3);
+  assert.deepEqual([f.nodes.canvas.width, f.nodes.canvas.height], [1920, 1080]);
+  assert.equal(f.ctx.clears, before + 2, 'The density watcher must re-arm after each change');
+  assert.equal(f.nodes.seek.value, '2.5');
+  assert.equal(f.nodes.play.textContent, 'Play');
+  for (const [width, height] of [[10000, 10000], [30000, 1000]]) {
+    f.resize(width, height);
+    assert.ok(f.nodes.canvas.width > 0 && f.nodes.canvas.height > 0);
+    assert.ok(f.nodes.canvas.width <= 8192 && f.nodes.canvas.height <= 8192);
+    assert.ok(f.nodes.canvas.width * f.nodes.canvas.height <= 16_777_216);
+  }
+});
+
 test('pointer inspection resolves shared hit indices in reverse paint order', async () => {
   const data = drawing();
   data.hits = [
@@ -166,8 +240,9 @@ test('pointer inspection resolves shared hit indices in reverse paint order', as
     {x: 10, y: 10, width: 50, height: 50, label: 'Top group', detail: 'Later evidence'},
   ];
   data.frames[0].hits = [0, 1]; data.frames[1].hits = [0];
-  const f = fixture(data); await f.ready();
-  const inspect = (x, y) => f.nodes.canvas.handlers.pointermove({clientX: x, clientY: y});
+  const f = fixture(data, {width: 640, height: 360, dpr: 2}); await f.ready();
+  const inspect = (x, y) => f.nodes.canvas.handlers.pointermove({
+    clientX: x * f.bounds.width / data.width, clientY: y * f.bounds.height / data.height});
   inspect(20, 20);
   assert.equal(f.nodes.tooltip.hidden, false);
   assert.equal(f.nodes.tooltip.textContent, 'Top group\nLater evidence');
@@ -175,6 +250,9 @@ test('pointer inspection resolves shared hit indices in reverse paint order', as
   assert.equal(f.nodes.tooltip.hidden, true, 'Changing frames hides stale evidence');
   inspect(20, 20);
   assert.equal(f.nodes.tooltip.textContent, 'Underlying group\nFirst evidence');
+  f.resize(960, 540); f.pixelRatio(3);
+  inspect(20, 20);
+  assert.equal(f.nodes.tooltip.textContent, 'Underlying group\nFirst evidence', 'Hover targets stay in logical coordinates');
   inspect(200, 200);
   assert.equal(f.nodes.tooltip.hidden, true);
 });

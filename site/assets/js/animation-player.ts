@@ -206,6 +206,11 @@ class AnimationPlayer {
     });
     new ResizeObserver(entries => get('player').style.setProperty('--animation-controls-height',
       `${Math.ceil(entries[0].target.getBoundingClientRect().height)}px`)).observe(get('controls'));
+    new ResizeObserver(this.resize).observe(this.canvas);
+    const watchDensity = () => matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener('change', () => {
+      this.resize(); watchDensity();
+    }, {once: true});
+    watchDensity();
     if (typeof IntersectionObserver !== 'undefined') {
       new IntersectionObserver(entries => {this.visible = entries[0].isIntersecting; this.sync();}).observe(root);
     } else {
@@ -221,6 +226,21 @@ class AnimationPlayer {
   }
 
   private get playing() {return !!this.data && this.intent && this.visible && !document.hidden;}
+  private resize = () => {
+    if (!this.data) return;
+    const bounds = this.canvas.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return;
+    let width = Math.max(1, Math.round(bounds.width * (devicePixelRatio || 1)));
+    let height = Math.max(1, Math.round(bounds.height * (devicePixelRatio || 1)));
+    // Bound backing-store memory at extreme zoom or on unusually large displays.
+    const limit = Math.min(1, 8192 / Math.max(width, height), Math.sqrt(16_777_216 / (width * height)));
+    width = Math.max(1, Math.floor(width * limit)); height = Math.max(1, Math.floor(height * limit));
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width; this.canvas.height = height;
+      this.lastFrame = -1;
+    }
+    this.render();
+  };
   private inspect(event: PointerEvent) {
     if (!this.data) return;
     const bounds = this.canvas.getBoundingClientRect();
@@ -259,14 +279,13 @@ class AnimationPlayer {
       this.lastRenderTime = -1; this.wasMoving = false;
       this.starts = this.data.frames.map(frame => {const start = this.duration; this.duration += frame.duration; return start;});
       this.motionTimes = (this.data.motions ?? []).map(track => track.keyframes.map(key => key[0]));
-      this.canvas.width = this.data.width; this.canvas.height = this.data.height;
       this.canvas.setAttribute('aria-label', this.data.title);
       this.root.style.setProperty('--animation-ratio', `${this.data.width} / ${this.data.height}`);
       this.root.style.setProperty('--animation-width-ratio', String(this.data.width / this.data.height));
       this.seek.max = String(this.duration);
       this.root.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLSelectElement>('[data-animation-control]').forEach(control => {control.disabled = false;});
       this.root.querySelector<HTMLElement>('[data-animation-error]')!.hidden = true;
-      this.render();
+      this.resize();
     } catch (error) {
       this.loadFailed = true;
       this.error(error instanceof Error ? error.message : 'Animation could not load.');
@@ -309,6 +328,7 @@ class AnimationPlayer {
     const moving = activeMotions.length > 0;
     if (index !== this.lastFrame || dark !== this.lastDark || moving !== this.wasMoving
       || moving && this.time !== this.lastRenderTime) {
+      ctx.setTransform(this.canvas.width / this.data.width, 0, 0, this.canvas.height / this.data.height, 0, 0);
       ctx.clearRect(0, 0, this.data.width, this.data.height);
       for (const id of frame.items) drawPrimitive(ctx, this.data.primitives[id], dark);
       for (const i of activeMotions) {

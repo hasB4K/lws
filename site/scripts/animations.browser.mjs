@@ -6,7 +6,7 @@ const origin = process.env.LWS_SITE_URL || 'http://127.0.0.1:18446';
 const prefix = process.env.LWS_DOCS_PREFIX ?? '/main';
 const browser = await chromium.launch({ headless: true,
   ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}) });
-const page = await browser.newPage({ reducedMotion: 'reduce', viewport: { width: 1600, height: 1100 } });
+const page = await browser.newPage({ reducedMotion: 'reduce', deviceScaleFactor: 2, viewport: { width: 1600, height: 1100 } });
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 const downloads = [];
@@ -16,6 +16,13 @@ const seekTo = (seek, time) => seek.evaluate((input, value) => {
   input.dispatchEvent(new Event('input', { bubbles: true }));
 }, time);
 const value = seek => seek.evaluate(input => Number(input.value));
+const nativeResolution = async canvas => {
+  await page.waitForFunction(node => {
+    const bounds = node.getBoundingClientRect();
+    return node.width === Math.round(bounds.width * devicePixelRatio) && node.height === Math.round(bounds.height * devicePixelRatio);
+  }, await canvas.elementHandle());
+  assert.ok(await canvas.evaluate(node => node.getContext('2d').getImageData(0, 0, 1, 1).data[3] > 0), 'Resizing redraws the paused canvas');
+};
 let examples = 0;
 try {
   for (const slug of ['rollout-strategy', 'llm-d-integration', 'scaling-during-rollout']) {
@@ -40,7 +47,7 @@ try {
       const asset = await (await page.request.get(new URL(await figure.getAttribute('data-animation-source'), origin).href)).json();
       const duration = asset.frames.reduce((total, frame) => total + frame.duration, 0);
       assert.ok(Math.abs(Number(await seek.getAttribute('max')) - duration) < .001);
-      assert.equal(await canvas.getAttribute('width'), String(asset.width));
+      await nativeResolution(canvas);
       let time = 0;
       for (const frame of asset.frames) {
         await seekTo(seek, time + frame.duration / 2);
@@ -126,25 +133,30 @@ try {
 
   const fullscreen = automatic.locator('[data-animation-fullscreen]');
   if (await fullscreen.isVisible()) {
+    const pausedTime = await value(seek);
     const player = automatic.locator('[data-animation-player]');
     await fullscreen.click();
     await page.waitForFunction(node => document.fullscreenElement === node, await player.elementHandle());
     await page.waitForFunction(button => button.getAttribute('aria-label') === 'Exit fullscreen', await fullscreen.elementHandle());
     assert.equal(await fullscreen.getAttribute('aria-label'), 'Exit fullscreen');
     assert.ok(await player.evaluate(node => node.scrollHeight <= innerHeight + 1), 'Fullscreen fits Canvas and controls');
+    await nativeResolution(automatic.locator('canvas'));
     await fullscreen.click();
     await page.waitForFunction(() => !document.fullscreenElement);
     await page.waitForFunction(button => button.getAttribute('aria-label') === 'Enter fullscreen', await fullscreen.elementHandle());
     assert.equal(await fullscreen.getAttribute('aria-label'), 'Enter fullscreen');
+    await nativeResolution(automatic.locator('canvas'));
+    assert.equal(await value(seek), pausedTime, 'Fullscreen resizing does not rewind or resume playback');
   }
 
   await page.setViewportSize({ width: 320, height: 844 });
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile page fits viewport');
   const first = page.locator('[data-animation-source]').first();
   await first.scrollIntoViewIfNeeded();
+  await nativeResolution(first.locator('canvas'));
   assert.ok(await first.locator('[data-animation-play]').isVisible());
   assert.deepEqual(errors, []);
-  console.log(`Verified ${examples} inline examples: all captions/states, themes, controls, autoplay, offscreen/manual pause, loop, fullscreen, reduced motion, and 320px layout.`);
+  console.log(`Verified ${examples} inline examples: all captions/states, themes, controls, autoplay, offscreen/manual pause, loop, HiDPI/fullscreen resizing, reduced motion, and 320px layout.`);
 } finally {
   await browser.close();
 }

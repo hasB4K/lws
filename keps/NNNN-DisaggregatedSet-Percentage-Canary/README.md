@@ -79,6 +79,8 @@ A settled hold reports current-generation `Progressing=True`, reason `CanaryHeld
 
 Argo CD can recognize these conditions through a custom health check; Git-driven promotion only changes the top-level percentage field. A separate promotion controller can own that field while Git owns templates, provided Argo CD ignores and preserves the controller-owned field during sync. This does not make DisaggregatedSet a native Argo Rollouts `workloadRef`: a step plugin or explicit analysis/promotion Jobs must bridge the APIs. Traffic routing and analysis metrics are separate concerns.
 
+The [Argo CD guide](../../site/content/en/docs/concepts/disaggregatedset/argo-cd/_index.md) provides complete health and optional manual-action configuration for stock Argo CD, along with field-ownership rules. No Argo CD source patch is required.
+
 ## Implementation
 
 - Validate and preserve the new percentage field in the API and CRD. Per-role LWS partition rejection remains unchanged.
@@ -103,4 +105,4 @@ Per-role integer partitions, proposed in [PR #1265](https://github.com/kubernete
 
 ## Implementation history
 
-- 2026-11-02: private independent prototype for comparing set-wide percentage canaries with per-role integer partitions.
+- 2026-11-02: work-in-progress independent proposal for comparing set-wide percentage canaries with per-role integer partitions.

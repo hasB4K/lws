@@ -60,9 +60,9 @@ This requests 25% of each role's replica groups on the new revision, independent
 - Lowering the percentage does not undo rollout progress. To roll back immediately, revert the template and set `canaryPercent: 100` together.
 - The embedded LWS `partition` field remains unsupported. This control belongs to DisaggregatedSet, not the child LWS rollout.
 
-A settled, fully Ready hold reports `Progressing=True` with reason `CanaryHeld`, and its message includes the percentage and observed new/desired counts. Argo CD can recognize this requested intermediate state through a custom health check; it is not native Argo Rollouts workload support.
+A settled, fully Ready hold reports `Progressing=True` with reason `CanaryHeld`, and its message includes the percentage and observed new/desired counts. For Git-driven promotion, health configuration, and optional manual actions with stock Argo CD, see [Canary Rollouts with Argo CD](../argo-cd/). This is not native Argo Rollouts workload support.
 
-There are two explicit limits. A one-group logical role cannot be split: the controller reports `CanaryBlocked` until it has at least two groups or the percentage reaches 100. Scaling an existing canary down to one can therefore leave it above desired until that action is taken. Also, a surviving old revision must have the same active roles and sub-roles; renaming, adding/removing active sub-roles, or changing a leaf between zero and nonzero requires finishing that layout change at 100 before starting a canary. Scaling the whole workload to zero remains allowed.
+There are two explicit limits. A positive partial canary (`1`–`99`) cannot split a one-group logical role: the controller reports `CanaryBlocked` until it has at least two groups or the percentage reaches 100. Zero percent can hold a singleton entirely old. Scaling an existing partial canary down to one can therefore leave it above desired until that action is taken. Also, a surviving old revision must have the same active roles and sub-roles; renaming, adding/removing active sub-roles, or changing a leaf between zero and nonzero requires finishing that layout change at 100 before starting a canary. Scaling the whole workload to zero remains allowed.
 
 ## What is the fractional window?
 
